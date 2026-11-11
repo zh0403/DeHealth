@@ -1,0 +1,29 @@
+{
+  "name": "dehealth-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "shared",
+    "contracts",
+    "mobile"
+  ],
+  "scripts": {
+    "build:shared": "npm run build --workspace=@dehealth/shared",
+    "build:contracts": "npm run build --workspace=@dehealth/contracts",
+    "build:mobile": "npm run build --workspace=@dehealth/mobile",
+    "build": "npm run build:shared && npm run build:contracts && npm run build:mobile",
+    "test:contracts": "npm run test --workspace=@dehealth/contracts",
+    "test:unit:shared": "npm run test --workspace=@dehealth/shared",
+    "test:unit:mobile": "npm run test --workspace=@dehealth/mobile",
+    "test:unit": "npm run test:unit:shared && npm run test:unit:mobile",
+    "test:e2e": "npm run test:e2e --workspace=@dehealth/contracts",
+    "test": "npm run test:contracts && npm run test:unit && npm run test:e2e",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

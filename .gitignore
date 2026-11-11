@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+artifacts/
+cache/
+typechain-types/
+*.tsbuildinfo
+.DS_Store
+.env*
+!.env.example
+
+# Audit & Build Manifests (Internal Capstone Artifacts)
+BUILD_REPORT.md
+TEST_READY.md
+report/
+reports/
+*.audit.md
