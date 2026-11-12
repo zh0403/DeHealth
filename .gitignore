@@ -12,6 +12,7 @@ typechain-types/
 
 # Audit & Build Manifests (Internal Capstone Artifacts)
 BUILD_REPORT.md
+BUILD_REPORT*.md
 TEST_READY.md
 report/
 reports/

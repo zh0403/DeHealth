@@ -2,21 +2,26 @@
   "name": "@dehealth/mobile",
   "version": "0.1.0",
   "private": true,
-  "main": "./dist/index.js",
+  "main": "index.ts",
   "types": "./dist/index.d.ts",
   "scripts": {
+    "start": "expo start",
+    "web": "expo start --web",
     "build": "tsc -p tsconfig.json",
     "test": "vitest run --coverage",
     "test:unit": "vitest run --coverage"
   },
   "dependencies": {
     "@dehealth/shared": "0.1.0",
+    "@expo/metro-runtime": "~3.2.3",
     "@react-native-async-storage/async-storage": "1.23.1",
     "@supabase/supabase-js": "^2.46.1",
     "ethers": "^6.13.4",
     "expo": "~51.0.28",
     "react": "18.2.0",
-    "react-native": "0.74.5"
+    "react-dom": "18.2.0",
+    "react-native": "0.74.5",
+    "react-native-web": "~0.19.10"
   },
   "devDependencies": {
     "@types/react": "~18.2.79",
