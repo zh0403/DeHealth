@@ -16,4 +16,9 @@ BUILD_REPORT*.md
 TEST_READY.md
 report/
 reports/
+audit_report/
+build_report/
 *.audit.md
+
+# Expo local dev state
+.expo/
