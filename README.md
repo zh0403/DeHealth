@@ -54,6 +54,23 @@ DeHealth is a privacy-preserving fitness incentive protocol. Users prove physica
 
 ---
 
+## Phase 2.0: Adaptive Fitness & Nutrition Engine
+
+A deterministic, fully offline engine personalises training and nutrition without any biometric data leaving the device. There are no LLM or network calls.
+
+| Capability | Behaviour |
+|---|---|
+| **Onboarding wizard** | 3-step goal / biometrics / schedule flow with domain-bound validation and a "Skip for Now" baseline. |
+| **Physiology math** | Katch-McArdle BMR (Mifflin-St Jeor fallback), activity-scaled TDEE, goal-based calorie offset, macro split, and a hard 1,200 kcal safety floor. |
+| **14-day adaptive plan** | Rotating upper / lower / cardio templates with per-day calorie and macro targets. |
+| **Runtime fatigue guard** | After more than 48 hours of inactivity, unfinished exercises in the active plan drop by 30% immediately, with no plan regeneration. |
+| **Dual-track check-in** | Food-preset portion logging with deterministic macro scaling, plus a workout checklist. |
+| **Proof gate** | The Keccak-256 / EIP-712 daily proof unlocks only after at least one completed exercise or one logged meal. |
+| **Bi-weekly review** | Rolling 7-entry weight average and adherence feed a goal-aware calorie proposal that the user approves or rejects. |
+| **Data sovereignty** | Biometrics, weight logs, plans and intake live only in encrypted local storage and never appear in the signed claim payload or the Supabase feed schema. |
+
+---
+
 ## Project Structure
 
 ```
@@ -75,13 +92,17 @@ dehealth-monorepo/
 │   │   └── e2e/                 # 4-tier end-to-end lifecycle harness
 │   └── hardhat.config.ts
 ├── mobile/                      # @dehealth/mobile — React Native / Expo client
+│   ├── App.tsx                  # app shell: onboarding gate + 3-tab navigation
 │   └── src/
 │       ├── services/
-│       │   ├── cryptoService.ts    # local Keccak-256 + EIP-712 signer
-│       │   └── profileEngine.ts    # adaptive 48h fatigue scaling engine
+│       │   ├── cryptoService.ts       # local Keccak-256 + EIP-712 signer
+│       │   ├── profileEngine.ts       # 48h fatigue scaling for daily targets
+│       │   └── adaptivePlanEngine.ts  # Phase 2.0 BMR/TDEE, 14-day plans, bi-weekly review
 │       ├── storage/
-│       │   └── encryptedStorageAdapter.ts  # encrypted local persistence
-│       ├── screens/             # dashboard, 1-tap check-in, anonymized feed
+│       │   ├── encryptedStorageAdapter.ts  # encrypted local persistence
+│       │   └── adaptiveStorage.ts          # typed vault for biometrics, plans, weight logs
+│       ├── screens/             # onboarding wizard, dashboard, check-in, anonymized feed
+│       ├── components/          # streak header, perks drawer, plan review modal
 │       └── __tests__/
 └── supabase/
     └── migrations/
