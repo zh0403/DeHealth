@@ -1,18 +1,21 @@
 import {
+  AdaptivePlanCycle,
   Address,
   AnonymizedFeedRecord,
   Bytes32,
+  DailyPlan,
+  DEFAULT_BASELINE_BIOMETRICS,
   SignedWorkoutClaimPayload,
-  TelemetryData,
-  UserProfile
+  UserBiometrics,
+  UserProfile,
+  WeightLogEntry
 } from "@dehealth/shared";
 import { Wallet } from "ethers";
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Platform,
   Pressable,
   SafeAreaView,
-  ScrollView,
   StyleSheet,
   Text,
   View
@@ -22,20 +25,21 @@ import { StreakFlameHeader } from "./src/components/StreakFlameHeader";
 import { AnonymizedFeedScreen } from "./src/screens/AnonymizedFeedScreen";
 import { DashboardScreen } from "./src/screens/DashboardScreen";
 import { MicroCheckInScreen } from "./src/screens/MicroCheckInScreen";
+import { OnboardingWizardScreen } from "./src/screens/OnboardingWizardScreen";
+import { generate14DayPlan } from "./src/services/adaptivePlanEngine";
 import { verifyWorkoutProofSignature } from "./src/services/cryptoService";
 import { evaluateDailyTarget } from "./src/services/profileEngine";
+import {
+  getActivePlanCycle,
+  getUserBiometrics,
+  getWeightLogs,
+  saveActivePlanCycle
+} from "./src/storage/adaptiveStorage";
 
 type ActiveTab = "checkin" | "dashboard" | "feed";
 
 const DEMO_VERIFYING_CONTRACT: Address =
   "0x1111111111111111111111111111111111111111" as Address;
-
-const DEMO_PROFILE: UserProfile = {
-  age: 28,
-  gender: "non-binary",
-  bodyFatPct: 18.5,
-  muscleMassKg: 34.0
-};
 
 const INITIAL_FEED_ITEMS: readonly AnonymizedFeedRecord[] = [
   {
@@ -71,9 +75,42 @@ const TAB_ITEMS: ReadonlyArray<{
   { id: "feed", label: "Feed", icon: "👥" }
 ];
 
+function biometricsToUserProfile(bio: UserBiometrics): UserProfile {
+  const bodyFatPct = bio.bodyFatPct ?? 18.5;
+  const estimatedLbm = Number(
+    (bio.weightKg * (1 - bodyFatPct / 100) * 0.55).toFixed(1)
+  );
+  return {
+    age: bio.age,
+    gender: bio.gender,
+    bodyFatPct,
+    muscleMassKg: Math.min(150, Math.max(10, estimatedLbm))
+  };
+}
+
 export default function App(): React.ReactElement {
-  // Default home/landing screen configured to Check-In (R1)
   const [activeTab, setActiveTab] = useState<ActiveTab>("checkin");
+  const [hasCompletedOnboarding, setHasCompletedOnboarding] =
+    useState<boolean>(false);
+  const [userBiometrics, setUserBiometrics] = useState<UserBiometrics>(
+    DEFAULT_BASELINE_BIOMETRICS
+  );
+  const [activeCycle, setActiveCycle] = useState<AdaptivePlanCycle>(() =>
+    generate14DayPlan(
+      DEFAULT_BASELINE_BIOMETRICS,
+      Date.now() - 15 * 24 * 60 * 60 * 1000
+    )
+  );
+  const [weightLogs, setWeightLogs] = useState<readonly WeightLogEntry[]>([
+    {
+      id: "wlog_baseline",
+      timestampMs: Date.now() - 14 * 24 * 60 * 60 * 1000,
+      weightKg: 70.0,
+      bodyFatPct: 18.5,
+      note: "Initial onboarding weight"
+    }
+  ]);
+
   const [streakCount, setStreakCount] = useState<number>(3);
   const [tokenBalanceDht, setTokenBalanceDht] = useState<string>("30.0");
   const [currentNonce, setCurrentNonce] = useState<bigint>(0n);
@@ -87,22 +124,86 @@ export default function App(): React.ReactElement {
     useState<Readonly<Record<string, number>>>(INITIAL_CHEERS);
   const [isPerksDrawerOpen, setIsPerksDrawerOpen] = useState<boolean>(false);
 
+  useEffect(() => {
+    let mounted = true;
+    const hydrateFromVault = async (): Promise<void> => {
+      try {
+        const [storedBio, storedCycle, storedLogs] = await Promise.all([
+          getUserBiometrics(),
+          getActivePlanCycle(),
+          getWeightLogs()
+        ]);
+        if (!mounted) return;
+        if (storedBio) {
+          setUserBiometrics(storedBio);
+          setHasCompletedOnboarding(true);
+        }
+        if (storedCycle) {
+          setActiveCycle(storedCycle);
+        }
+        if (storedLogs.length > 0) {
+          setWeightLogs(storedLogs);
+        }
+      } catch {
+        // Non-fatal in preview environments
+      }
+    };
+    void hydrateFromVault();
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const wallet = useMemo(() => Wallet.createRandom(), []);
   const userAddress = wallet.address as Address;
 
-  const targetAssessment = useMemo(
-    () => evaluateDailyTarget(DEMO_PROFILE, lastLogTimestampMs, Date.now()),
-    [lastLogTimestampMs]
+  const userProfile = useMemo(
+    () => biometricsToUserProfile(userBiometrics),
+    [userBiometrics]
   );
 
-  const collectTelemetry = (): TelemetryData => ({
-    timestampMs: Date.now(),
-    stepCount: 8_420,
-    activeMinutes: 42,
-    avgHeartRateBpm: 132.5,
-    caloriesBurnedKcal: 410.0,
-    profileSnapshot: DEMO_PROFILE
-  });
+  const targetAssessment = useMemo(
+    () => evaluateDailyTarget(userProfile, lastLogTimestampMs, Date.now()),
+    [userProfile, lastLogTimestampMs]
+  );
+
+  const todayPlan: DailyPlan = useMemo(() => {
+    return (
+      activeCycle.dailyPlans[0] ??
+      generate14DayPlan(userBiometrics, Date.now()).dailyPlans[0]!
+    );
+  }, [activeCycle, userBiometrics]);
+
+  const handleOnboardingComplete = (
+    bio: UserBiometrics,
+    plan: AdaptivePlanCycle
+  ): void => {
+    setUserBiometrics(bio);
+    setActiveCycle(plan);
+    setWeightLogs([
+      {
+        id: `wlog_${Date.now()}`,
+        timestampMs: Date.now(),
+        weightKg: bio.weightKg,
+        ...(bio.bodyFatPct !== undefined ? { bodyFatPct: bio.bodyFatPct } : {}),
+        note: "Onboarding baseline"
+      }
+    ]);
+    setHasCompletedOnboarding(true);
+    setActiveTab("checkin");
+  };
+
+  const handleUpdateDailyPlan = (updatedPlan: DailyPlan): void => {
+    const nextPlans = activeCycle.dailyPlans.map((p) =>
+      p.dayNumber === updatedPlan.dayNumber ? updatedPlan : p
+    );
+    const nextCycle: AdaptivePlanCycle = {
+      ...activeCycle,
+      dailyPlans: nextPlans
+    };
+    setActiveCycle(nextCycle);
+    void saveActivePlanCycle(nextCycle).catch(() => undefined);
+  };
 
   const handleDispatchSignedClaim = async (
     payload: SignedWorkoutClaimPayload
@@ -157,90 +258,109 @@ export default function App(): React.ReactElement {
   return (
     <SafeAreaView style={styles.viewport}>
       <View style={styles.phoneFrame}>
-        {/* Persistent Gamification Top Header (R2) */}
-        <StreakFlameHeader
-          userAddress={userAddress}
-          streakCount={streakCount}
-          tokenBalanceDht={tokenBalanceDht}
-          isFatigueScaled={targetAssessment.isFatigueScaled}
-          fitnessTier={targetAssessment.fitnessTier}
-          onOpenPerksDrawer={() => setIsPerksDrawerOpen(true)}
-        />
-
-        {/* Screen Area with Smooth Tab Switching */}
-        <View style={styles.screenArea}>
-          {activeTab === "checkin" ? (
-            <MicroCheckInScreen
+        {!hasCompletedOnboarding ? (
+          <OnboardingWizardScreen
+            initialBiometrics={userBiometrics}
+            onOnboardingComplete={handleOnboardingComplete}
+          />
+        ) : (
+          <>
+            {/* Persistent Gamification Top Header */}
+            <StreakFlameHeader
               userAddress={userAddress}
-              verifyingContract={DEMO_VERIFYING_CONTRACT}
-              currentStreak={streakCount}
-              currentNonce={currentNonce}
-              signer={wallet}
-              userProfile={DEMO_PROFILE}
-              collectTelemetry={collectTelemetry}
-              onDispatchSignedClaim={handleDispatchSignedClaim}
-            />
-          ) : null}
-
-          {activeTab === "dashboard" ? (
-            <DashboardScreen
               streakCount={streakCount}
               tokenBalanceDht={tokenBalanceDht}
-              lastProofHash={lastProofHash}
-              targetAssessment={targetAssessment}
+              isFatigueScaled={targetAssessment.isFatigueScaled}
+              fitnessTier={targetAssessment.fitnessTier}
               onOpenPerksDrawer={() => setIsPerksDrawerOpen(true)}
             />
-          ) : null}
 
-          {activeTab === "feed" ? (
-            <AnonymizedFeedScreen
-              items={feedItems}
-              cheerCountsByFeedId={cheerCounts}
-              onCheer={handleCheer}
+            {/* Screen Area */}
+            <View style={styles.screenArea}>
+              {activeTab === "checkin" ? (
+                <MicroCheckInScreen
+                  userAddress={userAddress}
+                  verifyingContract={DEMO_VERIFYING_CONTRACT}
+                  currentStreak={streakCount}
+                  currentNonce={currentNonce}
+                  signer={wallet}
+                  userProfile={userProfile}
+                  dailyPlan={todayPlan}
+                  lastLogTimestampMs={lastLogTimestampMs}
+                  onUpdateDailyPlan={handleUpdateDailyPlan}
+                  onDispatchSignedClaim={handleDispatchSignedClaim}
+                />
+              ) : null}
+
+              {activeTab === "dashboard" ? (
+                <DashboardScreen
+                  streakCount={streakCount}
+                  tokenBalanceDht={tokenBalanceDht}
+                  lastProofHash={lastProofHash}
+                  targetAssessment={targetAssessment}
+                  activeCycle={activeCycle}
+                  weightLogs={weightLogs}
+                  onLogWeightEntry={(entry) => {
+                    setWeightLogs((prev) => [...prev, entry]);
+                  }}
+                  onUpdatePlanCycle={(nextCycle) => {
+                    setActiveCycle(nextCycle);
+                  }}
+                  onOpenPerksDrawer={() => setIsPerksDrawerOpen(true)}
+                />
+              ) : null}
+
+              {activeTab === "feed" ? (
+                <AnonymizedFeedScreen
+                  items={feedItems}
+                  cheerCountsByFeedId={cheerCounts}
+                  onCheer={handleCheer}
+                />
+              ) : null}
+            </View>
+
+            {/* Bottom Navigation Bar */}
+            <View style={styles.tabBar}>
+              {TAB_ITEMS.map((tab) => {
+                const isActive = activeTab === tab.id;
+                return (
+                  <Pressable
+                    key={tab.id}
+                    accessibilityRole="tab"
+                    accessibilityLabel={`${tab.label} Tab`}
+                    accessibilityState={{ selected: isActive }}
+                    style={({ pressed }) => [
+                      styles.tabButton,
+                      isActive ? styles.tabButtonActive : null,
+                      pressed ? styles.tabButtonPressed : null
+                    ]}
+                    onPress={() => {
+                      setActiveTab(tab.id);
+                    }}
+                  >
+                    <Text style={styles.tabIcon}>{tab.icon}</Text>
+                    <Text
+                      style={[
+                        styles.tabLabel,
+                        isActive ? styles.tabLabelActive : null
+                      ]}
+                    >
+                      {tab.label}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            {/* Reward Perks Drawer / Modal */}
+            <RewardPerksDrawer
+              visible={isPerksDrawerOpen}
+              tokenBalanceDht={tokenBalanceDht}
+              onClose={() => setIsPerksDrawerOpen(false)}
+              onRedeemPerk={handleRedeemPerk}
             />
-          ) : null}
-        </View>
-
-        {/* Modern Gamified Bottom Navigation Bar (R1) */}
-        <View style={styles.tabBar}>
-          {TAB_ITEMS.map((tab) => {
-            const isActive = activeTab === tab.id;
-            return (
-              <Pressable
-                key={tab.id}
-                accessibilityRole="tab"
-                accessibilityLabel={`${tab.label} Tab`}
-                accessibilityState={{ selected: isActive }}
-                style={({ pressed }) => [
-                  styles.tabButton,
-                  isActive ? styles.tabButtonActive : null,
-                  pressed ? styles.tabButtonPressed : null
-                ]}
-                onPress={() => {
-                  setActiveTab(tab.id);
-                }}
-              >
-                <Text style={styles.tabIcon}>{tab.icon}</Text>
-                <Text
-                  style={[
-                    styles.tabLabel,
-                    isActive ? styles.tabLabelActive : null
-                  ]}
-                >
-                  {tab.label}
-                </Text>
-              </Pressable>
-            );
-          })}
-        </View>
-
-        {/* Reward Perks Drawer / Modal (R4) */}
-        <RewardPerksDrawer
-          visible={isPerksDrawerOpen}
-          tokenBalanceDht={tokenBalanceDht}
-          onClose={() => setIsPerksDrawerOpen(false)}
-          onRedeemPerk={handleRedeemPerk}
-        />
+          </>
+        )}
       </View>
     </SafeAreaView>
   );
