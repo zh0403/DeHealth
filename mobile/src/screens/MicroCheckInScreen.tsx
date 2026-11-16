@@ -315,7 +315,6 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         onUpdateDailyPlan(resolved);
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [externalDailyPlan, lastLogTimestampMs]);
 
   const [selectedPresetId, setSelectedPresetId] = useState<string>(
