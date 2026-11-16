@@ -305,12 +305,27 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  const handleKeepCurrentPlan = (review: ProposedPlanReview): void => {
-    const { preservedCycle } = keepCurrentPlanOnReview(effectiveCycle, review);
+  const handleKeepCurrentPlan = async (review: ProposedPlanReview): Promise<void> => {
+    const { preservedCycle, completedPreviousCycle } = keepCurrentPlanOnReview(
+      effectiveCycle,
+      review,
+      Date.now()
+    );
+    setLocalCycle(preservedCycle);
     setIsReviewModalOpen(false);
     setReviewActionNotice(
-      `Kept current Cycle #${preservedCycle.cycleNumber} targets (${preservedCycle.targetDailyCalories} kcal/day).`
+      `Kept current targets (${preservedCycle.targetDailyCalories} kcal/day). Started Cycle #${preservedCycle.cycleNumber}.`
     );
+
+    try {
+      await saveActivePlanCycle(preservedCycle);
+    } catch {
+      // Non-fatal
+    }
+
+    if (onUpdatePlanCycle) {
+      await onUpdatePlanCycle(preservedCycle, completedPreviousCycle);
+    }
   };
 
   const latestWeightKg =

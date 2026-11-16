@@ -122,12 +122,19 @@ export function applyApprovedPlanReview(
 /**
  * Marks a `ProposedPlanReview` as rejected ("Keep Current Plan") and starts a fresh
  * 14-day cycle preserving the current calorie and macronutrient targets.
+ *
+ * The finished cycle is closed as "completed" (not "reviewed", which is reserved
+ * for an approved adaptation) and returned so the caller can archive it.
+ * `preservedCycle` is the NEW active cycle; without it the review would remain
+ * due indefinitely.
  */
 export function keepCurrentPlanOnReview(
   currentCycle: AdaptivePlanCycle,
-  review: ProposedPlanReview
+  review: ProposedPlanReview,
+  nextStartDateMs: number = Date.now()
 ): {
   readonly rejectedReview: ProposedPlanReview;
+  readonly completedPreviousCycle: AdaptivePlanCycle;
   readonly preservedCycle: AdaptivePlanCycle;
 } {
   const rejectedReview = ProposedPlanReviewSchema.parse({
@@ -135,9 +142,26 @@ export function keepCurrentPlanOnReview(
     status: "rejected"
   });
 
+  // Hold targets constant by "approving" a review that proposes the current ones.
+  const heldReview: ProposedPlanReview = {
+    ...review,
+    proposedDailyCalories: currentCycle.targetDailyCalories,
+    calorieAdjustment: 0,
+    proposedMacroSplit: {
+      proteinGrams: currentCycle.targetDailyProteinGrams,
+      carbsGrams: currentCycle.targetDailyCarbsGrams,
+      fatGrams: currentCycle.targetDailyFatGrams
+    }
+  };
+  const { nextCycle } = applyApprovedPlanReview(currentCycle, heldReview, nextStartDateMs);
+
   return {
     rejectedReview,
-    preservedCycle: currentCycle
+    completedPreviousCycle: AdaptivePlanCycleSchema.parse({
+      ...currentCycle,
+      status: "completed"
+    }),
+    preservedCycle: nextCycle
   };
 }
 
