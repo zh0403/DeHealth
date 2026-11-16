@@ -31,11 +31,13 @@ import {
   getAdaptiveStorage,
   getDailyTaskCompletion,
   getPlanHistory,
+  getTelemetrySalt,
   getUserBiometrics,
   getWeightLogs,
   saveActivePlanCycle,
   saveDailyTaskCompletion,
   savePlanHistory,
+  saveTelemetrySalt,
   saveUserBiometrics,
   saveWeightLog,
   setAdaptiveStorage,
@@ -310,15 +312,18 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
     });
 
     describe("clearAllAdaptiveData & Sovereignty", () => {
-      it("removes all 5 adaptive storage keys leaving storage completely reset", async () => {
+      it("removes all 6 adaptive storage keys leaving storage completely reset", async () => {
         await saveUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
         const plan = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now(), null);
         await saveActivePlanCycle(plan);
         await saveWeightLog({ id: "w-1", timestampMs: Date.now(), weightKg: 70 });
         await saveDailyTaskCompletion(1, "nutrition", true);
         await savePlanHistory([plan]);
+        const saltedHash = `0x${"11".repeat(32)}` as `0x${string}`;
+        await saveTelemetrySalt(saltedHash, `0x${"22".repeat(32)}` as `0x${string}`);
 
         // Verify items were persisted
+        expect(await getTelemetrySalt(saltedHash)).not.toBeNull();
         expect(await getUserBiometrics()).not.toBeNull();
         expect(await getActivePlanCycle()).not.toBeNull();
         expect((await getWeightLogs()).length).toBe(1);
@@ -332,6 +337,7 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
         expect(await getWeightLogs()).toEqual([]);
         expect(await getDailyTaskCompletion()).toEqual({});
         expect(await getPlanHistory()).toEqual([]);
+        expect(await getTelemetrySalt(saltedHash)).toBeNull();
       });
 
       it("is idempotent when invoked on already empty storage", async () => {

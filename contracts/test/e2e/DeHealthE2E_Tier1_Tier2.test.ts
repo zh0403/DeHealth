@@ -29,10 +29,16 @@ import {
 } from "@dehealth/shared";
 import {
   computeWorkoutProofDigest,
-  hashTelemetry,
+  hashTelemetry as hashTelemetryCommitment,
   signWorkoutProof,
   verifyWorkoutProofSignature
 } from "../../../mobile/src/services/cryptoService";
+
+// Fixed salt keeps digests stable so replay/determinism assertions remain
+// meaningful. Production code generates a fresh random salt per claim.
+const FIXED_TEST_SALT = `0x${"5a".repeat(32)}` as `0x${string}`;
+const hashTelemetry = (metrics: Parameters<typeof hashTelemetryCommitment>[0]): `0x${string}` =>
+  hashTelemetryCommitment(metrics, FIXED_TEST_SALT).telemetryHash;
 import {
   calculateBaselineTarget,
   evaluateDailyTarget,

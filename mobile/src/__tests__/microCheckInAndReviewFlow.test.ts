@@ -38,10 +38,16 @@ import {
   generate14DayPlan
 } from "../services/adaptivePlanEngine";
 import {
-  hashTelemetry,
+  hashTelemetry as hashTelemetryCommitment,
   signWorkoutProof,
   verifyWorkoutProofSignature
 } from "../services/cryptoService";
+
+// Fixed salt keeps digests stable so replay/determinism assertions remain
+// meaningful. Production code generates a fresh random salt per claim.
+const FIXED_TEST_SALT = `0x${"5a".repeat(32)}` as `0x${string}`;
+const hashTelemetry = (metrics: Parameters<typeof hashTelemetryCommitment>[0]): `0x${string}` =>
+  hashTelemetryCommitment(metrics, FIXED_TEST_SALT).telemetryHash;
 
 describe("Phase 2.0 Dual-Track Check-In & Bi-Weekly Plan Review Suite", () => {
   describe("Track 1: Nutrition & Quick Food Portion Calculator", () => {

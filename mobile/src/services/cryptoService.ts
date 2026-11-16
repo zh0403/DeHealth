@@ -2,6 +2,7 @@ import {
   Address,
   ARBITRUM_SEPOLIA_CHAIN_ID,
   Bytes32,
+  Bytes32Schema,
   createDeHealthDomain,
   SignedWorkoutClaimPayload,
   SignedWorkoutClaimPayloadSchema,
@@ -12,7 +13,11 @@ import {
   WorkoutProofSchema
 } from "@dehealth/shared";
 import {
+  concat,
+  getBytes,
+  hexlify,
   keccak256,
+  randomBytes,
   Signer,
   toUtf8Bytes,
   TypedDataEncoder,
@@ -32,13 +37,22 @@ function getMutableWorkoutProofTypes(): {
   };
 }
 
+export const TELEMETRY_COMMITMENT_DOMAIN = "dehealth.telemetry.commitment.v2";
+
+export interface TelemetryCommitment {
+  readonly telemetryHash: Bytes32;
+  readonly salt: Bytes32;
+}
+
 /**
- * Produces a deterministic canonical JSON representation of TelemetryData
- * and hashes it using real Keccak-256.
+ * Generates a fresh 32-byte random salt for one telemetry commitment.
  */
-export function hashTelemetry(metrics: TelemetryData): Bytes32 {
-  const validated = TelemetryDataSchema.parse(metrics);
-  const canonicalPayload = JSON.stringify({
+export function generateTelemetrySalt(): Bytes32 {
+  return hexlify(randomBytes(32)) as Bytes32;
+}
+
+function canonicalizeTelemetry(validated: TelemetryData): string {
+  return JSON.stringify({
     timestampMs: validated.timestampMs,
     stepCount: validated.stepCount,
     activeMinutes: validated.activeMinutes,
@@ -51,10 +65,59 @@ export function hashTelemetry(metrics: TelemetryData): Bytes32 {
       muscleMassKg: Number(validated.profileSnapshot.muscleMassKg.toFixed(2))
     }
   });
-
-  return keccak256(toUtf8Bytes(canonicalPayload)) as Bytes32;
 }
 
+function computeCommitment(validated: TelemetryData, salt: Bytes32): Bytes32 {
+  // Fixed-length prefix + fixed-length salt + variable payload: no ambiguity
+  // between where one field ends and the next begins.
+  return keccak256(
+    concat([
+      toUtf8Bytes(TELEMETRY_COMMITMENT_DOMAIN),
+      getBytes(salt),
+      toUtf8Bytes(canonicalizeTelemetry(validated))
+    ])
+  ) as Bytes32;
+}
+
+/**
+ * Produces a salted Keccak-256 commitment to canonical TelemetryData.
+ *
+ * Without a salt, the preimage space (a few bounded integers plus a known claim
+ * time) is small enough to brute-force from a published hash. A per-claim random
+ * 32-byte salt makes the digest infeasible to reverse or rainbow-table.
+ *
+ * The caller must store `salt` locally (encrypted) if it ever wants to reveal
+ * and verify the commitment later. Pass an explicit `salt` only for
+ * deterministic tests; production callers should let one be generated.
+ */
+export function hashTelemetry(
+  metrics: TelemetryData,
+  salt?: Bytes32
+): TelemetryCommitment {
+  const validated = TelemetryDataSchema.parse(metrics);
+  const effectiveSalt = salt !== undefined ? Bytes32Schema.parse(salt) : generateTelemetrySalt();
+  return {
+    telemetryHash: computeCommitment(validated, effectiveSalt),
+    salt: effectiveSalt
+  };
+}
+
+/**
+ * Verifies that `telemetryHash` is the commitment to `metrics` under `salt`.
+ */
+export function verifyTelemetryCommitment(
+  metrics: TelemetryData,
+  salt: Bytes32,
+  telemetryHash: Bytes32
+): boolean {
+  try {
+    const validated = TelemetryDataSchema.parse(metrics);
+    const expected = computeCommitment(validated, Bytes32Schema.parse(salt));
+    return expected.toLowerCase() === Bytes32Schema.parse(telemetryHash).toLowerCase();
+  } catch {
+    return false;
+  }
+}
 /**
  * Computes the EIP-712 typed data digest for a WorkoutProof struct.
  */

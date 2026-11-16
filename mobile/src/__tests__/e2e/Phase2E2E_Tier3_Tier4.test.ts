@@ -40,10 +40,16 @@ import { ethers, Wallet } from "ethers";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
   computeWorkoutProofDigest,
-  hashTelemetry,
+  hashTelemetry as hashTelemetryCommitment,
   signWorkoutProof,
   verifyWorkoutProofSignature
 } from "../../services/cryptoService";
+
+// Fixed salt keeps digests stable so replay/determinism assertions remain
+// meaningful. Production code generates a fresh random salt per claim.
+const FIXED_TEST_SALT = `0x${"5a".repeat(32)}` as `0x${string}`;
+const hashTelemetry = (metrics: Parameters<typeof hashTelemetryCommitment>[0]): `0x${string}` =>
+  hashTelemetryCommitment(metrics, FIXED_TEST_SALT).telemetryHash;
 import {
   FATIGUE_GAP_THRESHOLD_MS,
   FATIGUE_SCALING_MULTIPLIER,

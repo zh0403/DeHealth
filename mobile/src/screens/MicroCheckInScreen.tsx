@@ -28,7 +28,10 @@ import {
   scaleFoodPresetPortion
 } from "../services/adaptivePlanEngine";
 import { hashTelemetry, signWorkoutProof } from "../services/cryptoService";
-import { saveDailyTaskCompletion } from "../storage/adaptiveStorage";
+import {
+  saveDailyTaskCompletion,
+  saveTelemetrySalt
+} from "../storage/adaptiveStorage";
 
 export interface HabitCardDefinition {
   readonly id: string;
@@ -471,7 +474,15 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
             }
           : buildDailyPlanTelemetry(localPlan, userProfile, Date.now());
 
-      const telemetryHash: Bytes32 = hashTelemetry(telemetry);
+      const { telemetryHash, salt }: { telemetryHash: Bytes32; salt: Bytes32 } =
+        hashTelemetry(telemetry);
+      try {
+        // Salt stays in the encrypted local vault so the owner can later reveal
+        // and verify the commitment. It is never part of the signed payload.
+        await saveTelemetrySalt(telemetryHash, salt);
+      } catch {
+        // Non-fatal: the commitment is still valid, only later reveal is lost.
+      }
 
       setStatusStep("2/3 Signing EIP-712 WorkoutProof on-device...");
       const deadlineSeconds = BigInt(Math.floor(Date.now() / 1000) + 3600);

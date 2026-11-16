@@ -5,12 +5,13 @@ import {
   UserProfile,
   WorkoutProof
 } from "@dehealth/shared";
-import { ethers, Wallet } from "ethers";
+import { ethers, keccak256, toUtf8Bytes, Wallet } from "ethers";
 import { describe, expect, it } from "vitest";
 import {
   computeWorkoutProofDigest,
   hashTelemetry,
   signWorkoutProof,
+  verifyTelemetryCommitment,
   verifyWorkoutProofSignature
 } from "../services/cryptoService";
 import {
@@ -135,12 +136,62 @@ describe("Mobile Client Crypto & Profile Unit Test Suite", () => {
       }
     };
 
-    it("deterministically computes Keccak-256 hash matching regex format", () => {
-      const hash1 = hashTelemetry(validTelemetry);
-      const hash2 = hashTelemetry(validTelemetry);
+    const FIXED_SALT = `0x${"ab".repeat(32)}` as `0x${string}`;
 
-      expect(hash1).toEqual(hash2);
-      expect(hash1).toMatch(/^0x[a-fA-F0-9]{64}$/);
+    it("deterministically computes Keccak-256 hash under a fixed salt, matching regex format", () => {
+      const c1 = hashTelemetry(validTelemetry, FIXED_SALT);
+      const c2 = hashTelemetry(validTelemetry, FIXED_SALT);
+
+      expect(c1).toEqual(c2);
+      expect(c1.salt).toBe(FIXED_SALT);
+      expect(c1.telemetryHash).toMatch(/^0x[a-fA-F0-9]{64}$/);
+    });
+
+    it("generates a fresh 32-byte salt per call so identical telemetry yields different digests", () => {
+      const c1 = hashTelemetry(validTelemetry);
+      const c2 = hashTelemetry(validTelemetry);
+
+      expect(c1.salt).toMatch(/^0x[a-f0-9]{64}$/);
+      expect(c2.salt).toMatch(/^0x[a-f0-9]{64}$/);
+      expect(c1.salt).not.toBe(c2.salt);
+      expect(c1.telemetryHash).not.toBe(c2.telemetryHash);
+    });
+
+    it("cannot be reproduced from telemetry alone: the unsalted preimage no longer matches", () => {
+      const { telemetryHash } = hashTelemetry(validTelemetry);
+      const unsalted = keccak256(
+        toUtf8Bytes(
+          JSON.stringify({
+            timestampMs: validTelemetry.timestampMs,
+            stepCount: validTelemetry.stepCount,
+            activeMinutes: validTelemetry.activeMinutes,
+            avgHeartRateBpm: 142.25,
+            caloriesBurnedKcal: 520.5,
+            profileSnapshot: {
+              age: 29,
+              gender: "male",
+              bodyFatPct: 18.5,
+              muscleMassKg: 62
+            }
+          })
+        )
+      );
+      expect(telemetryHash).not.toBe(unsalted);
+    });
+
+    it("verifies a commitment only with the correct telemetry and salt", () => {
+      const { telemetryHash, salt } = hashTelemetry(validTelemetry);
+      const otherSalt = `0x${"cd".repeat(32)}` as `0x${string}`;
+      const tampered: TelemetryData = { ...validTelemetry, stepCount: validTelemetry.stepCount + 1 };
+
+      expect(verifyTelemetryCommitment(validTelemetry, salt, telemetryHash)).toBe(true);
+      expect(verifyTelemetryCommitment(validTelemetry, otherSalt, telemetryHash)).toBe(false);
+      expect(verifyTelemetryCommitment(tampered, salt, telemetryHash)).toBe(false);
+      expect(verifyTelemetryCommitment(validTelemetry, "0x12" as `0x${string}`, telemetryHash)).toBe(false);
+    });
+
+    it("rejects a malformed explicit salt", () => {
+      expect(() => hashTelemetry(validTelemetry, "0xdeadbeef" as `0x${string}`)).toThrow();
     });
 
     it("normalizes float precision and gender casing in telemetry hashing", () => {
@@ -153,14 +204,14 @@ describe("Mobile Client Crypto & Profile Unit Test Suite", () => {
         profileSnapshot: { ...validTelemetry.profileSnapshot, gender: "male", bodyFatPct: 18.5 }
       };
 
-      expect(hashTelemetry(telA)).toEqual(hashTelemetry(telB));
+      expect(hashTelemetry(telA, FIXED_SALT)).toEqual(hashTelemetry(telB, FIXED_SALT));
     });
 
     it("computes EIP-712 typed data digest matching TypedDataEncoder", () => {
       const dummyGate = "0x1111111111111111111111111111111111111111";
       const proof: WorkoutProof = {
         user: "0x2222222222222222222222222222222222222222",
-        telemetryHash: hashTelemetry(validTelemetry),
+        telemetryHash: hashTelemetry(validTelemetry).telemetryHash,
         streakCount: 5n,
         nonce: 1n,
         deadline: 1893456000n
@@ -175,7 +226,7 @@ describe("Mobile Client Crypto & Profile Unit Test Suite", () => {
       const dummyGate = "0x1111111111111111111111111111111111111111";
       const proof: WorkoutProof = {
         user: wallet.address as `0x${string}`,
-        telemetryHash: hashTelemetry(validTelemetry),
+        telemetryHash: hashTelemetry(validTelemetry).telemetryHash,
         streakCount: 1n,
         nonce: 0n,
         deadline: 1893456000n
@@ -195,7 +246,7 @@ describe("Mobile Client Crypto & Profile Unit Test Suite", () => {
 
       const proof: WorkoutProof = {
         user: realUser.address as `0x${string}`,
-        telemetryHash: hashTelemetry(validTelemetry),
+        telemetryHash: hashTelemetry(validTelemetry).telemetryHash,
         streakCount: 1n,
         nonce: 0n,
         deadline: 1893456000n
