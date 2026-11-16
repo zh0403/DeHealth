@@ -26,14 +26,21 @@ import { AnonymizedFeedScreen } from "./src/screens/AnonymizedFeedScreen";
 import { DashboardScreen } from "./src/screens/DashboardScreen";
 import { MicroCheckInScreen } from "./src/screens/MicroCheckInScreen";
 import { OnboardingWizardScreen } from "./src/screens/OnboardingWizardScreen";
-import { generate14DayPlan } from "./src/services/adaptivePlanEngine";
+import {
+  appendCycleToHistory,
+  calculateAdherencePct,
+  generate14DayPlan,
+  getActiveDayIndex
+} from "./src/services/adaptivePlanEngine";
 import { verifyWorkoutProofSignature } from "./src/services/cryptoService";
 import { evaluateDailyTarget } from "./src/services/profileEngine";
 import {
   getActivePlanCycle,
+  getPlanHistory,
   getUserBiometrics,
   getWeightLogs,
-  saveActivePlanCycle
+  saveActivePlanCycle,
+  savePlanHistory
 } from "./src/storage/adaptiveStorage";
 
 type ActiveTab = "checkin" | "dashboard" | "feed";
@@ -123,6 +130,14 @@ export default function App(): React.ReactElement {
   const [cheerCounts, setCheerCounts] =
     useState<Readonly<Record<string, number>>>(INITIAL_CHEERS);
   const [isPerksDrawerOpen, setIsPerksDrawerOpen] = useState<boolean>(false);
+  // Wall clock for day-index and adherence; ticks each minute so the active day
+  // rolls over at midnight even if the app stays open.
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+
+  useEffect(() => {
+    const timer = setInterval(() => setNowMs(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -168,11 +183,17 @@ export default function App(): React.ReactElement {
   );
 
   const todayPlan: DailyPlan = useMemo(() => {
+    const dayIndex = getActiveDayIndex(activeCycle.startDateMs, nowMs);
     return (
-      activeCycle.dailyPlans[0] ??
-      generate14DayPlan(userBiometrics, Date.now()).dailyPlans[0]!
+      activeCycle.dailyPlans[dayIndex] ??
+      generate14DayPlan(userBiometrics, nowMs).dailyPlans[0]!
     );
-  }, [activeCycle, userBiometrics]);
+  }, [activeCycle, userBiometrics, nowMs]);
+
+  const adherencePct = useMemo<number>(
+    () => calculateAdherencePct(activeCycle, nowMs),
+    [activeCycle, nowMs]
+  );
 
   const handleOnboardingComplete = (
     bio: UserBiometrics,
@@ -203,6 +224,23 @@ export default function App(): React.ReactElement {
     };
     setActiveCycle(nextCycle);
     void saveActivePlanCycle(nextCycle).catch(() => undefined);
+  };
+
+  const handleApprovePlan = async (
+    nextCycle: AdaptivePlanCycle,
+    completedPreviousCycle?: AdaptivePlanCycle
+  ): Promise<void> => {
+    setActiveCycle(nextCycle);
+    if (!completedPreviousCycle) {
+      return;
+    }
+    // Archive the finished 14-day cycle so plan history survives approval.
+    try {
+      const history = await getPlanHistory();
+      await savePlanHistory(appendCycleToHistory(history, completedPreviousCycle));
+    } catch {
+      // Non-fatal: the new cycle is already active and persisted by the dashboard.
+    }
   };
 
   const handleDispatchSignedClaim = async (
@@ -299,13 +337,14 @@ export default function App(): React.ReactElement {
                   lastProofHash={lastProofHash}
                   targetAssessment={targetAssessment}
                   activeCycle={activeCycle}
+                  todayPlan={todayPlan}
                   weightLogs={weightLogs}
+                  adherencePct={adherencePct}
+                  currentTimestampMs={nowMs}
                   onLogWeightEntry={(entry) => {
                     setWeightLogs((prev) => [...prev, entry]);
                   }}
-                  onUpdatePlanCycle={(nextCycle) => {
-                    setActiveCycle(nextCycle);
-                  }}
+                  onUpdatePlanCycle={handleApprovePlan}
                   onOpenPerksDrawer={() => setIsPerksDrawerOpen(true)}
                 />
               ) : null}

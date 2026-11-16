@@ -362,6 +362,43 @@ export function generate14DayPlan(
   return AdaptivePlanCycleSchema.parse(cycle);
 }
 
+export const MS_PER_DAY = 86_400_000;
+export const CYCLE_LENGTH_DAYS = 14;
+
+/**
+ * Index (0..13) of the active day within a 14-day cycle, derived from wall-clock
+ * time. Clamped, so a stale cycle stays on its final day until it is reviewed and
+ * a new cycle begins, and a start date in the future maps to day 0.
+ */
+export function getActiveDayIndex(startDateMs: number, nowMs: number): number {
+  const elapsedDays = Math.floor((nowMs - startDateMs) / MS_PER_DAY);
+  return Math.min(CYCLE_LENGTH_DAYS - 1, Math.max(0, elapsedDays));
+}
+
+/**
+ * Real adherence for the cycle: completed days divided by elapsed days
+ * (inclusive of today), as a percentage rounded to one decimal.
+ * Never returns a fabricated figure; an unfinished today counts against it
+ * until the day's proof is signed.
+ */
+export function calculateAdherencePct(cycle: AdaptivePlanCycle, nowMs: number): number {
+  const elapsedDays = getActiveDayIndex(cycle.startDateMs, nowMs) + 1;
+  const completedDays = cycle.dailyPlans
+    .slice(0, elapsedDays)
+    .filter((plan) => plan.completed).length;
+  return Number(((completedDays / elapsedDays) * 100).toFixed(1));
+}
+
+/**
+ * Returns `history` with `cycle` appended. Idempotent: a cycle whose id is
+ * already archived replaces the earlier entry instead of duplicating it.
+ */
+export function appendCycleToHistory(
+  history: readonly AdaptivePlanCycle[],
+  cycle: AdaptivePlanCycle
+): AdaptivePlanCycle[] {
+  return [...history.filter((entry) => entry.id !== cycle.id), cycle];
+}
 /**
  * Calculates the rolling average of up to 7 trailing chronological weight logs.
  * Returns null if the weight log collection is empty.

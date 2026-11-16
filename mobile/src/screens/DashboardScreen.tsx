@@ -1,6 +1,7 @@
 import {
   AdaptivePlanCycle,
   Bytes32,
+  DailyPlan,
   DEFAULT_BASELINE_BIOMETRICS,
   ProposedPlanReview,
   WeightLogEntry,
@@ -23,6 +24,7 @@ import {
   PlanReviewModal
 } from "../components/PlanReviewModal";
 import {
+  calculateAdherencePct,
   calculateRollingWeightAverage,
   evaluateBiWeeklyReview,
   generate14DayPlan
@@ -108,11 +110,24 @@ export interface DashboardScreenProps {
   readonly targetAssessment: DailyTargetAssessment;
   readonly onOpenPerksDrawer?: () => void;
   readonly activeCycle?: AdaptivePlanCycle | null;
+  /** Plan for the current day of the active cycle (see getActiveDayIndex). */
+  readonly todayPlan?: DailyPlan;
   readonly weightLogs?: readonly WeightLogEntry[];
+  /**
+   * Live adherence percentage. When omitted it is computed from the cycle's
+   * completed days; there is deliberately no fixed default.
+   */
   readonly adherencePct?: number;
   readonly currentTimestampMs?: number;
   readonly onLogWeightEntry?: (entry: WeightLogEntry) => Promise<void> | void;
-  readonly onUpdatePlanCycle?: (nextCycle: AdaptivePlanCycle) => Promise<void> | void;
+  /**
+   * Called when the user approves a review. `completedPreviousCycle` is the
+   * finished cycle, so the caller can archive it to plan history.
+   */
+  readonly onUpdatePlanCycle?: (
+    nextCycle: AdaptivePlanCycle,
+    completedPreviousCycle?: AdaptivePlanCycle
+  ) => Promise<void> | void;
 }
 
 const WEEK_DAYS: ReadonlyArray<{
@@ -136,8 +151,9 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   targetAssessment,
   onOpenPerksDrawer,
   activeCycle: externalCycle,
+  todayPlan,
   weightLogs: externalWeightLogs,
-  adherencePct = 88,
+  adherencePct: adherencePctProp,
   currentTimestampMs,
   onLogWeightEntry,
   onUpdatePlanCycle
@@ -171,6 +187,23 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const effectiveCycle = externalCycle ?? localCycle;
   const effectiveWeightLogs = externalWeightLogs ?? localWeightLogs;
   const nowMs = currentTimestampMs ?? Date.now();
+  const adherencePct =
+    adherencePctProp ?? calculateAdherencePct(effectiveCycle, nowMs);
+
+  const ringProgress = useMemo<{ readonly pct: number; readonly label: string }>(() => {
+    if (!todayPlan) {
+      return { pct: 0, label: "No plan today" };
+    }
+    if (todayPlan.completed) {
+      return { pct: 100, label: "Ring Closed" };
+    }
+    const total = todayPlan.exercises.length;
+    const done = todayPlan.exercises.filter((ex) => ex.completed).length;
+    return {
+      pct: total === 0 ? 0 : Math.round((done / total) * 100),
+      label: `Day ${todayPlan.dayNumber} of 14`
+    };
+  }, [todayPlan]);
 
   const [isWeightModalOpen, setIsWeightModalOpen] = useState<boolean>(false);
   const [weightInputStr, setWeightInputStr] = useState<string>(
@@ -250,7 +283,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const handleApproveReview = async (
     review: ProposedPlanReview
   ): Promise<void> => {
-    const { nextCycle } = applyApprovedPlanReview(
+    const { nextCycle, completedPreviousCycle } = applyApprovedPlanReview(
       effectiveCycle,
       review,
       Date.now()
@@ -268,7 +301,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
 
     if (onUpdatePlanCycle) {
-      await onUpdatePlanCycle(nextCycle);
+      await onUpdatePlanCycle(nextCycle, completedPreviousCycle);
     }
   };
 
@@ -332,8 +365,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           <View style={styles.outerGlowRing}>
             <View style={styles.innerGlowRing}>
               <Text style={styles.ringFlameIcon}>🔥</Text>
-              <Text style={styles.ringPercentText}>100%</Text>
-              <Text style={styles.ringSubtext}>Ring Closed</Text>
+              <Text style={styles.ringPercentText}>{ringProgress.pct}%</Text>
+              <Text style={styles.ringSubtext}>{ringProgress.label}</Text>
             </View>
           </View>
         </View>
