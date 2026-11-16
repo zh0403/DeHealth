@@ -66,290 +66,23 @@ const FIXED_TEST_SALT = `0x${"5a".repeat(32)}` as `0x${string}`;
 const hashTelemetry = (metrics: Parameters<typeof hashTelemetryCommitment>[0]): `0x${string}` =>
   hashTelemetryCommitment(metrics, FIXED_TEST_SALT).telemetryHash;
 import {
+  ACTIVITY_MULTIPLIERS,
+  calculateBmr,
+  calculateMacroSplit,
+  calculateRollingWeightAverage,
+  calculateTargetCalories,
+  calculateTdee,
+  evaluateBiWeeklyReview,
+  FATIGUE_GAP_THRESHOLD_MS,
+  FATIGUE_SCALING_MULTIPLIER as FATIGUE_SCALING_FACTOR,
+  SAFE_CALORIE_FLOOR_KCAL as SAFE_CALORIE_FLOOR,
+  scaleExercisesForFatigue,
+  scaleFoodPresetPortion
+} from "../../services/adaptivePlanEngine";
+import {
   EncryptedStorageAdapter,
   KeyValueStorageBackend
 } from "../../storage/encryptedStorageAdapter";
-
-// ============================================================================
-// Deterministic Physiology & Plan Contract Helpers (Phase 2.0 Specification)
-// ============================================================================
-
-export const SAFE_CALORIE_FLOOR = 1200;
-export const FATIGUE_GAP_THRESHOLD_MS = 48 * 60 * 60 * 1000; // 48h
-export const FATIGUE_SCALING_FACTOR = 0.7; // 30% reduction
-
-export const ACTIVITY_MULTIPLIERS: Record<ActivityLevel, number> = {
-  sedentary: 1.2,
-  light: 1.375,
-  moderate: 1.55,
-  heavy: 1.725,
-  very_active: 1.9
-};
-
-/**
- * Deterministic BMR:
- * - Katch-McArdle when bodyFatPct is provided: 370 + (21.6 * LBM)
- * - Mifflin-St Jeor fallback: 10*W + 6.25*H - 5*A + genderOffset (+5 male, -161 female, -78 other)
- */
-export function calculateBmr(biometrics: UserBiometrics): number {
-  if (biometrics.bodyFatPct !== undefined && biometrics.bodyFatPct > 0) {
-    const lbm = biometrics.weightKg * (1 - biometrics.bodyFatPct / 100);
-    return Math.round(370 + 21.6 * lbm);
-  }
-  const base = 10 * biometrics.weightKg + 6.25 * biometrics.heightCm - 5 * biometrics.age;
-  if (biometrics.gender === "male") {
-    return Math.round(base + 5);
-  } else if (biometrics.gender === "female") {
-    return Math.round(base - 161);
-  } else {
-    // "other": midpoint of male and female: (5 + -161) / 2 = -78
-    return Math.round(base - 78);
-  }
-}
-
-/**
- * Calculates TDEE from BMR and weekly frequency or activity level.
- */
-export function calculateTdee(
-  bmr: number,
-  weeklyFrequency: number,
-  activityLevel?: ActivityLevel
-): number {
-  let multiplier: number;
-  if (activityLevel) {
-    multiplier = ACTIVITY_MULTIPLIERS[activityLevel];
-  } else if (weeklyFrequency <= 1) {
-    multiplier = 1.2;
-  } else if (weeklyFrequency <= 3) {
-    multiplier = 1.375;
-  } else if (weeklyFrequency <= 5) {
-    multiplier = 1.55;
-  } else {
-    multiplier = 1.725;
-  }
-  return Math.round(bmr * multiplier);
-}
-
-/**
- * Calculates daily target calories clamped to safe floor (>= 1200 kcal/day).
- */
-export function calculateTargetCalories(tdee: number, goal: FitnessGoal): number {
-  let target: number;
-  switch (goal) {
-    case "cut":
-    case "fat_loss":
-      target = tdee - 500;
-      break;
-    case "bulk":
-    case "muscle_gain":
-      target = tdee + 300;
-      break;
-    case "maintain":
-    case "maintenance":
-    default:
-      target = tdee;
-      break;
-  }
-  return Math.max(SAFE_CALORIE_FLOOR, Math.round(target));
-}
-
-/**
- * Allocates macro splits:
- * - Cut: 35% protein, 35% carbs, 30% fat
- * - Maintain: 25% protein, 50% carbs, 25% fat
- * - Bulk: 25% protein, 55% carbs, 20% fat
- */
-export function calculateMacroSplit(targetCalories: number, goal: FitnessGoal): MacroSplit {
-  const calories = Math.max(SAFE_CALORIE_FLOOR, targetCalories);
-  let pRatio: number;
-  let cRatio: number;
-  let fRatio: number;
-
-  switch (goal) {
-    case "cut":
-    case "fat_loss":
-      pRatio = 0.35;
-      cRatio = 0.35;
-      fRatio = 0.3;
-      break;
-    case "bulk":
-    case "muscle_gain":
-      pRatio = 0.25;
-      cRatio = 0.55;
-      fRatio = 0.2;
-      break;
-    case "maintain":
-    case "maintenance":
-    default:
-      pRatio = 0.25;
-      cRatio = 0.5;
-      fRatio = 0.25;
-      break;
-  }
-
-  const proteinGrams = Math.round((calories * pRatio) / 4);
-  const carbsGrams = Math.round((calories * cRatio) / 4);
-  const fatGrams = Math.round((calories * fRatio) / 9);
-
-  return { proteinGrams, carbsGrams, fatGrams };
-}
-
-/**
- * Scales workout exercises down by 30% if inactivity gap > 48 hours.
- */
-export function scaleExercisesForFatigue(
-  exercises: readonly WorkoutExerciseItem[],
-  lastLogTimestampMs: number | null,
-  currentTimestampMs: number
-): { exercises: WorkoutExerciseItem[]; isFatigueScaled: boolean } {
-  if (lastLogTimestampMs === null) {
-    return {
-      exercises: exercises.map((e) => ({ ...e, scaledForFatigue: false })),
-      isFatigueScaled: false
-    };
-  }
-  const elapsedMs = currentTimestampMs - lastLogTimestampMs;
-  if (elapsedMs > FATIGUE_GAP_THRESHOLD_MS) {
-    const scaled = exercises.map((e) => ({
-      ...e,
-      sets: Math.max(1, Math.round(e.sets * FATIGUE_SCALING_FACTOR)),
-      durationMinutes:
-        e.durationMinutes !== undefined
-          ? Math.max(1, Math.round(e.durationMinutes * FATIGUE_SCALING_FACTOR))
-          : undefined,
-      scaledForFatigue: true
-    }));
-    return { exercises: scaled, isFatigueScaled: true };
-  }
-  return {
-    exercises: exercises.map((e) => ({ ...e, scaledForFatigue: false })),
-    isFatigueScaled: false
-  };
-}
-
-/**
- * Calculates rolling average of the most recent up to 7 chronological weight logs.
- */
-export function calculateRollingWeightAverage(logs: readonly WeightLogEntry[]): number | null {
-  if (logs.length === 0) return null;
-  const sorted = [...logs].sort((a, b) => a.timestampMs - b.timestampMs);
-  const recent7 = sorted.slice(-7);
-  const sum = recent7.reduce((acc, entry) => acc + entry.weightKg, 0);
-  return Number((sum / recent7.length).toFixed(2));
-}
-
-/**
- * Deterministic 14-day Bi-Weekly Review evaluation.
- */
-export function evaluateBiWeeklyReview(
-  currentCycle: AdaptivePlanCycle,
-  weightLogs: readonly WeightLogEntry[],
-  adherencePct: number,
-  reviewDateMs: number
-): ProposedPlanReview {
-  const startingWeight = currentCycle.baselineBiometrics.weightKg;
-  const rollingAvg = calculateRollingWeightAverage(weightLogs);
-  const sorted = [...weightLogs].sort((a, b) => a.timestampMs - b.timestampMs);
-  const currentWeight = sorted.length > 0 ? sorted[sorted.length - 1]!.weightKg : startingWeight;
-  const weightChange = Number((currentWeight - startingWeight).toFixed(2));
-  const effectiveRollingAvg = rollingAvg ?? currentWeight;
-
-  let calorieAdjustment = 0;
-  let rationale = "";
-
-  if (adherencePct < 70) {
-    calorieAdjustment = 0;
-    rationale = `Adherence was ${adherencePct.toFixed(1)}% (< 70% threshold). Targets held constant to allow metabolic adaptation.`;
-  } else {
-    switch (currentCycle.goal) {
-      case "cut":
-      case "fat_loss":
-        if (weightChange > -0.2) {
-          calorieAdjustment = -150;
-          rationale = `Plateau detected over 14 days (weight change ${weightChange} kg >= -0.2 kg). Decreasing daily calories by 150 kcal.`;
-        } else {
-          calorieAdjustment = 0;
-          rationale = `On track for fat loss (weight change ${weightChange} kg). Caloric deficit maintained.`;
-        }
-        break;
-      case "bulk":
-      case "muscle_gain":
-        if (weightChange < 0.2) {
-          calorieAdjustment = 150;
-          rationale = `Weight gain slow (${weightChange} kg < 0.2 kg). Increasing daily surplus by 150 kcal.`;
-        } else {
-          calorieAdjustment = 0;
-          rationale = `On track for muscle gain (+${weightChange} kg). Caloric surplus maintained.`;
-        }
-        break;
-      case "maintain":
-      case "maintenance":
-      default:
-        if (weightChange > 0.5) {
-          calorieAdjustment = -100;
-          rationale = `Weight drifted upward (+${weightChange} kg). Adjusting target down by 100 kcal.`;
-        } else if (weightChange < -0.5) {
-          calorieAdjustment = 100;
-          rationale = `Weight drifted downward (${weightChange} kg). Adjusting target up by 100 kcal.`;
-        } else {
-          calorieAdjustment = 0;
-          rationale = `Weight stable (${weightChange} kg). Maintenance caloric targets preserved.`;
-        }
-        break;
-    }
-  }
-
-  const proposedDailyCalories = Math.max(
-    SAFE_CALORIE_FLOOR,
-    currentCycle.targetDailyCalories + calorieAdjustment
-  );
-  const actualAdjustment = proposedDailyCalories - currentCycle.targetDailyCalories;
-
-  const currentMacroSplit: MacroSplit = {
-    proteinGrams: currentCycle.targetDailyProteinGrams,
-    carbsGrams: currentCycle.targetDailyCarbsGrams,
-    fatGrams: currentCycle.targetDailyFatGrams
-  };
-  const proposedMacroSplit = calculateMacroSplit(proposedDailyCalories, currentCycle.goal);
-
-  return {
-    cycleId: currentCycle.id,
-    reviewDateMs,
-    adherencePct,
-    startingWeightKg: startingWeight,
-    currentWeightKg: currentWeight,
-    weightChangeKg: weightChange,
-    rollingAverageWeightKg: effectiveRollingAvg,
-    currentDailyCalories: currentCycle.targetDailyCalories,
-    proposedDailyCalories,
-    calorieAdjustment: actualAdjustment,
-    currentMacroSplit,
-    proposedMacroSplit,
-    rationale,
-    status: "pending"
-  };
-}
-
-/**
- * Scales food preset portion linearly.
- */
-export function scaleFoodPresetPortion(
-  preset: FoodPresetItem,
-  portionGrams: number
-): {
-  caloriesKcal: number;
-  proteinGrams: number;
-  carbsGrams: number;
-  fatGrams: number;
-} {
-  const factor = portionGrams / preset.servingSizeGrams;
-  return {
-    caloriesKcal: Number((preset.caloriesKcal * factor).toFixed(1)),
-    proteinGrams: Number((preset.proteinGrams * factor).toFixed(1)),
-    carbsGrams: Number((preset.carbsGrams * factor).toFixed(1)),
-    fatGrams: Number((preset.fatGrams * factor).toFixed(1))
-  };
-}
 
 /**
  * In-memory test storage backend implementing KeyValueStorageBackend.
@@ -715,18 +448,18 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
       });
 
       it("F4-T1-2: allocates balanced macro split for 'maintain' goal", () => {
-        // 2000 kcal maintain: 25% P (125g), 50% C (250g), 25% F (56g)
+        // 2000 kcal maintain: 30% P (150g), 45% C (225g), 25% F (56g)
         const macros = calculateMacroSplit(2000, "maintain");
-        expect(macros.proteinGrams).toBe(125);
-        expect(macros.carbsGrams).toBe(250);
+        expect(macros.proteinGrams).toBe(150);
+        expect(macros.carbsGrams).toBe(225);
         expect(macros.fatGrams).toBe(56);
       });
 
       it("F4-T1-3: allocates surplus carb-focused macro split for 'bulk' goal", () => {
-        // 2400 kcal bulk: 25% P (150g), 55% C (330g), 20% F (53g)
+        // 2400 kcal bulk: 30% P (180g), 50% C (300g), 20% F (53g)
         const macros = calculateMacroSplit(2400, "bulk");
-        expect(macros.proteinGrams).toBe(150);
-        expect(macros.carbsGrams).toBe(330);
+        expect(macros.proteinGrams).toBe(180);
+        expect(macros.carbsGrams).toBe(300);
         expect(macros.fatGrams).toBe(53);
       });
 
@@ -865,9 +598,9 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
           { id: "l2", timestampMs: cycle.endDateMs, weightKg: 79.9 } // Only 0.1kg lost in 14 days
         ];
         const review = evaluateBiWeeklyReview(cycle, logs, 90, cycle.endDateMs);
-        expect(review.calorieAdjustment).toBe(-150);
-        expect(review.proposedDailyCalories).toBe(1850);
-        expect(review.rationale).toContain("Plateau detected");
+        expect(review.calorieAdjustment).toBe(-100);
+        expect(review.proposedDailyCalories).toBe(1900);
+        expect(review.rationale).toContain("stalled");
       });
 
       it("F7-T1-2: generates review with surplus adjustment for Bulk goal when weight gain stalls", () => {
@@ -885,7 +618,7 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
         expect(review.proposedDailyCalories).toBe(2750);
       });
 
-      it("F7-T1-3: maintains current calories when adherence is under 70% to prevent premature adjustments", () => {
+      it("F7-T1-3: maintains current calories when adherence is under the 80% gate to prevent premature adjustments", () => {
         const cycle = createMock14DayCycle({ targetDailyCalories: 2100 });
         const logs: WeightLogEntry[] = [
           { id: "l1", timestampMs: cycle.startDateMs, weightKg: 75.0 },
@@ -1462,10 +1195,10 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
         expect(calculateBmr(bio)).toBe(910);
       });
 
-      it("F2-T2-3: activity multiplier extreme boundaries (freq=1: 1.20 vs freq=7: 1.725)", () => {
+      it("F2-T2-3: activity multiplier extreme boundaries (freq=1: 1.20 vs freq=7: 1.90)", () => {
         const bmr = 1600;
         expect(calculateTdee(bmr, 1)).toBe(1920); // 1600 * 1.20
-        expect(calculateTdee(bmr, 7)).toBe(2760); // 1600 * 1.725 = 2760
+        expect(calculateTdee(bmr, 7)).toBe(3040); // 1600 * 1.90 = 3040
       });
 
       it("F2-T2-4: fractional biometric inputs (70.45kg, 175.5cm) produce deterministic values without NaN", () => {
@@ -1550,8 +1283,8 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
 
       it("F4-T2-2: high-calorie 4000 kcal allocation scales safely without arithmetic overflow", () => {
         const macros = calculateMacroSplit(4000, "bulk");
-        expect(macros.proteinGrams).toBe(250); // 4000 * 0.25 / 4
-        expect(macros.carbsGrams).toBe(550); // 4000 * 0.55 / 4
+        expect(macros.proteinGrams).toBe(300); // 4000 * 0.30 / 4
+        expect(macros.carbsGrams).toBe(500); // 4000 * 0.50 / 4
         expect(macros.fatGrams).toBe(89); // 4000 * 0.20 / 9
       });
 
@@ -1720,7 +1453,7 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
         expect(review.proposedDailyCalories).toBe(2000);
       });
 
-      it("F7-T2-4: 100% adherence on plateau triggers maximum capped calorie reduction (-150 kcal)", () => {
+      it("F7-T2-4: 100% adherence on plateau triggers the 100 kcal plateau reduction", () => {
         const cycle = createMock14DayCycle({
           goal: "cut",
           targetDailyCalories: 2400,
@@ -1731,11 +1464,11 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
           { id: "2", timestampMs: cycle.endDateMs, weightKg: 85.0 }
         ];
         const review = evaluateBiWeeklyReview(cycle, logs, 100, cycle.endDateMs);
-        expect(review.calorieAdjustment).toBe(-150);
-        expect(review.proposedDailyCalories).toBe(2250);
+        expect(review.calorieAdjustment).toBe(-100);
+        expect(review.proposedDailyCalories).toBe(2300);
       });
 
-      it("F7-T2-5: review adjustment on 1250 kcal target with -150 proposed clamps to 1200 kcal floor", () => {
+      it("F7-T2-5: review adjustment on 1250 kcal target with -100 proposed clamps to 1200 kcal floor", () => {
         const cycle = createMock14DayCycle({
           goal: "cut",
           targetDailyCalories: 1250,
@@ -1746,8 +1479,32 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
           { id: "2", timestampMs: cycle.endDateMs, weightKg: 60 }
         ];
         const review = evaluateBiWeeklyReview(cycle, logs, 90, cycle.endDateMs);
-        expect(review.proposedDailyCalories).toBe(1200); // Clamped from 1100 to 1200!
+        expect(review.proposedDailyCalories).toBe(1200); // Clamped from 1150 to 1200!
         expect(review.calorieAdjustment).toBe(-50); // Actual adjustment is -50
+      });
+
+      it("F7-T2-6: adherence gate sits exactly at 80% (79.9% holds targets, 80% adjusts)", () => {
+        const cycle = createMock14DayCycle({ goal: "cut", targetDailyCalories: 2000 });
+        const flat: WeightLogEntry[] = [
+          { id: "1", timestampMs: cycle.startDateMs, weightKg: 80 },
+          { id: "2", timestampMs: cycle.endDateMs, weightKg: 80 }
+        ];
+        const below = evaluateBiWeeklyReview(cycle, flat, 79.9, cycle.endDateMs);
+        const at = evaluateBiWeeklyReview(cycle, flat, 80, cycle.endDateMs);
+        expect(below.calorieAdjustment).toBe(0);
+        expect(below.rationale).toContain("below the 80% threshold");
+        expect(at.calorieAdjustment).toBe(-100);
+      });
+
+      it("F7-T2-7: uses the shipped +350 kcal bulk surplus and per-goal stall steps", () => {
+        expect(calculateTargetCalories(2500, "bulk")).toBe(2850);
+        expect(calculateTargetCalories(2500, "muscle_gain")).toBe(2850);
+        const bulk = createMock14DayCycle({ goal: "bulk", targetDailyCalories: 2600 });
+        const stalled: WeightLogEntry[] = [
+          { id: "1", timestampMs: bulk.startDateMs, weightKg: 70 },
+          { id: "2", timestampMs: bulk.endDateMs, weightKg: 70 }
+        ];
+        expect(evaluateBiWeeklyReview(bulk, stalled, 90, bulk.endDateMs).calorieAdjustment).toBe(150);
       });
     });
 
@@ -2069,7 +1826,7 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
           { id: "2", timestampMs: cycle.endDateMs, weightKg: 74.9 } // -0.1kg lost
         ];
         const review = evaluateBiWeeklyReview(cycle, logs, 85, cycle.endDateMs);
-        expect(review.calorieAdjustment).toBe(-150);
+        expect(review.calorieAdjustment).toBe(-100);
       });
 
       it("F13-T2-2: cycle number increases strictly monotonically (cycle 1 -> 2 -> 3)", () => {

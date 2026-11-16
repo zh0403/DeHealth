@@ -13,9 +13,10 @@ const secureStoreMock = vi.hoisted(() => ({
 }));
 
 vi.mock("expo-secure-store", () => ({
-  isAvailableAsync: secureStoreMock.isAvailableAsync,
-  getItemAsync: secureStoreMock.getItemAsync,
-  setItemAsync: secureStoreMock.setItemAsync
+  isAvailableAsync: (): Promise<boolean> => secureStoreMock.isAvailableAsync(),
+  getItemAsync: (key: string): Promise<string | null> => secureStoreMock.getItemAsync(key),
+  setItemAsync: (key: string, value: string): Promise<void> =>
+    secureStoreMock.setItemAsync(key, value)
 }));
 
 vi.mock("@react-native-async-storage/async-storage", () => {
@@ -185,6 +186,37 @@ describe("SOV-01: per-install vault key provisioning", () => {
       expect(store).toBeInstanceOf(WebLocalStorageKeyStore);
       await store.setItem("k", "v");
       expect(data.get("k")).toBe("v");
+      expect(await store.getItem("k")).toBe("v");
+      expect(await store.getItem("missing")).toBeNull();
+    });
+
+    it("provisions and then reuses the same secret through the web keystore", async () => {
+      const data = new Map<string, string>();
+      vi.stubGlobal("localStorage", {
+        getItem: (k: string) => data.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          data.set(k, v);
+        }
+      });
+      const first = await provisionVaultSecret(await createPlatformKeyStore());
+      const second = await provisionVaultSecret(await createPlatformKeyStore());
+      expect(second).toBe(first);
+      expect(data.get(VAULT_SECRET_STORAGE_KEY)).toBe(first);
+    });
+
+    it("falls back when expo-secure-store reports itself unavailable or throws", async () => {
+      secureStoreMock.available = true;
+      const original = secureStoreMock.isAvailableAsync;
+      secureStoreMock.isAvailableAsync = async (): Promise<boolean> => {
+        throw new Error("native module missing");
+      };
+      vi.stubGlobal("localStorage", undefined);
+      vi.stubGlobal("navigator", { product: "Gecko" });
+      try {
+        expect(await createPlatformKeyStore()).toBeInstanceOf(InMemoryKeyStore);
+      } finally {
+        secureStoreMock.isAvailableAsync = original;
+      }
     });
 
     it("falls back to memory only in a non-native, non-web runtime", async () => {
