@@ -182,15 +182,29 @@ export async function resetVaultAndRecover(
 
 export interface VaultBootGateProps {
   readonly initError: string | null;
+  readonly isRetrying?: boolean;
   readonly isResetting?: boolean;
-  readonly onResetVaultAndRetry: () => void;
+  readonly onRetry: () => void;
+  readonly onResetVault: () => void;
+  readonly initialConfirmReset?: boolean;
 }
 
 export const VaultBootGate: React.FC<VaultBootGateProps> = ({
   initError,
+  isRetrying = false,
   isResetting = false,
-  onResetVaultAndRetry
+  onRetry,
+  onResetVault,
+  initialConfirmReset = false
 }) => {
+  const [confirmReset, setConfirmReset] = useState<boolean>(initialConfirmReset);
+
+  useEffect(() => {
+    setConfirmReset(initialConfirmReset);
+  }, [initError, initialConfirmReset]);
+
+  const isBusy = isRetrying || isResetting;
+
   if (initError !== null) {
     return (
       <View
@@ -204,21 +218,82 @@ export const VaultBootGate: React.FC<VaultBootGateProps> = ({
             Cryptographic Enclave Error
           </Text>
           <Text style={styles.bootErrorText}>{initError}</Text>
+
           <Pressable
             accessibilityRole="button"
-            accessibilityLabel="Reset Vault / Retry"
-            disabled={isResetting}
+            accessibilityLabel="Retry"
+            disabled={isBusy}
             style={({ pressed }) => [
-              styles.bootRetryButton,
-              isResetting ? styles.bootRetryButtonDisabled : null,
+              styles.bootRetryPrimaryButton,
+              isBusy ? styles.bootRetryButtonDisabled : null,
               pressed ? styles.tabButtonPressed : null
             ]}
-            onPress={onResetVaultAndRetry}
+            onPress={onRetry}
           >
-            <Text style={styles.bootRetryButtonText}>
-              {isResetting ? "Resetting Vault..." : "Reset Vault / Retry"}
+            <Text style={styles.bootRetryPrimaryButtonText}>
+              {isRetrying ? "Retrying..." : "Retry"}
             </Text>
           </Pressable>
+
+          {!confirmReset ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Reset Vault (Erases Wallet)"
+              disabled={isBusy}
+              style={({ pressed }) => [
+                styles.bootResetSecondaryButton,
+                isBusy ? styles.bootRetryButtonDisabled : null,
+                pressed ? styles.tabButtonPressed : null
+              ]}
+              onPress={() => {
+                setConfirmReset(true);
+              }}
+            >
+              <Text style={styles.bootResetSecondaryButtonText}>
+                Reset Vault (Erases Wallet)
+              </Text>
+            </Pressable>
+          ) : (
+            <View style={styles.bootConfirmBox}>
+              <Text style={styles.bootConfirmWarningText}>
+                Warning: Resetting the vault permanently erases any unbacked-up
+                private key and all locally encrypted biometric, plan, and
+                governance records.
+              </Text>
+              <View style={styles.bootConfirmBtnRow}>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Confirm Reset Vault"
+                  disabled={isBusy}
+                  style={({ pressed }) => [
+                    styles.bootConfirmResetButton,
+                    isBusy ? styles.bootRetryButtonDisabled : null,
+                    pressed ? styles.tabButtonPressed : null
+                  ]}
+                  onPress={onResetVault}
+                >
+                  <Text style={styles.bootRetryButtonText}>
+                    {isResetting ? "Resetting Vault..." : "Confirm Reset Vault"}
+                  </Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Cancel"
+                  disabled={isBusy}
+                  style={({ pressed }) => [
+                    styles.bootCancelResetButton,
+                    isBusy ? styles.bootRetryButtonDisabled : null,
+                    pressed ? styles.tabButtonPressed : null
+                  ]}
+                  onPress={() => {
+                    setConfirmReset(false);
+                  }}
+                >
+                  <Text style={styles.bootCancelResetButtonText}>Cancel</Text>
+                </Pressable>
+              </View>
+            </View>
+          )}
         </View>
       </View>
     );
@@ -314,6 +389,7 @@ export default function App(): React.ReactElement {
 
   const [wallet, setWallet] = useState<Wallet | null>(null);
   const [initError, setInitError] = useState<string | null>(null);
+  const [isRetryingVault, setIsRetryingVault] = useState<boolean>(false);
   const [isResettingVault, setIsResettingVault] = useState<boolean>(false);
 
   const applyHydratedState = (
@@ -380,10 +456,26 @@ export default function App(): React.ReactElement {
     };
   }, []);
 
+  const handleRetryVaultBoot = async (): Promise<void> => {
+    if (isRetryingVault || isResettingVault) return;
+    setIsRetryingVault(true);
+    try {
+      const hydrated = await hydrateVaultData();
+      applyHydratedState(hydrated, () => true);
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Failed to initialize local cryptographic enclave.";
+      setInitError(message);
+    } finally {
+      setIsRetryingVault(false);
+    }
+  };
+
   const handleResetVaultAndRetry = async (): Promise<void> => {
-    if (isResettingVault) return;
+    if (isResettingVault || isRetryingVault) return;
     setIsResettingVault(true);
-    setInitError(null);
     try {
       const recovered = await resetVaultAndRecover();
       setLastProofHash(null);
@@ -573,8 +665,12 @@ export default function App(): React.ReactElement {
       <SafeAreaView style={styles.viewport}>
         <VaultBootGate
           initError={initError}
+          isRetrying={isRetryingVault}
           isResetting={isResettingVault}
-          onResetVaultAndRetry={() => {
+          onRetry={() => {
+            void handleRetryVaultBoot();
+          }}
+          onResetVault={() => {
             void handleResetVaultAndRetry();
           }}
         />
@@ -792,12 +888,70 @@ const styles = StyleSheet.create({
     lineHeight: 19,
     marginBottom: 16
   },
-  bootRetryButton: {
-    backgroundColor: "#EF4444",
+  bootRetryPrimaryButton: {
+    backgroundColor: "#10B981",
     borderRadius: 10,
     paddingVertical: 12,
     paddingHorizontal: 16,
+    alignItems: "center",
+    marginBottom: 10
+  },
+  bootRetryPrimaryButtonText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#052E16"
+  },
+  bootResetSecondaryButton: {
+    backgroundColor: "transparent",
+    borderWidth: 1,
+    borderColor: "#EF4444",
+    borderRadius: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 16,
     alignItems: "center"
+  },
+  bootResetSecondaryButtonText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#FCA5A5"
+  },
+  bootConfirmBox: {
+    backgroundColor: "#2A1215",
+    borderWidth: 1,
+    borderColor: "#F87171",
+    borderRadius: 12,
+    padding: 12,
+    marginTop: 4
+  },
+  bootConfirmWarningText: {
+    fontSize: 12,
+    color: "#FECACA",
+    lineHeight: 17,
+    marginBottom: 10
+  },
+  bootConfirmBtnRow: {
+    flexDirection: "row",
+    gap: 8
+  },
+  bootConfirmResetButton: {
+    flex: 1,
+    backgroundColor: "#EF4444",
+    borderRadius: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 12,
+    alignItems: "center"
+  },
+  bootCancelResetButton: {
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    backgroundColor: "#1E293B",
+    alignItems: "center"
+  },
+  bootCancelResetButtonText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#E2E8F0"
   },
   bootRetryButtonDisabled: {
     opacity: 0.6

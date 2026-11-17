@@ -24,43 +24,19 @@ export function isValidPrivateKey(value: unknown): value is string {
 }
 
 let cachedWallet: Wallet | null = null;
+const pendingWalletByStore = new WeakMap<SecureKeyStore, Promise<Wallet>>();
+let pendingDefaultWalletPromise: Promise<Wallet> | null = null;
 
 /**
- * Resets in-memory cached wallet reference. Used primarily across isolated test runs.
+ * Resets in-memory cached wallet reference and default in-flight lock.
+ * Used primarily across isolated test runs.
  */
 export function resetWalletStorageForTesting(): void {
   cachedWallet = null;
+  pendingDefaultWalletPromise = null;
 }
 
-/**
- * Returns the persisted embedded wallet, generating and persisting a new one
- * on first launch via platform-secure storage (expo-secure-store on native,
- * WebLocalStorage on web, InMemoryKeyStore in Vitest / Node).
- *
- * Adheres strictly to fail-closed security rules:
- *  - Existing malformed or corrupted keys are refused with WalletStorageError
- *    and NEVER overwritten, preventing accidental fund destruction.
- *  - On React Native, if a hardware-backed secure store is missing, it refuses
- *    to boot (fails closed).
- *  - Zero Math.random usage (relies exclusively on Web Crypto / expo-crypto).
- */
-export async function getOrCreatePersistentWallet(
-  keyStore?: SecureKeyStore
-): Promise<Wallet> {
-  if (cachedWallet && !keyStore) {
-    return cachedWallet;
-  }
-
-  let store: SecureKeyStore;
-  try {
-    store = keyStore ?? (await createPlatformKeyStore());
-  } catch (err) {
-    if (err instanceof VaultKeyUnavailableError) {
-      throw new WalletStorageError(err.message);
-    }
-    throw err;
-  }
-
+async function resolveWalletFromStore(store: SecureKeyStore): Promise<Wallet> {
   const existing = await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY);
 
   if (existing !== null) {
@@ -69,11 +45,7 @@ export async function getOrCreatePersistentWallet(
         "Stored wallet private key is malformed; refusing to open wallet to prevent fund loss."
       );
     }
-    const wallet = new Wallet(existing);
-    if (!keyStore) {
-      cachedWallet = wallet;
-    }
-    return wallet;
+    return new Wallet(existing);
   }
 
   const randomWallet = Wallet.createRandom();
@@ -87,10 +59,74 @@ export async function getOrCreatePersistentWallet(
     );
   }
 
-  if (!keyStore) {
-    cachedWallet = newWallet;
-  }
   return newWallet;
+}
+
+/**
+ * Returns the persisted embedded wallet, generating and persisting a new one
+ * on first launch via platform-secure storage (expo-secure-store on native,
+ * WebLocalStorage on web, InMemoryKeyStore in Vitest / Node).
+ *
+ * Concurrent calls sharing the same `keyStore` (or the default platform keystore)
+ * are serialized so first-boot generation never triggers read-back collisions.
+ *
+ * Adheres strictly to fail-closed security rules:
+ *  - Existing malformed or corrupted keys are refused with WalletStorageError
+ *    and NEVER overwritten, preventing accidental fund destruction.
+ *  - On React Native, if a hardware-backed secure store is missing, it refuses
+ *    to boot (fails closed).
+ *  - Zero Math.random usage (relies exclusively on Web Crypto / expo-crypto).
+ */
+export async function getOrCreatePersistentWallet(
+  keyStore?: SecureKeyStore
+): Promise<Wallet> {
+  if (keyStore) {
+    const inflight = pendingWalletByStore.get(keyStore);
+    if (inflight) {
+      return inflight;
+    }
+
+    const work = resolveWalletFromStore(keyStore);
+    pendingWalletByStore.set(keyStore, work);
+    try {
+      return await work;
+    } finally {
+      pendingWalletByStore.delete(keyStore);
+    }
+  }
+
+  if (cachedWallet) {
+    return cachedWallet;
+  }
+
+  if (pendingDefaultWalletPromise) {
+    return pendingDefaultWalletPromise;
+  }
+
+  const work = (async (): Promise<Wallet> => {
+    let store: SecureKeyStore;
+    try {
+      store = await createPlatformKeyStore();
+    } catch (err) {
+      if (err instanceof VaultKeyUnavailableError) {
+        throw new WalletStorageError(err.message);
+      }
+      throw err;
+    }
+
+    const wallet = await resolveWalletFromStore(store);
+    cachedWallet = wallet;
+    return wallet;
+  })();
+
+  pendingDefaultWalletPromise = work;
+  try {
+    return await work;
+  } finally {
+    if (pendingDefaultWalletPromise === work) {
+      pendingDefaultWalletPromise = null;
+    }
+  }
 }
 
 /**

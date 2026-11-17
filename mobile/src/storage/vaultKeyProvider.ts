@@ -139,33 +139,53 @@ export async function createPlatformKeyStore(): Promise<SecureKeyStore> {
   return new InMemoryKeyStore();
 }
 
+const pendingProvisionByStore = new WeakMap<SecureKeyStore, Promise<string>>();
+
 /**
  * Returns the persisted vault secret, generating and storing a new one on first
  * launch. An existing but malformed value is treated as corruption and refused,
  * never silently replaced, so previously encrypted data is not orphaned.
+ * Concurrent calls sharing the same `store` instance are serialized to avoid
+ * read-back verification races during parallel subsystem hydration.
  */
 export async function provisionVaultSecret(store: SecureKeyStore): Promise<string> {
-  const existing = await store.getItem(VAULT_SECRET_STORAGE_KEY);
+  const inflight = pendingProvisionByStore.get(store);
+  if (inflight) {
+    return inflight;
+  }
 
-  if (existing !== null) {
-    if (!isValidVaultSecret(existing)) {
+  const work = (async (): Promise<string> => {
+    const existing = await store.getItem(VAULT_SECRET_STORAGE_KEY);
+
+    if (existing !== null) {
+      if (!isValidVaultSecret(existing)) {
+        throw new VaultKeyUnavailableError(
+          "Stored vault secret is malformed; refusing to open the local vault."
+        );
+      }
+      return existing;
+    }
+
+    const created = generateVaultSecret();
+    await store.setItem(VAULT_SECRET_STORAGE_KEY, created);
+
+    const readBack = await store.getItem(VAULT_SECRET_STORAGE_KEY);
+    if (readBack !== created) {
       throw new VaultKeyUnavailableError(
-        "Stored vault secret is malformed; refusing to open the local vault."
+        "Vault secret could not be persisted; refusing to open the local vault."
       );
     }
-    return existing;
-  }
+    return created;
+  })();
 
-  const created = generateVaultSecret();
-  await store.setItem(VAULT_SECRET_STORAGE_KEY, created);
-
-  const readBack = await store.getItem(VAULT_SECRET_STORAGE_KEY);
-  if (readBack !== created) {
-    throw new VaultKeyUnavailableError(
-      "Vault secret could not be persisted; refusing to open the local vault."
-    );
+  pendingProvisionByStore.set(store, work);
+  try {
+    return await work;
+  } finally {
+    if (pendingProvisionByStore.get(store) === work) {
+      pendingProvisionByStore.delete(store);
+    }
   }
-  return created;
 }
 
 /**

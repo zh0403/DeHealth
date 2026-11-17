@@ -77,6 +77,8 @@ export const PROHIBITED_BIOMETRIC_KEYS = [
   "bmi"
 ] as const;
 
+export const MAX_RECURSION_DEPTH = 20;
+
 export class DataSovereigntyViolationError extends Error {
   constructor(message: string) {
     super(message);
@@ -96,25 +98,34 @@ function isObjectLike(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function inspectForRawBiometrics(value: unknown, visited: WeakSet<object>): void {
+function inspectForRawBiometrics(
+  value: unknown,
+  visited: WeakSet<object>,
+  depth: number = 0
+): void {
   if (!isObjectLike(value)) {
     return;
   }
   if (visited.has(value)) {
     return;
   }
+  if (depth > MAX_RECURSION_DEPTH) {
+    throw new DataSovereigntyViolationError(
+      `Data sovereignty violation: payload nesting exceeds maximum depth of ${MAX_RECURSION_DEPTH}.`
+    );
+  }
   visited.add(value);
 
   if (Array.isArray(value)) {
     for (const item of value) {
-      inspectForRawBiometrics(item, visited);
+      inspectForRawBiometrics(item, visited, depth + 1);
     }
     return;
   }
 
   if (value instanceof Set) {
     for (const item of value) {
-      inspectForRawBiometrics(item, visited);
+      inspectForRawBiometrics(item, visited, depth + 1);
     }
     return;
   }
@@ -130,8 +141,8 @@ function inspectForRawBiometrics(value: unknown, visited: WeakSet<object>): void
           `Data sovereignty violation: raw biometric key "${mapKey}" detected in feed payload. Zero raw biometrics may leave the device.`
         );
       }
-      inspectForRawBiometrics(mapKey, visited);
-      inspectForRawBiometrics(mapValue, visited);
+      inspectForRawBiometrics(mapKey, visited, depth + 1);
+      inspectForRawBiometrics(mapValue, visited, depth + 1);
     }
     return;
   }
@@ -145,7 +156,7 @@ function inspectForRawBiometrics(value: unknown, visited: WeakSet<object>): void
         `Data sovereignty violation: raw biometric key "${key}" detected in feed payload. Zero raw biometrics may leave the device.`
       );
     }
-    inspectForRawBiometrics(propValue, visited);
+    inspectForRawBiometrics(propValue, visited, depth + 1);
   }
 }
 
