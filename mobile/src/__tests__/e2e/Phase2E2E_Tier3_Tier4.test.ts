@@ -657,8 +657,9 @@ describe("Phase 2.0 E2E Tier 3 & Tier 4 Test Suite", () => {
       const rawEnvelope = backend.getRaw(STORAGE_KEYS.WEIGHT_LOGS);
       expect(rawEnvelope).toBeDefined();
       const parsedEnvelope = JSON.parse(rawEnvelope!);
+      const originalEnd = parsedEnvelope.ciphertext.slice(-2);
       parsedEnvelope.ciphertext =
-        parsedEnvelope.ciphertext.slice(0, -2) + "aa";
+        parsedEnvelope.ciphertext.slice(0, -2) + (originalEnd === "aa" ? "bb" : "aa");
       backend.setRaw(STORAGE_KEYS.WEIGHT_LOGS, JSON.stringify(parsedEnvelope));
 
       // Adapter must reject with tampering detection error

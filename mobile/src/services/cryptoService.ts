@@ -13,6 +13,7 @@ import {
   WorkoutProofSchema
 } from "@dehealth/shared";
 import {
+  computeHmac,
   concat,
   getBytes,
   hexlify,
@@ -49,6 +50,39 @@ export interface TelemetryCommitment {
  */
 export function generateTelemetrySalt(): Bytes32 {
   return hexlify(randomBytes(32)) as Bytes32;
+}
+
+/**
+ * Derives a cryptographically unguessable, deterministic daily salt for one day of a cycle.
+ *
+ * Uses HMAC-SHA256 over the cycle ID and day index keyed by the device's vault secret:
+ * `HMAC("sha256", vaultSecret, "${cycleId}:${dayIndex}")`.
+ *
+ * This guarantees that:
+ * 1. Retrying a claim for the same cycle and day yields the identical telemetryHash,
+ *    enforcing on-chain duplicate-claim rejection.
+ * 2. An external observer cannot compute or predict salts without the vault secret.
+ * 3. Salts across different days or cycles are uncorrelated.
+ */
+export function deriveDeterministicDailySalt(
+  vaultSecretHex: string,
+  cycleId: string,
+  dayIndex: number
+): Bytes32 {
+  const validatedSecret = Bytes32Schema.parse(vaultSecretHex);
+  if (typeof cycleId !== "string" || cycleId.trim().length === 0) {
+    throw new Error("cycleId must be a non-empty string");
+  }
+  if (typeof dayIndex !== "number" || !Number.isInteger(dayIndex) || dayIndex < 0) {
+    throw new Error("dayIndex must be a non-negative integer");
+  }
+
+  const message = `${cycleId}:${dayIndex}`;
+  return computeHmac(
+    "sha256",
+    getBytes(validatedSecret),
+    toUtf8Bytes(message)
+  ) as Bytes32;
 }
 
 function canonicalizeTelemetry(validated: TelemetryData): string {

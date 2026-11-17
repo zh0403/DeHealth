@@ -24,6 +24,14 @@ const config: HardhatUserConfig = {
     outDir: "typechain-types",
     target: "ethers-v6",
   },
+  networks: {
+    hardhat: {},
+    arbitrumSepolia: {
+      url: process.env.ARBITRUM_SEPOLIA_RPC_URL || "https://sepolia-rollup.arbitrum.io/rpc",
+      chainId: 421614,
+      accounts: process.env.DEPLOYER_PRIVATE_KEY ? [process.env.DEPLOYER_PRIVATE_KEY] : [],
+    },
+  },
   paths: {
     sources: "./contracts",
     tests: "./test",

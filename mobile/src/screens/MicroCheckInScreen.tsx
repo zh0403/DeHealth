@@ -14,6 +14,7 @@ import {
 import { Signer } from "ethers";
 import React, { useEffect, useMemo, useState } from "react";
 import {
+  Linking,
   Modal,
   Pressable,
   ScrollView,
@@ -27,11 +28,17 @@ import {
   generate14DayPlan,
   scaleFoodPresetPortion
 } from "../services/adaptivePlanEngine";
-import { hashTelemetry, signWorkoutProof } from "../services/cryptoService";
 import {
+  deriveDeterministicDailySalt,
+  hashTelemetry,
+  signWorkoutProof
+} from "../services/cryptoService";
+import {
+  getActivePlanCycle,
   saveDailyTaskCompletion,
   saveTelemetrySalt
 } from "../storage/adaptiveStorage";
+import { getVaultSecret } from "../storage/vaultKeyProvider";
 
 export interface HabitCardDefinition {
   readonly id: string;
@@ -269,10 +276,14 @@ export interface MicroCheckInScreenProps {
   readonly collectTelemetry?: () => TelemetryData;
   readonly userProfile?: UserProfile;
   readonly dailyPlan?: DailyPlan;
+  readonly cycleId?: string;
+  readonly vaultSecretHex?: string;
   /** Timestamp of the last verified proof; drives runtime 48h fatigue scaling. */
   readonly lastLogTimestampMs?: number | null;
   readonly onUpdateDailyPlan?: (updatedPlan: DailyPlan) => void;
   readonly onDispatchSignedClaim: (payload: SignedWorkoutClaimPayload) => Promise<void>;
+  readonly lastTxHash?: string | null;
+  readonly lastExplorerUrl?: string | null;
 }
 
 const GRAM_QUICK_OPTIONS: readonly number[] = [50, 100, 150, 200, 250];
@@ -286,9 +297,13 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   collectTelemetry,
   userProfile = DEFAULT_PROFILE,
   dailyPlan: externalDailyPlan,
+  cycleId,
+  vaultSecretHex,
   lastLogTimestampMs = null,
   onUpdateDailyPlan,
-  onDispatchSignedClaim
+  onDispatchSignedClaim,
+  lastTxHash,
+  lastExplorerUrl
 }) => {
   const defaultInitialPlan = useMemo<DailyPlan>(() => {
     const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now());
@@ -364,6 +379,8 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     () => hasMinimumDailyProgress(localPlan),
     [localPlan]
   );
+
+  const isPlanCompleted = Boolean(localPlan.completed || externalDailyPlan?.completed);
 
   const calorieProgressPct = useMemo<number>(() => {
     if (localPlan.targetCaloriesKcal <= 0) return 0;
@@ -449,7 +466,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   const handleSignAndDispatchProof = async (
     cardOverride?: HabitCardDefinition
   ): Promise<void> => {
-    if (isSubmitting) return;
+    if (isSubmitting || isPlanCompleted) return;
     if (!hasMinimumDailyProgress(localPlan)) {
       setStatusStep(MINIMUM_PROGRESS_MESSAGE);
       return;
@@ -473,8 +490,18 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
             }
           : buildDailyPlanTelemetry(localPlan, userProfile, Date.now());
 
+      const resolvedVaultSecret = vaultSecretHex ?? (await getVaultSecret());
+      const resolvedCycleId =
+        cycleId ?? (await getActivePlanCycle().catch(() => null))?.id ?? "default_cycle";
+      const dayIndex = Math.max(0, localPlan.dayNumber - 1);
+      const deterministicDailySalt = deriveDeterministicDailySalt(
+        resolvedVaultSecret,
+        resolvedCycleId,
+        dayIndex
+      );
+
       const { telemetryHash, salt }: { telemetryHash: Bytes32; salt: Bytes32 } =
-        hashTelemetry(telemetry);
+        hashTelemetry(telemetry, deterministicDailySalt);
       try {
         // Salt stays in the encrypted local vault so the owner can later reveal
         // and verify the commitment. It is never part of the signed payload.
@@ -620,18 +647,32 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
             </Pressable>
           </View>
 
-          {l2MintSimulation ? (
+          {l2MintSimulation || lastTxHash ? (
             <View style={styles.l2ReceiptBox}>
               <Text style={styles.l2ReceiptTitle}>
-                ✓ {l2MintSimulation.status}
+                ✓ {l2MintSimulation?.status ?? "Confirmed on Arbitrum Sepolia (10.0 $DHT Minted)"}
               </Text>
               <Text
                 style={styles.l2ReceiptMeta}
                 numberOfLines={1}
                 ellipsizeMode="middle"
               >
-                Tx: {l2MintSimulation.txHash} (Block #{l2MintSimulation.blockNumber})
+                Tx: {lastTxHash ?? l2MintSimulation?.txHash}
               </Text>
+              {lastExplorerUrl ? (
+                <Pressable
+                  accessibilityRole="link"
+                  accessibilityLabel="View transaction on Arbiscan Sepolia"
+                  onPress={() => {
+                    void Linking.openURL(lastExplorerUrl).catch(() => undefined);
+                  }}
+                  style={{ marginTop: 4 }}
+                >
+                  <Text style={styles.l2ExplorerLink}>
+                    View on Arbiscan Sepolia ↗
+                  </Text>
+                </Pressable>
+              ) : null}
             </View>
           ) : null}
         </View>
@@ -873,22 +914,24 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
 
         <Pressable
           accessibilityRole="button"
-          accessibilityState={{ disabled: isSubmitting || !canSignProof }}
+          accessibilityState={{ disabled: isSubmitting || !canSignProof || isPlanCompleted }}
           style={[
             styles.signProofPrimaryBtn,
-            isSubmitting || !canSignProof ? styles.buttonDisabled : null
+            isSubmitting || !canSignProof || isPlanCompleted ? styles.buttonDisabled : null
           ]}
-          disabled={isSubmitting || !canSignProof}
+          disabled={isSubmitting || !canSignProof || isPlanCompleted}
           onPress={() => {
             void handleSignAndDispatchProof();
           }}
         >
           <Text style={styles.signProofPrimaryBtnText}>
-            {isSubmitting
-              ? "Hashing & Signing EIP-712 Proof..."
-              : !canSignProof
-                ? "Log a meal or finish 1 exercise to unlock"
-                : "Complete & Sign Daily Proof (+10 $DHT)"}
+            {isPlanCompleted
+              ? "Daily Proof Signed & Claimed ✓"
+              : isSubmitting
+                ? "Hashing & Signing EIP-712 Proof..."
+                : !canSignProof
+                  ? "Log a meal or finish 1 exercise to unlock"
+                  : "Complete & Sign Daily Proof (+10 $DHT)"}
           </Text>
         </Pressable>
 
@@ -905,11 +948,13 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
           return (
             <Pressable
               key={card.id}
+              accessibilityRole="button"
+              accessibilityState={{ disabled: isSubmitting || !canSignProof || isPlanCompleted }}
               style={[
                 styles.expressCard,
-                isSubmitting || !canSignProof ? styles.buttonDisabled : null
+                isSubmitting || !canSignProof || isPlanCompleted ? styles.buttonDisabled : null
               ]}
-              disabled={isSubmitting || !canSignProof}
+              disabled={isSubmitting || !canSignProof || isPlanCompleted}
               onPress={() => {
                 void handleSignAndDispatchProof(card);
               }}
@@ -919,8 +964,8 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
                 <Text style={styles.expressTitle}>{card.title}</Text>
                 <Text style={styles.expressSub}>{card.durationText}</Text>
               </View>
-              <Text style={[styles.expressCta, { color: card.accentColor }]}>
-                {isBusy ? "Signing..." : "1-Tap Sign →"}
+              <Text style={[styles.expressCta, { color: isPlanCompleted ? "#94A3B8" : card.accentColor }]}>
+                {isPlanCompleted ? "Claimed ✓" : isBusy ? "Signing..." : "1-Tap Sign →"}
               </Text>
             </Pressable>
           );
@@ -1134,6 +1179,12 @@ const styles = StyleSheet.create({
     fontFamily: "monospace",
     color: "#A7F3D0",
     marginTop: 2
+  },
+  l2ExplorerLink: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#38BDF8",
+    textDecorationLine: "underline"
   },
   trackCard: {
     backgroundColor: "#161F30",

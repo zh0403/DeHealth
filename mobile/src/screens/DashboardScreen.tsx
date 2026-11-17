@@ -1,5 +1,6 @@
 import {
   AdaptivePlanCycle,
+  Address,
   Bytes32,
   DailyPlan,
   DEFAULT_BASELINE_BIOMETRICS,
@@ -9,6 +10,7 @@ import {
 } from "@dehealth/shared";
 import React, { useMemo, useState } from "react";
 import {
+  Linking,
   Modal,
   Pressable,
   ScrollView,
@@ -128,6 +130,13 @@ export interface DashboardScreenProps {
     nextCycle: AdaptivePlanCycle,
     completedPreviousCycle?: AdaptivePlanCycle
   ) => Promise<void> | void;
+  /** User wallet address for Arbitrum Sepolia testnet funding and display */
+  readonly userAddress?: Address | null;
+  /** Callback or direct function to export private key with security warning */
+  readonly onExportPrivateKey?: () => Promise<string> | string;
+  /** Optional transaction hash and explorer URL from L2 */
+  readonly lastTxHash?: string | null;
+  readonly lastExplorerUrl?: string | null;
 }
 
 const WEEK_DAYS: ReadonlyArray<{
@@ -156,7 +165,11 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   adherencePct: adherencePctProp,
   currentTimestampMs,
   onLogWeightEntry,
-  onUpdatePlanCycle
+  onUpdatePlanCycle,
+  userAddress,
+  onExportPrivateKey,
+  lastTxHash,
+  lastExplorerUrl
 }) => {
   const defaultCycle = useMemo<AdaptivePlanCycle>(() => {
     const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
@@ -223,6 +236,51 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   const [isReviewModalOpen, setIsReviewModalOpen] = useState<boolean>(false);
   const [reviewActionNotice, setReviewActionNotice] = useState<string | null>(null);
+
+  const [isPrivateKeyRevealed, setIsPrivateKeyRevealed] = useState<boolean>(false);
+  const [exportedPrivateKey, setExportedPrivateKey] = useState<string | null>(null);
+  const [isExportingKey, setIsExportingKey] = useState<boolean>(false);
+  const [walletFeedback, setWalletFeedback] = useState<string | null>(null);
+
+  const handleCopy = async (text: string, label: string): Promise<void> => {
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        setWalletFeedback(`${label} copied to clipboard!`);
+        return;
+      }
+    } catch {
+      // Non-fatal if clipboard API unavailable
+    }
+    setWalletFeedback(`${label} selected. Copy via keyboard or long press.`);
+  };
+
+  const handleToggleExportPrivateKey = async (): Promise<void> => {
+    if (isPrivateKeyRevealed) {
+      setIsPrivateKeyRevealed(false);
+      return;
+    }
+    if (exportedPrivateKey) {
+      setIsPrivateKeyRevealed(true);
+      return;
+    }
+    if (!onExportPrivateKey) {
+      setWalletFeedback("Private key export is not configured in this runtime.");
+      return;
+    }
+    setIsExportingKey(true);
+    try {
+      const key = await onExportPrivateKey();
+      setExportedPrivateKey(key);
+      setIsPrivateKeyRevealed(true);
+      setWalletFeedback("Private key successfully retrieved from secure storage.");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to export private key";
+      setWalletFeedback(`Export error: ${msg}`);
+    } finally {
+      setIsExportingKey(false);
+    }
+  };
 
   const lastWeighInMs = useMemo<number | null>(() => {
     if (effectiveWeightLogs.length === 0) return null;
@@ -594,6 +652,21 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
               {lastProofHash}
             </Text>
 
+            {lastTxHash ? (
+              <View style={{ marginTop: 6 }}>
+                <Text style={styles.hashLabel}>Arbitrum Sepolia Transaction Hash:</Text>
+                <Text
+                  selectable
+                  accessibilityLabel="L2 Transaction Hash"
+                  style={styles.hashText}
+                  numberOfLines={1}
+                  ellipsizeMode="middle"
+                >
+                  {lastTxHash}
+                </Text>
+              </View>
+            ) : null}
+
             <Text style={styles.proofAuditNotice}>
               [✓ Proof Verified On-Chain • Zero Biometrics Disclosed]
             </Text>
@@ -608,6 +681,139 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             </Text>
           </View>
         )}
+      </View>
+
+      {/* Embedded Testnet Wallet Card */}
+      <View style={styles.card}>
+        <View style={styles.cardHeaderRow}>
+          <Text style={styles.label}>Embedded Testnet Wallet</Text>
+          <Text style={styles.walletBadgeTag}>Arbitrum Sepolia</Text>
+        </View>
+
+        <Text style={styles.walletDescription}>
+          Non-custodial key persisted on-device in secure storage. Fund with Arbitrum Sepolia ETH to submit cryptographic claims on-chain.
+        </Text>
+
+        <View style={styles.walletAddressBox}>
+          <Text style={styles.walletSubLabel}>Public Address:</Text>
+          <Text
+            selectable
+            accessibilityLabel="Wallet Public Address"
+            style={styles.walletAddressText}
+            numberOfLines={1}
+            ellipsizeMode="middle"
+          >
+            {userAddress ?? "0x0000000000000000000000000000000000000000"}
+          </Text>
+
+          <View style={styles.walletBtnRow}>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Copy Address"
+              style={({ pressed }) => [
+                styles.walletActionBtn,
+                pressed ? styles.btnPressed : null
+              ]}
+              onPress={() => {
+                if (userAddress) {
+                  void handleCopy(userAddress, "Address");
+                }
+              }}
+            >
+              <Text style={styles.walletActionBtnText}>📋 Copy Address</Text>
+            </Pressable>
+
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Export Private Key"
+              style={({ pressed }) => [
+                styles.walletSecondaryBtn,
+                pressed ? styles.btnPressed : null
+              ]}
+              disabled={isExportingKey}
+              onPress={() => {
+                void handleToggleExportPrivateKey();
+              }}
+            >
+              <Text style={styles.walletSecondaryBtnText}>
+                {isExportingKey
+                  ? "Decrypting..."
+                  : isPrivateKeyRevealed
+                    ? "Hide Private Key"
+                    : "🔑 Export Private Key"}
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+
+        {isPrivateKeyRevealed && exportedPrivateKey ? (
+          <View style={styles.privateKeyWarningBox}>
+            <Text style={styles.warningTitle}>⚠️ SECURITY WARNING</Text>
+            <Text style={styles.warningText}>
+              Never share your private key. Anyone with this key can access and transfer all assets in this wallet. DeHealth will never ask for this key.
+            </Text>
+
+            <Text style={styles.walletSubLabel}>Raw Private Key (Hardware Keystore):</Text>
+            <Text
+              selectable
+              accessibilityLabel="Exported Private Key"
+              style={styles.walletKeyText}
+            >
+              {exportedPrivateKey}
+            </Text>
+
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Copy Private Key"
+              style={({ pressed }) => [
+                styles.walletCopyKeyBtn,
+                pressed ? styles.btnPressed : null
+              ]}
+              onPress={() => {
+                void handleCopy(exportedPrivateKey, "Private Key");
+              }}
+            >
+              <Text style={styles.walletCopyKeyBtnText}>📋 Copy Private Key</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {walletFeedback ? (
+          <Text style={styles.walletFeedbackText}>{walletFeedback}</Text>
+        ) : null}
+
+        {lastTxHash ? (
+          <View style={{ marginTop: 8 }}>
+            <Text style={styles.walletSubLabel}>Last L2 Transaction Hash:</Text>
+            <Text
+              selectable
+              accessibilityLabel="Wallet Last Tx Hash"
+              style={styles.walletKeyText}
+              numberOfLines={1}
+              ellipsizeMode="middle"
+            >
+              {lastTxHash}
+            </Text>
+          </View>
+        ) : null}
+
+        {lastExplorerUrl ? (
+          <Pressable
+            accessibilityRole="link"
+            accessibilityLabel="View on Arbiscan Sepolia"
+            style={({ pressed }) => [
+              styles.explorerLinkBtn,
+              pressed ? styles.btnPressed : null
+            ]}
+            onPress={() => {
+              void Linking.openURL(lastExplorerUrl).catch(() => undefined);
+            }}
+          >
+            <Text style={styles.explorerLinkText}>
+              View Last Transaction on Arbiscan Sepolia ↗
+            </Text>
+          </Pressable>
+        ) : null}
       </View>
 
       {/* Standalone Log Weight / Biometrics Modal */}
@@ -1228,5 +1434,134 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: "#CBD5E1"
+  },
+  walletBadgeTag: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#38BDF8",
+    backgroundColor: "#0C4A6E",
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    overflow: "hidden"
+  },
+  walletDescription: {
+    fontSize: 12,
+    color: "#94A3B8",
+    lineHeight: 17,
+    marginBottom: 12
+  },
+  walletAddressBox: {
+    backgroundColor: "#0A101D",
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: "#1E293B",
+    marginBottom: 8
+  },
+  walletSubLabel: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#64748B",
+    marginBottom: 4,
+    textTransform: "uppercase"
+  },
+  walletAddressText: {
+    fontFamily: "monospace",
+    fontSize: 12,
+    color: "#38BDF8",
+    marginBottom: 10
+  },
+  walletBtnRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 4
+  },
+  walletActionBtn: {
+    flex: 1,
+    backgroundColor: "#0284C7",
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: "center"
+  },
+  walletActionBtnText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#FFFFFF"
+  },
+  walletSecondaryBtn: {
+    flex: 1,
+    backgroundColor: "#1E293B",
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#334155"
+  },
+  walletSecondaryBtnText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#E2E8F0"
+  },
+  privateKeyWarningBox: {
+    backgroundColor: "#2A1215",
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: "#7F1D1D",
+    marginTop: 8,
+    marginBottom: 8
+  },
+  warningTitle: {
+    fontSize: 12,
+    fontWeight: "900",
+    color: "#F87171",
+    marginBottom: 4
+  },
+  warningText: {
+    fontSize: 11,
+    color: "#FCA5A5",
+    lineHeight: 16,
+    marginBottom: 8
+  },
+  walletKeyText: {
+    fontFamily: "monospace",
+    fontSize: 11,
+    color: "#FCD34D",
+    backgroundColor: "#1C1917",
+    padding: 8,
+    borderRadius: 6,
+    marginBottom: 8
+  },
+  walletCopyKeyBtn: {
+    backgroundColor: "#DC2626",
+    paddingVertical: 8,
+    borderRadius: 8,
+    alignItems: "center"
+  },
+  walletCopyKeyBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#FFFFFF"
+  },
+  walletFeedbackText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#34D399",
+    marginTop: 6,
+    marginBottom: 4
+  },
+  explorerLinkBtn: {
+    marginTop: 8,
+    paddingVertical: 8,
+    alignItems: "center"
+  },
+  explorerLinkText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#38BDF8",
+    textDecorationLine: "underline"
   }
 });

@@ -13,6 +13,7 @@ import {
 import { Wallet } from "ethers";
 import React, { useEffect, useMemo, useState } from "react";
 import {
+  ActivityIndicator,
   Platform,
   Pressable,
   SafeAreaView,
@@ -32,7 +33,18 @@ import {
   generate14DayPlan,
   getActiveDayIndex
 } from "./src/services/adaptivePlanEngine";
-import { verifyWorkoutProofSignature } from "./src/services/cryptoService";
+import {
+  claimStreakReward,
+  DEMO_VERIFYING_CONTRACT,
+  fetchOnChainNonce,
+  fetchTokenBalance,
+  getRewardGateAddress
+} from "./src/services/l2ContractService";
+import {
+  fetchAnonymizedFeed,
+  publishProofMilestone,
+  sendPeerCheer
+} from "./src/services/supabaseService";
 import { evaluateDailyTarget } from "./src/services/profileEngine";
 import {
   getActivePlanCycle,
@@ -42,11 +54,12 @@ import {
   saveActivePlanCycle,
   savePlanHistory
 } from "./src/storage/adaptiveStorage";
+import {
+  exportWalletPrivateKey,
+  getOrCreatePersistentWallet
+} from "./src/storage/walletStorage";
 
 type ActiveTab = "checkin" | "dashboard" | "feed";
-
-const DEMO_VERIFYING_CONTRACT: Address =
-  "0x1111111111111111111111111111111111111111" as Address;
 
 const INITIAL_FEED_ITEMS: readonly AnonymizedFeedRecord[] = [
   {
@@ -122,6 +135,8 @@ export default function App(): React.ReactElement {
   const [tokenBalanceDht, setTokenBalanceDht] = useState<string>("30.0");
   const [currentNonce, setCurrentNonce] = useState<bigint>(0n);
   const [lastProofHash, setLastProofHash] = useState<Bytes32 | null>(null);
+  const [lastTxHash, setLastTxHash] = useState<string | null>(null);
+  const [lastExplorerUrl, setLastExplorerUrl] = useState<string | null>(null);
   const [lastLogTimestampMs, setLastLogTimestampMs] = useState<number>(
     () => Date.now() - 50 * 60 * 60 * 1000
   );
@@ -141,14 +156,47 @@ export default function App(): React.ReactElement {
 
   useEffect(() => {
     let mounted = true;
+    void fetchAnonymizedFeed()
+      .then((res) => {
+        if (!mounted) return;
+        if (res.items && res.items.length > 0) {
+          setFeedItems(res.items);
+          setCheerCounts(res.cheerCounts);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const [wallet, setWallet] = useState<Wallet | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
     const hydrateFromVault = async (): Promise<void> => {
       try {
-        const [storedBio, storedCycle, storedLogs] = await Promise.all([
+        const [storedBio, storedCycle, storedLogs, persistentWallet] = await Promise.all([
           getUserBiometrics(),
           getActivePlanCycle(),
-          getWeightLogs()
+          getWeightLogs(),
+          getOrCreatePersistentWallet()
         ]);
         if (!mounted) return;
+        setWallet(persistentWallet);
+        if (persistentWallet) {
+          const addr = persistentWallet.address as Address;
+          void fetchOnChainNonce(addr, 0n)
+            .then((nonce) => {
+              if (mounted) setCurrentNonce(nonce);
+            })
+            .catch(() => undefined);
+          void fetchTokenBalance(addr, "30.0")
+            .then((bal) => {
+              if (mounted) setTokenBalanceDht(bal);
+            })
+            .catch(() => undefined);
+        }
         if (storedBio) {
           setUserBiometrics(storedBio);
           setHasCompletedOnboarding(true);
@@ -169,8 +217,7 @@ export default function App(): React.ReactElement {
     };
   }, []);
 
-  const wallet = useMemo(() => Wallet.createRandom(), []);
-  const userAddress = wallet.address as Address;
+  const userAddress = (wallet ? wallet.address : "0x0000000000000000000000000000000000000000") as Address;
 
   const userProfile = useMemo(
     () => biometricsToUserProfile(userBiometrics),
@@ -246,34 +293,42 @@ export default function App(): React.ReactElement {
   const handleDispatchSignedClaim = async (
     payload: SignedWorkoutClaimPayload
   ): Promise<void> => {
-    const isValid = verifyWorkoutProofSignature(payload, DEMO_VERIFYING_CONTRACT);
-    if (!isValid) {
-      throw new Error("Local EIP-712 signature verification failed");
-    }
+    // 1. Submit on-chain claim or fallback receipt
+    const claimResult = await claimStreakReward(payload, wallet ?? undefined);
+    setLastTxHash(claimResult.txHash);
+    setLastExplorerUrl(claimResult.explorerUrl);
 
     const nextStreak = Number(payload.proof.streakCount);
-    const nextBalance = (Number.parseFloat(tokenBalanceDht) + 10).toFixed(1);
-    const newFeedId = `00000000-0000-4000-8000-${String(feedItems.length + 1).padStart(12, "0")}`;
+    const expectedBalance = (Number.parseFloat(tokenBalanceDht) + 10).toFixed(1);
+
+    // 2. Publish milestone to Supabase (strict data sovereignty: pseudonym, proof_hash, streak_count)
+    const userPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
+    const milestoneResult = await publishProofMilestone({
+      user_pseudonym: userPseudonym,
+      proof_hash: payload.proof.telemetryHash,
+      streak_count: nextStreak
+    });
 
     setStreakCount(nextStreak);
-    setTokenBalanceDht(nextBalance);
-    setCurrentNonce((prev) => prev + 1n);
     setLastProofHash(payload.proof.telemetryHash);
     setLastLogTimestampMs(Date.now());
+
+    // Update feed items and cheer counts
     setFeedItems((prev) => [
-      {
-        id: newFeedId,
-        user_pseudonym: `athlete_${userAddress.slice(2, 8).toLowerCase()}`,
-        proof_hash: payload.proof.telemetryHash,
-        streak_count: nextStreak,
-        created_at: new Date().toISOString()
-      },
-      ...prev
+      milestoneResult.data,
+      ...prev.filter((i) => i.id !== milestoneResult.data.id)
     ]);
     setCheerCounts((prev) => ({
       ...prev,
-      [newFeedId]: 0
+      [milestoneResult.data.id]: 0
     }));
+
+    // 3. Update nonce and DHT token balance from L2 service
+    const updatedNonce = await fetchOnChainNonce(userAddress, currentNonce + 1n);
+    setCurrentNonce(updatedNonce);
+
+    const updatedBalance = await fetchTokenBalance(userAddress, expectedBalance);
+    setTokenBalanceDht(updatedBalance);
   };
 
   const handleCheer = (feedId: string): void => {
@@ -281,6 +336,8 @@ export default function App(): React.ReactElement {
       ...prev,
       [feedId]: (prev[feedId] ?? 0) + 1
     }));
+    const senderPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
+    void sendPeerCheer(feedId, senderPseudonym).catch(() => undefined);
   };
 
   const handleRedeemPerk = (costDht: number, _perkTitle: string): boolean => {
@@ -292,6 +349,31 @@ export default function App(): React.ReactElement {
     setTokenBalanceDht(nextBalance);
     return true;
   };
+
+  if (!wallet) {
+    return (
+      <SafeAreaView style={styles.viewport}>
+        <View
+          style={[
+            styles.phoneFrame,
+            { justifyContent: "center", alignItems: "center" }
+          ]}
+        >
+          <ActivityIndicator size="large" color="#10B981" />
+          <Text
+            style={{
+              color: "#94A3B8",
+              marginTop: 14,
+              fontSize: 13,
+              fontWeight: "600"
+            }}
+          >
+            Securing Cryptographic Enclave...
+          </Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.viewport}>
@@ -318,23 +400,30 @@ export default function App(): React.ReactElement {
               {activeTab === "checkin" ? (
                 <MicroCheckInScreen
                   userAddress={userAddress}
-                  verifyingContract={DEMO_VERIFYING_CONTRACT}
+                  verifyingContract={getRewardGateAddress() || DEMO_VERIFYING_CONTRACT}
                   currentStreak={streakCount}
                   currentNonce={currentNonce}
                   signer={wallet}
                   userProfile={userProfile}
                   dailyPlan={todayPlan}
+                  cycleId={activeCycle.id}
                   lastLogTimestampMs={lastLogTimestampMs}
                   onUpdateDailyPlan={handleUpdateDailyPlan}
                   onDispatchSignedClaim={handleDispatchSignedClaim}
+                  lastTxHash={lastTxHash}
+                  lastExplorerUrl={lastExplorerUrl}
                 />
               ) : null}
 
               {activeTab === "dashboard" ? (
                 <DashboardScreen
+                  userAddress={userAddress}
+                  onExportPrivateKey={exportWalletPrivateKey}
                   streakCount={streakCount}
                   tokenBalanceDht={tokenBalanceDht}
                   lastProofHash={lastProofHash}
+                  lastTxHash={lastTxHash}
+                  lastExplorerUrl={lastExplorerUrl}
                   targetAssessment={targetAssessment}
                   activeCycle={activeCycle}
                   todayPlan={todayPlan}

@@ -18,7 +18,7 @@
     "test:unit": "npm run test:unit:shared && npm run test:unit:mobile",
     "test:e2e": "npm run test:e2e --workspace=@dehealth/contracts",
     "test": "npm run test:contracts && npm run test:unit && npm run test:e2e",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit && tsc --noEmit -p mobile/tsconfig.app.json"
   },
   "devDependencies": {
     "typescript": "^5.6.3"

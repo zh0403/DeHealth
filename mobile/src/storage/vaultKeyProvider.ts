@@ -152,3 +152,13 @@ export async function provisionVaultSecret(store: SecureKeyStore): Promise<strin
   }
   return created;
 }
+
+/**
+ * Convenience helper to obtain the device's vault secret.
+ * Resolves the platform keystore if no store is explicitly passed,
+ * then provisions (or retrieves) the 32-byte vault secret.
+ */
+export async function getVaultSecret(keyStore?: SecureKeyStore): Promise<string> {
+  const store = keyStore ?? (await createPlatformKeyStore());
+  return provisionVaultSecret(store);
+}
