@@ -29,13 +29,19 @@ import {
   scaleFoodPresetPortion
 } from "../services/adaptivePlanEngine";
 import {
+  buildDailyCheckInCommitment,
   deriveDeterministicDailySalt,
   hashTelemetry,
   signWorkoutProof
 } from "../services/cryptoService";
+import { L2ServiceMode } from "../services/l2ContractService";
 import {
   getActivePlanCycle,
+  getDailyTelemetryCommitment,
+  makeDailyProofSignedKey,
+  saveDailyProofSigned,
   saveDailyTaskCompletion,
+  saveDailyTelemetryCommitment,
   saveTelemetrySalt
 } from "../storage/adaptiveStorage";
 import { getVaultSecret } from "../storage/vaultKeyProvider";
@@ -238,6 +244,12 @@ export function buildDailyPlanTelemetry(
   userProfile: UserProfile = DEFAULT_PROFILE,
   timestampMs: number = Date.now()
 ): TelemetryData {
+  const parsedPlanDateMs = Date.parse(`${plan.date}T00:00:00.000Z`);
+  const stableTimestampMs =
+    Number.isFinite(parsedPlanDateMs) && parsedPlanDateMs > 0
+      ? parsedPlanDateMs
+      : timestampMs;
+
   const completedExercises = plan.exercises.filter((ex) => ex.completed);
   const totalDurationMinutes = completedExercises.reduce((acc, ex) => {
     if (ex.durationMinutes !== undefined) {
@@ -258,7 +270,7 @@ export function buildDailyPlanTelemetry(
   );
 
   return {
-    timestampMs,
+    timestampMs: stableTimestampMs,
     stepCount: estimatedSteps,
     activeMinutes,
     avgHeartRateBpm,
@@ -278,12 +290,14 @@ export interface MicroCheckInScreenProps {
   readonly dailyPlan?: DailyPlan;
   readonly cycleId?: string;
   readonly vaultSecretHex?: string;
+  readonly isProofSigned?: boolean;
   /** Timestamp of the last verified proof; drives runtime 48h fatigue scaling. */
   readonly lastLogTimestampMs?: number | null;
   readonly onUpdateDailyPlan?: (updatedPlan: DailyPlan) => void;
   readonly onDispatchSignedClaim: (payload: SignedWorkoutClaimPayload) => Promise<void>;
   readonly lastTxHash?: string | null;
   readonly lastExplorerUrl?: string | null;
+  readonly lastClaimMode?: L2ServiceMode | null;
 }
 
 const GRAM_QUICK_OPTIONS: readonly number[] = [50, 100, 150, 200, 250];
@@ -299,11 +313,13 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   dailyPlan: externalDailyPlan,
   cycleId,
   vaultSecretHex,
+  isProofSigned: externalIsProofSigned = false,
   lastLogTimestampMs = null,
   onUpdateDailyPlan,
   onDispatchSignedClaim,
   lastTxHash,
-  lastExplorerUrl
+  lastExplorerUrl,
+  lastClaimMode = null
 }) => {
   const defaultInitialPlan = useMemo<DailyPlan>(() => {
     const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now());
@@ -380,7 +396,16 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     [localPlan]
   );
 
-  const isPlanCompleted = Boolean(localPlan.completed || externalDailyPlan?.completed);
+  const resolvedCycleId =
+    cycleId && cycleId.trim().length > 0 ? cycleId.trim() : "default_cycle";
+  const resolvedDayIndex = Math.max(0, localPlan.dayNumber - 1);
+  const proofSignedKey = makeDailyProofSignedKey(resolvedCycleId, resolvedDayIndex);
+  const [localProofSignedKeys, setLocalProofSignedKeys] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
+  const isProofLocked = Boolean(
+    externalIsProofSigned || localProofSignedKeys[proofSignedKey]
+  );
 
   const calorieProgressPct = useMemo<number>(() => {
     if (localPlan.targetCaloriesKcal <= 0) return 0;
@@ -466,7 +491,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   const handleSignAndDispatchProof = async (
     cardOverride?: HabitCardDefinition
   ): Promise<void> => {
-    if (isSubmitting || isPlanCompleted) return;
+    if (isSubmitting || isProofLocked) return;
     if (!hasMinimumDailyProgress(localPlan)) {
       setStatusStep(MINIMUM_PROGRESS_MESSAGE);
       return;
@@ -491,18 +516,39 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
           : buildDailyPlanTelemetry(localPlan, userProfile, Date.now());
 
       const resolvedVaultSecret = vaultSecretHex ?? (await getVaultSecret());
-      const resolvedCycleId =
-        cycleId ?? (await getActivePlanCycle().catch(() => null))?.id ?? "default_cycle";
+      const effectiveCycleId =
+        cycleId && cycleId.trim().length > 0
+          ? cycleId.trim()
+          : (await getActivePlanCycle().catch(() => null))?.id ?? "default_cycle";
       const dayIndex = Math.max(0, localPlan.dayNumber - 1);
-      const deterministicDailySalt = deriveDeterministicDailySalt(
+
+      const existingCommitment = await getDailyTelemetryCommitment(
+        effectiveCycleId,
+        dayIndex
+      ).catch(() => null);
+
+      const deterministicSalt = deriveDeterministicDailySalt(
         resolvedVaultSecret,
-        resolvedCycleId,
+        effectiveCycleId,
         dayIndex
       );
 
-      const { telemetryHash, salt }: { telemetryHash: Bytes32; salt: Bytes32 } =
-        hashTelemetry(telemetry, deterministicDailySalt);
+      const freshCommitment = collectTelemetry
+        ? hashTelemetry(telemetry, deterministicSalt)
+        : buildDailyCheckInCommitment({
+            vaultSecretHex: resolvedVaultSecret,
+            cycleId: effectiveCycleId,
+            dayIndex,
+            planDate: localPlan.date,
+            timestampMs: Date.now()
+          });
+
+      const telemetryHash: Bytes32 =
+        existingCommitment ?? freshCommitment.telemetryHash;
+      const salt: Bytes32 = freshCommitment.salt;
+
       try {
+        await saveDailyTelemetryCommitment(effectiveCycleId, dayIndex, telemetryHash);
         // Salt stays in the encrypted local vault so the owner can later reveal
         // and verify the commitment. It is never part of the signed payload.
         await saveTelemetrySalt(telemetryHash, salt);
@@ -525,10 +571,17 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
       setStatusStep("3/3 Dispatching verified proof to DeHealthRewardGate...");
       await onDispatchSignedClaim(signedPayload);
 
+      const signedKey = makeDailyProofSignedKey(effectiveCycleId, dayIndex);
+      setLocalProofSignedKeys((prev) => ({
+        ...prev,
+        [proofSignedKey]: true,
+        [signedKey]: true
+      }));
+
       const completedPlan: DailyPlan = { ...localPlan, completed: true };
       applyPlanUpdate(completedPlan);
       try {
-        await saveDailyTaskCompletion(localPlan.dayNumber, "daily_proof_signed", true);
+        await saveDailyProofSigned(effectiveCycleId, dayIndex, true);
       } catch {
         // Non-fatal
       }
@@ -568,7 +621,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     setL2MintSimulation({
       txHash: `0x99a4b7c2${hashSuffix}`,
       blockNumber: 4_819_204 + currentStreak,
-      status: "Confirmed on Arbitrum Sepolia (10.0 $DHT Minted)"
+      status: "Simulated Local Mint (Demo Mode — Configure L2 .env for Live Arbitrum)"
     });
   };
 
@@ -650,7 +703,12 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
           {l2MintSimulation || lastTxHash ? (
             <View style={styles.l2ReceiptBox}>
               <Text style={styles.l2ReceiptTitle}>
-                ✓ {l2MintSimulation?.status ?? "Confirmed on Arbitrum Sepolia (10.0 $DHT Minted)"}
+                ✓{" "}
+                {l2MintSimulation
+                  ? l2MintSimulation.status
+                  : lastClaimMode === "live"
+                    ? "Confirmed on Arbitrum Sepolia (10.0 $DHT Minted)"
+                    : "Simulated Local Mint (Demo Mode — Configure L2 .env for Live Arbitrum)"}
               </Text>
               <Text
                 style={styles.l2ReceiptMeta}
@@ -659,7 +717,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
               >
                 Tx: {lastTxHash ?? l2MintSimulation?.txHash}
               </Text>
-              {lastExplorerUrl ? (
+              {!l2MintSimulation && lastClaimMode === "live" && lastExplorerUrl ? (
                 <Pressable
                   accessibilityRole="link"
                   accessibilityLabel="View transaction on Arbiscan Sepolia"
@@ -914,18 +972,18 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
 
         <Pressable
           accessibilityRole="button"
-          accessibilityState={{ disabled: isSubmitting || !canSignProof || isPlanCompleted }}
+          accessibilityState={{ disabled: isSubmitting || !canSignProof || isProofLocked }}
           style={[
             styles.signProofPrimaryBtn,
-            isSubmitting || !canSignProof || isPlanCompleted ? styles.buttonDisabled : null
+            isSubmitting || !canSignProof || isProofLocked ? styles.buttonDisabled : null
           ]}
-          disabled={isSubmitting || !canSignProof || isPlanCompleted}
+          disabled={isSubmitting || !canSignProof || isProofLocked}
           onPress={() => {
             void handleSignAndDispatchProof();
           }}
         >
           <Text style={styles.signProofPrimaryBtnText}>
-            {isPlanCompleted
+            {isProofLocked
               ? "Daily Proof Signed & Claimed ✓"
               : isSubmitting
                 ? "Hashing & Signing EIP-712 Proof..."
@@ -949,12 +1007,12 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
             <Pressable
               key={card.id}
               accessibilityRole="button"
-              accessibilityState={{ disabled: isSubmitting || !canSignProof || isPlanCompleted }}
+              accessibilityState={{ disabled: isSubmitting || !canSignProof || isProofLocked }}
               style={[
                 styles.expressCard,
-                isSubmitting || !canSignProof || isPlanCompleted ? styles.buttonDisabled : null
+                isSubmitting || !canSignProof || isProofLocked ? styles.buttonDisabled : null
               ]}
-              disabled={isSubmitting || !canSignProof || isPlanCompleted}
+              disabled={isSubmitting || !canSignProof || isProofLocked}
               onPress={() => {
                 void handleSignAndDispatchProof(card);
               }}
@@ -964,8 +1022,8 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
                 <Text style={styles.expressTitle}>{card.title}</Text>
                 <Text style={styles.expressSub}>{card.durationText}</Text>
               </View>
-              <Text style={[styles.expressCta, { color: isPlanCompleted ? "#94A3B8" : card.accentColor }]}>
-                {isPlanCompleted ? "Claimed ✓" : isBusy ? "Signing..." : "1-Tap Sign →"}
+              <Text style={[styles.expressCta, { color: isProofLocked ? "#94A3B8" : card.accentColor }]}>
+                {isProofLocked ? "Claimed ✓" : isBusy ? "Signing..." : "1-Tap Sign →"}
               </Text>
             </Pressable>
           );

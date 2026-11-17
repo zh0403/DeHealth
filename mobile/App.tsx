@@ -38,7 +38,8 @@ import {
   DEMO_VERIFYING_CONTRACT,
   fetchOnChainNonce,
   fetchTokenBalance,
-  getRewardGateAddress
+  getRewardGateAddress,
+  L2ServiceMode
 } from "./src/services/l2ContractService";
 import {
   fetchAnonymizedFeed,
@@ -48,13 +49,19 @@ import {
 import { evaluateDailyTarget } from "./src/services/profileEngine";
 import {
   getActivePlanCycle,
+  getDailyProofSignedMap,
   getPlanHistory,
   getUserBiometrics,
   getWeightLogs,
+  makeDailyProofSignedKey,
+  purgeAdaptiveStorageKeys,
   saveActivePlanCycle,
+  saveDailyProofSigned,
   savePlanHistory
 } from "./src/storage/adaptiveStorage";
+import { clearVaultSecret } from "./src/storage/vaultKeyProvider";
 import {
+  clearStoredWallet,
   exportWalletPrivateKey,
   getOrCreatePersistentWallet
 } from "./src/storage/walletStorage";
@@ -108,6 +115,137 @@ function biometricsToUserProfile(bio: UserBiometrics): UserProfile {
   };
 }
 
+export interface HydratedVaultState {
+  readonly storedBio: UserBiometrics | null;
+  readonly storedCycle: AdaptivePlanCycle | null;
+  readonly storedLogs: readonly WeightLogEntry[];
+  readonly persistentWallet: Wallet;
+  readonly proofSignedMap: Readonly<Record<string, boolean>>;
+}
+
+export interface VaultHydrationDeps {
+  readonly getUserBiometrics: () => Promise<UserBiometrics | null>;
+  readonly getActivePlanCycle: () => Promise<AdaptivePlanCycle | null>;
+  readonly getWeightLogs: () => Promise<WeightLogEntry[]>;
+  readonly getOrCreatePersistentWallet: () => Promise<Wallet>;
+  readonly getDailyProofSignedMap: () => Promise<Record<string, boolean>>;
+  readonly clearStoredWallet: () => Promise<void>;
+  readonly clearVaultSecret: () => Promise<void>;
+  readonly purgeAdaptiveStorageKeys: () => Promise<void>;
+}
+
+const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
+  getUserBiometrics,
+  getActivePlanCycle,
+  getWeightLogs,
+  getOrCreatePersistentWallet,
+  getDailyProofSignedMap,
+  clearStoredWallet,
+  clearVaultSecret,
+  purgeAdaptiveStorageKeys
+};
+
+export async function hydrateVaultData(
+  deps: VaultHydrationDeps = DEFAULT_VAULT_HYDRATION_DEPS
+): Promise<HydratedVaultState> {
+  const [
+    storedBio,
+    storedCycle,
+    storedLogs,
+    persistentWallet,
+    proofSignedMap
+  ] = await Promise.all([
+    deps.getUserBiometrics(),
+    deps.getActivePlanCycle(),
+    deps.getWeightLogs(),
+    deps.getOrCreatePersistentWallet(),
+    deps.getDailyProofSignedMap()
+  ]);
+
+  return {
+    storedBio,
+    storedCycle,
+    storedLogs,
+    persistentWallet,
+    proofSignedMap
+  };
+}
+
+export async function resetVaultAndRecover(
+  deps: VaultHydrationDeps = DEFAULT_VAULT_HYDRATION_DEPS
+): Promise<HydratedVaultState> {
+  await deps.clearStoredWallet();
+  await deps.clearVaultSecret();
+  await deps.purgeAdaptiveStorageKeys();
+  return hydrateVaultData(deps);
+}
+
+export interface VaultBootGateProps {
+  readonly initError: string | null;
+  readonly isResetting?: boolean;
+  readonly onResetVaultAndRetry: () => void;
+}
+
+export const VaultBootGate: React.FC<VaultBootGateProps> = ({
+  initError,
+  isResetting = false,
+  onResetVaultAndRetry
+}) => {
+  if (initError !== null) {
+    return (
+      <View
+        style={[
+          styles.phoneFrame,
+          styles.bootErrorContainer
+        ]}
+      >
+        <View style={styles.bootErrorBanner}>
+          <Text style={styles.bootErrorTitle}>
+            Cryptographic Enclave Error
+          </Text>
+          <Text style={styles.bootErrorText}>{initError}</Text>
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Reset Vault / Retry"
+            disabled={isResetting}
+            style={({ pressed }) => [
+              styles.bootRetryButton,
+              isResetting ? styles.bootRetryButtonDisabled : null,
+              pressed ? styles.tabButtonPressed : null
+            ]}
+            onPress={onResetVaultAndRetry}
+          >
+            <Text style={styles.bootRetryButtonText}>
+              {isResetting ? "Resetting Vault..." : "Reset Vault / Retry"}
+            </Text>
+          </Pressable>
+        </View>
+      </View>
+    );
+  }
+
+  return (
+    <View
+      style={[
+        styles.phoneFrame,
+        { justifyContent: "center", alignItems: "center" }
+      ]}
+    >
+      <ActivityIndicator size="large" color="#10B981" />
+      <Text
+        style={{
+          color: "#94A3B8",
+          marginTop: 14,
+          fontSize: 13,
+          fontWeight: "600"
+        }}
+      >
+        Securing Cryptographic Enclave...
+      </Text>
+    </View>
+  );
+};
+
 export default function App(): React.ReactElement {
   const [activeTab, setActiveTab] = useState<ActiveTab>("checkin");
   const [hasCompletedOnboarding, setHasCompletedOnboarding] =
@@ -137,6 +275,10 @@ export default function App(): React.ReactElement {
   const [lastProofHash, setLastProofHash] = useState<Bytes32 | null>(null);
   const [lastTxHash, setLastTxHash] = useState<string | null>(null);
   const [lastExplorerUrl, setLastExplorerUrl] = useState<string | null>(null);
+  const [lastClaimMode, setLastClaimMode] = useState<L2ServiceMode | null>(null);
+  const [proofSignedMap, setProofSignedMap] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
   const [lastLogTimestampMs, setLastLogTimestampMs] = useState<number>(
     () => Date.now() - 50 * 60 * 60 * 1000
   );
@@ -171,44 +313,65 @@ export default function App(): React.ReactElement {
   }, []);
 
   const [wallet, setWallet] = useState<Wallet | null>(null);
+  const [initError, setInitError] = useState<string | null>(null);
+  const [isResettingVault, setIsResettingVault] = useState<boolean>(false);
+
+  const applyHydratedState = (
+    hydrated: HydratedVaultState,
+    isMounted: () => boolean
+  ): void => {
+    if (!isMounted()) return;
+    const {
+      storedBio,
+      storedCycle,
+      storedLogs,
+      persistentWallet,
+      proofSignedMap: hydratedProofMap
+    } = hydrated;
+    setInitError(null);
+    setWallet(persistentWallet);
+    setProofSignedMap(hydratedProofMap);
+
+    const addr = persistentWallet.address as Address;
+    void fetchOnChainNonce(addr, 0n)
+      .then((nonce) => {
+        if (isMounted()) setCurrentNonce(nonce);
+      })
+      .catch(() => undefined);
+    void fetchTokenBalance(addr, "30.0")
+      .then((bal) => {
+        if (isMounted()) setTokenBalanceDht(bal);
+      })
+      .catch(() => undefined);
+
+    if (storedBio) {
+      setUserBiometrics(storedBio);
+      setHasCompletedOnboarding(true);
+    } else {
+      setUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
+      setHasCompletedOnboarding(false);
+    }
+    if (storedCycle) {
+      setActiveCycle(storedCycle);
+    }
+    if (storedLogs.length > 0) {
+      setWeightLogs(storedLogs);
+    }
+  };
 
   useEffect(() => {
     let mounted = true;
     const hydrateFromVault = async (): Promise<void> => {
       try {
-        const [storedBio, storedCycle, storedLogs, persistentWallet] = await Promise.all([
-          getUserBiometrics(),
-          getActivePlanCycle(),
-          getWeightLogs(),
-          getOrCreatePersistentWallet()
-        ]);
+        const hydrated = await hydrateVaultData();
+        applyHydratedState(hydrated, () => mounted);
+      } catch (err: unknown) {
         if (!mounted) return;
-        setWallet(persistentWallet);
-        if (persistentWallet) {
-          const addr = persistentWallet.address as Address;
-          void fetchOnChainNonce(addr, 0n)
-            .then((nonce) => {
-              if (mounted) setCurrentNonce(nonce);
-            })
-            .catch(() => undefined);
-          void fetchTokenBalance(addr, "30.0")
-            .then((bal) => {
-              if (mounted) setTokenBalanceDht(bal);
-            })
-            .catch(() => undefined);
-        }
-        if (storedBio) {
-          setUserBiometrics(storedBio);
-          setHasCompletedOnboarding(true);
-        }
-        if (storedCycle) {
-          setActiveCycle(storedCycle);
-        }
-        if (storedLogs.length > 0) {
-          setWeightLogs(storedLogs);
-        }
-      } catch {
-        // Non-fatal in preview environments
+        const message =
+          err instanceof Error
+            ? err.message
+            : "Failed to initialize local cryptographic enclave.";
+        setInitError(message);
       }
     };
     void hydrateFromVault();
@@ -216,6 +379,43 @@ export default function App(): React.ReactElement {
       mounted = false;
     };
   }, []);
+
+  const handleResetVaultAndRetry = async (): Promise<void> => {
+    if (isResettingVault) return;
+    setIsResettingVault(true);
+    setInitError(null);
+    try {
+      const recovered = await resetVaultAndRecover();
+      setLastProofHash(null);
+      setLastTxHash(null);
+      setLastExplorerUrl(null);
+      setLastClaimMode(null);
+      setActiveCycle(
+        generate14DayPlan(
+          DEFAULT_BASELINE_BIOMETRICS,
+          Date.now() - 15 * 24 * 60 * 60 * 1000
+        )
+      );
+      setWeightLogs([
+        {
+          id: "wlog_baseline",
+          timestampMs: Date.now() - 14 * 24 * 60 * 60 * 1000,
+          weightKg: 70.0,
+          bodyFatPct: 18.5,
+          note: "Initial onboarding weight"
+        }
+      ]);
+      applyHydratedState(recovered, () => true);
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Vault recovery failed. Please try again.";
+      setInitError(message);
+    } finally {
+      setIsResettingVault(false);
+    }
+  };
 
   const userAddress = (wallet ? wallet.address : "0x0000000000000000000000000000000000000000") as Address;
 
@@ -229,13 +429,21 @@ export default function App(): React.ReactElement {
     [userProfile, lastLogTimestampMs]
   );
 
+  const activeDayIndex = useMemo<number>(
+    () => getActiveDayIndex(activeCycle.startDateMs, nowMs),
+    [activeCycle.startDateMs, nowMs]
+  );
+
+  const isTodayProofSigned = Boolean(
+    proofSignedMap[makeDailyProofSignedKey(activeCycle.id, activeDayIndex)]
+  );
+
   const todayPlan: DailyPlan = useMemo(() => {
-    const dayIndex = getActiveDayIndex(activeCycle.startDateMs, nowMs);
     return (
-      activeCycle.dailyPlans[dayIndex] ??
+      activeCycle.dailyPlans[activeDayIndex] ??
       generate14DayPlan(userBiometrics, nowMs).dailyPlans[0]!
     );
-  }, [activeCycle, userBiometrics, nowMs]);
+  }, [activeCycle, activeDayIndex, userBiometrics, nowMs]);
 
   const adherencePct = useMemo<number>(
     () => calculateAdherencePct(activeCycle, nowMs),
@@ -296,7 +504,17 @@ export default function App(): React.ReactElement {
     // 1. Submit on-chain claim or fallback receipt
     const claimResult = await claimStreakReward(payload, wallet ?? undefined);
     setLastTxHash(claimResult.txHash);
-    setLastExplorerUrl(claimResult.explorerUrl);
+    setLastExplorerUrl(claimResult.mode === "live" ? claimResult.explorerUrl : null);
+    setLastClaimMode(claimResult.mode);
+
+    const proofSignedKey = makeDailyProofSignedKey(activeCycle.id, activeDayIndex);
+    setProofSignedMap((prev) => ({
+      ...prev,
+      [proofSignedKey]: true
+    }));
+    void saveDailyProofSigned(activeCycle.id, activeDayIndex, true).catch(
+      () => undefined
+    );
 
     const nextStreak = Number(payload.proof.streakCount);
     const expectedBalance = (Number.parseFloat(tokenBalanceDht) + 10).toFixed(1);
@@ -350,27 +568,16 @@ export default function App(): React.ReactElement {
     return true;
   };
 
-  if (!wallet) {
+  if (!wallet || initError !== null) {
     return (
       <SafeAreaView style={styles.viewport}>
-        <View
-          style={[
-            styles.phoneFrame,
-            { justifyContent: "center", alignItems: "center" }
-          ]}
-        >
-          <ActivityIndicator size="large" color="#10B981" />
-          <Text
-            style={{
-              color: "#94A3B8",
-              marginTop: 14,
-              fontSize: 13,
-              fontWeight: "600"
-            }}
-          >
-            Securing Cryptographic Enclave...
-          </Text>
-        </View>
+        <VaultBootGate
+          initError={initError}
+          isResetting={isResettingVault}
+          onResetVaultAndRetry={() => {
+            void handleResetVaultAndRetry();
+          }}
+        />
       </SafeAreaView>
     );
   }
@@ -407,11 +614,13 @@ export default function App(): React.ReactElement {
                   userProfile={userProfile}
                   dailyPlan={todayPlan}
                   cycleId={activeCycle.id}
+                  isProofSigned={isTodayProofSigned}
                   lastLogTimestampMs={lastLogTimestampMs}
                   onUpdateDailyPlan={handleUpdateDailyPlan}
                   onDispatchSignedClaim={handleDispatchSignedClaim}
                   lastTxHash={lastTxHash}
                   lastExplorerUrl={lastExplorerUrl}
+                  lastClaimMode={lastClaimMode}
                 />
               ) : null}
 
@@ -424,6 +633,7 @@ export default function App(): React.ReactElement {
                   lastProofHash={lastProofHash}
                   lastTxHash={lastTxHash}
                   lastExplorerUrl={lastExplorerUrl}
+                  lastClaimMode={lastClaimMode}
                   targetAssessment={targetAssessment}
                   activeCycle={activeCycle}
                   todayPlan={todayPlan}
@@ -556,5 +766,45 @@ const styles = StyleSheet.create({
   tabLabelActive: {
     color: "#38BDF8",
     fontWeight: "700"
+  },
+  bootErrorContainer: {
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 24
+  },
+  bootErrorBanner: {
+    width: "100%",
+    backgroundColor: "#1F1215",
+    borderWidth: 1,
+    borderColor: "#EF4444",
+    borderRadius: 16,
+    padding: 18
+  },
+  bootErrorTitle: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#FCA5A5",
+    marginBottom: 8
+  },
+  bootErrorText: {
+    fontSize: 13,
+    color: "#FECACA",
+    lineHeight: 19,
+    marginBottom: 16
+  },
+  bootRetryButton: {
+    backgroundColor: "#EF4444",
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: "center"
+  },
+  bootRetryButtonDisabled: {
+    opacity: 0.6
+  },
+  bootRetryButtonText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#FFFFFF"
   }
 });

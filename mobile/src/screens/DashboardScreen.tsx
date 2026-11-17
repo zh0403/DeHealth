@@ -31,6 +31,7 @@ import {
   evaluateBiWeeklyReview,
   generate14DayPlan
 } from "../services/adaptivePlanEngine";
+import { L2ServiceMode } from "../services/l2ContractService";
 import { DailyTargetAssessment } from "../services/profileEngine";
 import {
   saveActivePlanCycle,
@@ -134,9 +135,10 @@ export interface DashboardScreenProps {
   readonly userAddress?: Address | null;
   /** Callback or direct function to export private key with security warning */
   readonly onExportPrivateKey?: () => Promise<string> | string;
-  /** Optional transaction hash and explorer URL from L2 */
+  /** Optional transaction hash, explorer URL, and mode from L2 */
   readonly lastTxHash?: string | null;
   readonly lastExplorerUrl?: string | null;
+  readonly lastClaimMode?: L2ServiceMode | null;
 }
 
 const WEEK_DAYS: ReadonlyArray<{
@@ -169,8 +171,10 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   userAddress,
   onExportPrivateKey,
   lastTxHash,
-  lastExplorerUrl
+  lastExplorerUrl,
+  lastClaimMode = null
 }) => {
+  const isLiveClaim = lastClaimMode === "live";
   const defaultCycle = useMemo<AdaptivePlanCycle>(() => {
     const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
     return generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, fifteenDaysAgo);
@@ -638,7 +642,9 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             <View style={styles.proofStatusRow}>
               <Text style={styles.proofDot}>●</Text>
               <Text style={styles.proofStatus}>
-                Confirmed on Arbitrum Sepolia (L2)
+                {isLiveClaim
+                  ? "Confirmed on Arbitrum Sepolia (L2)"
+                  : "Simulated Local Mint (Demo Mode — Configure L2 .env for Live Arbitrum)"}
               </Text>
               <Text style={styles.proofStreakBadge}>Streak #{streakCount}</Text>
             </View>
@@ -654,7 +660,11 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
             {lastTxHash ? (
               <View style={{ marginTop: 6 }}>
-                <Text style={styles.hashLabel}>Arbitrum Sepolia Transaction Hash:</Text>
+                <Text style={styles.hashLabel}>
+                  {isLiveClaim
+                    ? "Arbitrum Sepolia Transaction Hash:"
+                    : "Simulated Local Transaction Hash:"}
+                </Text>
                 <Text
                   selectable
                   accessibilityLabel="L2 Transaction Hash"
@@ -668,7 +678,9 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             ) : null}
 
             <Text style={styles.proofAuditNotice}>
-              [✓ Proof Verified On-Chain • Zero Biometrics Disclosed]
+              {isLiveClaim
+                ? "[✓ Proof Verified On-Chain • Zero Biometrics Disclosed]"
+                : "[✓ EIP-712 Proof Verified Locally • Zero Biometrics Disclosed]"}
             </Text>
           </View>
         ) : (
@@ -784,7 +796,11 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
         {lastTxHash ? (
           <View style={{ marginTop: 8 }}>
-            <Text style={styles.walletSubLabel}>Last L2 Transaction Hash:</Text>
+            <Text style={styles.walletSubLabel}>
+              {isLiveClaim
+                ? "Last L2 Transaction Hash:"
+                : "Simulated Local Transaction Hash:"}
+            </Text>
             <Text
               selectable
               accessibilityLabel="Wallet Last Tx Hash"
@@ -794,10 +810,15 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             >
               {lastTxHash}
             </Text>
+            {!isLiveClaim ? (
+              <Text style={styles.walletFeedbackText}>
+                Simulated Local Mint (Demo Mode — Configure L2 .env for Live Arbitrum)
+              </Text>
+            ) : null}
           </View>
         ) : null}
 
-        {lastExplorerUrl ? (
+        {isLiveClaim && lastExplorerUrl ? (
           <Pressable
             accessibilityRole="link"
             accessibilityLabel="View on Arbiscan Sepolia"

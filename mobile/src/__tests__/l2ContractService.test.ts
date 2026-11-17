@@ -1,5 +1,5 @@
 import { Address, Bytes32, SignedWorkoutClaimPayload, WorkoutProof } from "@dehealth/shared";
-import { parseEther, Wallet } from "ethers";
+import { Signer, Wallet, parseEther } from "ethers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { signWorkoutProof } from "../services/cryptoService";
 import {
@@ -17,7 +17,8 @@ import {
   setContractFactory,
   setL2Provider,
   setRewardGateAddress,
-  setTokenAddress
+  setTokenAddress,
+  ZERO_ADDRESS
 } from "../services/l2ContractService";
 
 const TEST_PRIVATE_KEY =
@@ -79,6 +80,27 @@ describe("Milestone 3 R4: L2 Contract Service Unit Test Suite", () => {
       expect(isL2Configured()).toBe(false);
       expect(getRewardGateAddress()).toBeNull();
       expect(getTokenAddress()).toBeNull();
+    });
+
+    it("rejects zero/placeholder addresses (0x000...0) and invalid addresses in getters and isL2Configured (P3-07)", () => {
+      process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL =
+        "https://sepolia-rollup.arbitrum.io/rpc";
+      process.env.EXPO_PUBLIC_REWARD_GATE_ADDRESS = ZERO_ADDRESS;
+      process.env.EXPO_PUBLIC_DHT_TOKEN_ADDRESS = ZERO_ADDRESS;
+
+      expect(getRewardGateAddress()).toBeNull();
+      expect(getTokenAddress()).toBeNull();
+      expect(isL2Configured()).toBe(false);
+
+      // Even via programmatic setter, zero address must be rejected
+      const mockProvider = {} as unknown as ReturnType<typeof getL2Provider>;
+      setL2Provider(mockProvider);
+      setRewardGateAddress(ZERO_ADDRESS);
+      setTokenAddress("not-an-address" as Address);
+
+      expect(getRewardGateAddress()).toBeNull();
+      expect(getTokenAddress()).toBeNull();
+      expect(isL2Configured()).toBe(false);
     });
   });
 
@@ -214,7 +236,31 @@ describe("Milestone 3 R4: L2 Contract Service Unit Test Suite", () => {
       const result = await claimStreakReward(payload);
       expect(result.mode).toBe("local-fallback");
       expect(result.txHash).toMatch(/^0x[a-f0-9]{64}$/);
-      expect(result.explorerUrl).toBe(`${ARBISCAN_SEPOLIA_BASE_URL}/${result.txHash}`);
+      expect(result.explorerUrl).toBeNull();
+    });
+
+    it("falls back cleanly with explorerUrl: null when env holds placeholder 0x000...0 addresses", async () => {
+      process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL =
+        "https://sepolia-rollup.arbitrum.io/rpc";
+      process.env.EXPO_PUBLIC_REWARD_GATE_ADDRESS = ZERO_ADDRESS;
+
+      const proof: WorkoutProof = {
+        user: testWallet.address as Address,
+        telemetryHash:
+          "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" as Bytes32,
+        streakCount: 2n,
+        nonce: 1n,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+      };
+      const payload = await signWorkoutProof(
+        testWallet,
+        proof,
+        DEMO_VERIFYING_CONTRACT
+      );
+
+      const result = await claimStreakReward(payload);
+      expect(result.mode).toBe("local-fallback");
+      expect(result.explorerUrl).toBeNull();
     });
   });
 
@@ -280,6 +326,32 @@ describe("Milestone 3 R4: L2 Contract Service Unit Test Suite", () => {
 
       await expect(claimStreakReward(payload, testWallet)).rejects.toThrow(
         "SignatureReplay"
+      );
+    });
+
+    it("throws an explicit error when L2 is configured without a valid signer instead of silently simulating (P3-02)", async () => {
+      const mockProvider = {} as unknown as ReturnType<typeof getL2Provider>;
+      setL2Provider(mockProvider);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+
+      const proof: WorkoutProof = {
+        user: testWallet.address as Address,
+        telemetryHash:
+          "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" as Bytes32,
+        streakCount: 3n,
+        nonce: 0n,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+      };
+
+      const payload = await signWorkoutProof(testWallet, proof, TEST_GATE_ADDRESS);
+
+      await expect(claimStreakReward(payload)).rejects.toThrow(
+        "L2 contract submission requires a valid signer when Arbitrum Sepolia is configured."
+      );
+      await expect(
+        claimStreakReward(payload, {} as unknown as Signer)
+      ).rejects.toThrow(
+        "L2 contract submission requires a valid signer when Arbitrum Sepolia is configured."
       );
     });
   });

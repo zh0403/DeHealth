@@ -17,6 +17,28 @@ import {
 } from "ethers";
 import { verifyWorkoutProofSignature } from "./cryptoService";
 
+export const ZERO_ADDRESS: Address =
+  "0x0000000000000000000000000000000000000000" as Address;
+
+const EVM_ADDRESS_REGEX = /^0x[a-fA-F0-9]{40}$/;
+
+export function isZeroAddress(address: string): boolean {
+  return address.trim().toLowerCase() === ZERO_ADDRESS;
+}
+
+function normalizeConfiguredAddress(
+  address: string | null | undefined
+): Address | null {
+  if (!address) {
+    return null;
+  }
+  const trimmed = address.trim();
+  if (!EVM_ADDRESS_REGEX.test(trimmed) || isZeroAddress(trimmed)) {
+    return null;
+  }
+  return trimmed as Address;
+}
+
 export const DEMO_VERIFYING_CONTRACT: Address =
   "0x1111111111111111111111111111111111111111" as Address;
 
@@ -39,7 +61,7 @@ export type L2ServiceMode = "live" | "local-fallback";
 
 export interface ClaimStreakRewardResult {
   readonly txHash: string;
-  readonly explorerUrl: string;
+  readonly explorerUrl: string | null;
   readonly mode: L2ServiceMode;
 }
 
@@ -126,25 +148,25 @@ export function resetL2Config(): void {
 }
 
 /**
- * Returns the active DeHealthRewardGate address or null if unconfigured.
+ * Returns the active DeHealthRewardGate address or null if unconfigured,
+ * invalid, or equal to the zero placeholder address (0x000...0).
  */
 export function getRewardGateAddress(): Address | null {
   if (customGateAddress !== undefined) {
-    return customGateAddress;
+    return normalizeConfiguredAddress(customGateAddress);
   }
-  const addr = process.env.EXPO_PUBLIC_REWARD_GATE_ADDRESS?.trim();
-  return addr && addr.length > 0 ? (addr as Address) : null;
+  return normalizeConfiguredAddress(process.env.EXPO_PUBLIC_REWARD_GATE_ADDRESS);
 }
 
 /**
- * Returns the active DeHealthToken address or null if unconfigured.
+ * Returns the active DeHealthToken address or null if unconfigured,
+ * invalid, or equal to the zero placeholder address (0x000...0).
  */
 export function getTokenAddress(): Address | null {
   if (customTokenAddress !== undefined) {
-    return customTokenAddress;
+    return normalizeConfiguredAddress(customTokenAddress);
   }
-  const addr = process.env.EXPO_PUBLIC_DHT_TOKEN_ADDRESS?.trim();
-  return addr && addr.length > 0 ? (addr as Address) : null;
+  return normalizeConfiguredAddress(process.env.EXPO_PUBLIC_DHT_TOKEN_ADDRESS);
 }
 
 /**
@@ -167,12 +189,13 @@ export function getL2Provider(): Provider | null {
 }
 
 /**
- * Returns whether live Arbitrum Sepolia L2 contract connectivity is configured.
+ * Returns whether live Arbitrum Sepolia L2 contract connectivity is configured
+ * with a non-zero contract address.
  */
 export function isL2Configured(): boolean {
   const provider = getL2Provider();
   const gateAddress = getRewardGateAddress();
-  return Boolean(provider && gateAddress);
+  return Boolean(provider && gateAddress && !isZeroAddress(gateAddress));
 }
 
 /**
@@ -275,11 +298,21 @@ export async function fetchTokenBalance(
   }
 }
 
+function isValidSigner(signer: Signer | null | undefined): signer is Signer {
+  return (
+    signer !== null &&
+    signer !== undefined &&
+    typeof signer.getAddress === "function" &&
+    typeof signer.signTypedData === "function"
+  );
+}
+
 /**
  * Claims a streak reward:
  * 1. Executes local EIP-712 verification first to ensure cryptographic fail-closed safety.
- * 2. If live Arbitrum Sepolia RPC and RewardGate address are configured, submits on-chain transaction.
- * 3. If unconfigured, cleanly returns local EIP-712 verification and simulated receipt with Arbiscan link.
+ * 2. If live Arbitrum Sepolia RPC and RewardGate address are configured, requires a valid signer
+ *    (throwing an explicit Error if missing/invalid) and submits the on-chain transaction.
+ * 3. If unconfigured, returns local EIP-712 verification and simulated receipt with explorerUrl: null.
  */
 export async function claimStreakReward(
   payload: SignedWorkoutClaimPayload,
@@ -294,52 +327,53 @@ export async function claimStreakReward(
     );
   }
 
-  if (isL2Configured() && signer) {
-    try {
-      const gateAddress = getRewardGateAddress()!;
-      const provider = getL2Provider();
-
-      let effectiveSigner = signer;
-      if (provider && isConnectableSigner(signer)) {
-        if (signer.provider !== provider) {
-          effectiveSigner = signer.connect(provider);
-        }
-      }
-
-      const gateContract = getRewardGateContract(gateAddress, effectiveSigner);
-
-      const proofStruct = {
-        user: payload.proof.user,
-        telemetryHash: payload.proof.telemetryHash,
-        streakCount: payload.proof.streakCount,
-        nonce: payload.proof.nonce,
-        deadline: payload.proof.deadline
-      };
-
-      const tx = await gateContract.claimStreakReward(
-        proofStruct,
-        payload.signature
+  if (isL2Configured()) {
+    if (!isValidSigner(signer)) {
+      throw new Error(
+        "L2 contract submission requires a valid signer when Arbitrum Sepolia is configured."
       );
-
-      const receipt = await tx.wait();
-      const txHash: string = receipt?.hash ?? tx.hash;
-
-      return {
-        txHash,
-        explorerUrl: `${ARBISCAN_SEPOLIA_BASE_URL}/${txHash}`,
-        mode: "live"
-      };
-    } catch (err: unknown) {
-      // Re-throw genuine on-chain errors (e.g. SignatureReplay, InvalidNonce) to fail closed
-      throw err;
     }
+
+    const gateAddress = getRewardGateAddress()!;
+    const provider = getL2Provider();
+
+    let effectiveSigner = signer;
+    if (provider && isConnectableSigner(signer)) {
+      if (signer.provider !== provider) {
+        effectiveSigner = signer.connect(provider);
+      }
+    }
+
+    const gateContract = getRewardGateContract(gateAddress, effectiveSigner);
+
+    const proofStruct = {
+      user: payload.proof.user,
+      telemetryHash: payload.proof.telemetryHash,
+      streakCount: payload.proof.streakCount,
+      nonce: payload.proof.nonce,
+      deadline: payload.proof.deadline
+    };
+
+    const tx = await gateContract.claimStreakReward(
+      proofStruct,
+      payload.signature
+    );
+
+    const receipt = await tx.wait();
+    const txHash: string = receipt?.hash ?? tx.hash;
+
+    return {
+      txHash,
+      explorerUrl: `${ARBISCAN_SEPOLIA_BASE_URL}/${txHash}`,
+      mode: "live"
+    };
   }
 
-  // Unconfigured fallback mode: verified offline EIP-712 commitment + simulated receipt
+  // Unconfigured fallback mode: verified offline EIP-712 commitment + simulated receipt (no fake explorer URL)
   const simulatedHash = generateSimulatedTxHash(payload);
   return {
     txHash: simulatedHash,
-    explorerUrl: `${ARBISCAN_SEPOLIA_BASE_URL}/${simulatedHash}`,
+    explorerUrl: null,
     mode: "local-fallback"
   };
 }
