@@ -54,7 +54,27 @@ export const PROHIBITED_BIOMETRIC_KEYS = [
   "fitnessGoal",
   "dailyCalorieTarget",
   "dailyStepTarget",
-  "sleepHours"
+  "sleepHours",
+  "bodyFatPct",
+  "muscleMassKg",
+  "activeMinutes",
+  "weeklyWorkoutFrequency",
+  "goal",
+  "loggedCaloriesKcal",
+  "loggedProteinGrams",
+  "loggedCarbsGrams",
+  "loggedFatGrams",
+  "targetCaloriesKcal",
+  "targetProteinGrams",
+  "targetCarbsGrams",
+  "targetFatGrams",
+  "baselineBiometrics",
+  "dailyPlans",
+  "exercises",
+  "heartRate",
+  "heartRateBpm",
+  "caloriesKcal",
+  "bmi"
 ] as const;
 
 export class DataSovereigntyViolationError extends Error {
@@ -64,21 +84,79 @@ export class DataSovereigntyViolationError extends Error {
   }
 }
 
+function normalizeBiometricKey(key: string): string {
+  return key.replace(/[\s_-]+/g, "").toLowerCase();
+}
+
+const NORMALIZED_PROHIBITED_BIOMETRIC_KEYS: ReadonlySet<string> = new Set(
+  PROHIBITED_BIOMETRIC_KEYS.map((key) => normalizeBiometricKey(key))
+);
+
+function isObjectLike(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function inspectForRawBiometrics(value: unknown, visited: WeakSet<object>): void {
+  if (!isObjectLike(value)) {
+    return;
+  }
+  if (visited.has(value)) {
+    return;
+  }
+  visited.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      inspectForRawBiometrics(item, visited);
+    }
+    return;
+  }
+
+  if (value instanceof Set) {
+    for (const item of value) {
+      inspectForRawBiometrics(item, visited);
+    }
+    return;
+  }
+
+  if (value instanceof Map) {
+    for (const [mapKey, mapValue] of value.entries()) {
+      if (
+        typeof mapKey === "string" &&
+        mapValue !== undefined &&
+        NORMALIZED_PROHIBITED_BIOMETRIC_KEYS.has(normalizeBiometricKey(mapKey))
+      ) {
+        throw new DataSovereigntyViolationError(
+          `Data sovereignty violation: raw biometric key "${mapKey}" detected in feed payload. Zero raw biometrics may leave the device.`
+        );
+      }
+      inspectForRawBiometrics(mapKey, visited);
+      inspectForRawBiometrics(mapValue, visited);
+    }
+    return;
+  }
+
+  for (const [key, propValue] of Object.entries(value)) {
+    if (
+      propValue !== undefined &&
+      NORMALIZED_PROHIBITED_BIOMETRIC_KEYS.has(normalizeBiometricKey(key))
+    ) {
+      throw new DataSovereigntyViolationError(
+        `Data sovereignty violation: raw biometric key "${key}" detected in feed payload. Zero raw biometrics may leave the device.`
+      );
+    }
+    inspectForRawBiometrics(propValue, visited);
+  }
+}
+
 /**
- * Asserts that the incoming payload contains zero raw biometrics or profile data.
+ * Asserts that the incoming payload contains zero raw biometrics or profile data
+ * at any nesting depth (objects, arrays, Sets, Maps) regardless of key casing or
+ * snake/kebab formatting.
  * Throws DataSovereigntyViolationError if any raw biometrics are detected.
  */
 export function assertZeroRawBiometrics(payload: unknown): void {
-  if (payload && typeof payload === "object") {
-    const record = payload as Record<string, unknown>;
-    for (const key of PROHIBITED_BIOMETRIC_KEYS) {
-      if (key in record && record[key] !== undefined) {
-        throw new DataSovereigntyViolationError(
-          `Data sovereignty violation: raw biometric key "${key}" detected in feed payload. Zero raw biometrics may leave the device.`
-        );
-      }
-    }
-  }
+  inspectForRawBiometrics(payload, new WeakSet<object>());
 }
 
 /**

@@ -138,16 +138,18 @@ export const SignedWorkoutClaimPayloadSchema: z.ZodType<
   signature: HexSignatureSchema
 });
 
-export const AnonymizedFeedInsertSchema = z.object({
-  user_pseudonym: z
-    .string()
-    .trim()
-    .min(3)
-    .max(64)
-    .regex(/^[a-zA-Z0-9_-]+$/, "Pseudonym must be alphanumeric with underscores or hyphens"),
-  proof_hash: Bytes32Schema,
-  streak_count: z.number().int().min(1).max(10_000)
-});
+export const AnonymizedFeedInsertSchema = z
+  .object({
+    user_pseudonym: z
+      .string()
+      .trim()
+      .min(3)
+      .max(64)
+      .regex(/^[a-zA-Z0-9_-]+$/, "Pseudonym must be alphanumeric with underscores or hyphens"),
+    proof_hash: Bytes32Schema,
+    streak_count: z.number().int().min(1).max(10_000)
+  })
+  .strict();
 
 export const PeerCheerInsertSchema = z.object({
   feed_id: z.string().uuid(),

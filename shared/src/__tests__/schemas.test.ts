@@ -18,7 +18,6 @@ import {
   DEHEALTH_EIP712_VERSION,
   Eip712DomainSchema,
   FITNESS_GOALS,
-  FitnessGoal,
   FitnessGoalSchema,
   FoodPresetItem,
   FoodPresetItemSchema,
@@ -31,7 +30,6 @@ import {
   PeerCheerInsertSchema,
   PLAN_CYCLE_STATUSES,
   PLAN_REVIEW_STATUSES,
-  PlanCycleStatus,
   PlanCycleStatusSchema,
   PlanReviewStatus,
   PlanReviewStatusSchema,
@@ -465,6 +463,18 @@ describe("Shared Domain Layer & Cryptographic Schemas", () => {
           user_pseudonym: "valid_name",
           proof_hash: sampleValidBytes32,
           streak_count: 10_001
+        })
+      ).toThrow();
+    });
+
+    it("rejects unknown extra fields via strict() mode to block unexpected metadata leakage", () => {
+      expect(() =>
+        AnonymizedFeedInsertSchema.parse({
+          user_pseudonym: "athlete_alpha-01",
+          proof_hash: sampleValidBytes32,
+          streak_count: 5,
+          extraMetadata: "unexpected",
+          weightKg: 70
         })
       ).toThrow();
     });

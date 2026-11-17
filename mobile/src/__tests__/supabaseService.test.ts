@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AnonymizedFeedInsert,
-  AnonymizedFeedRecord,
   assertZeroRawBiometrics,
   DataSovereigntyViolationError,
   DEFAULT_FALLBACK_CHEER_COUNTS,
@@ -19,7 +18,7 @@ import {
   sendPeerCheer,
   setSupabaseClient
 } from "../services/supabaseService";
-import { Bytes32 } from "@dehealth/shared";
+import { AnonymizedFeedRecord, Bytes32 } from "@dehealth/shared";
 import { SupabaseClient } from "@supabase/supabase-js";
 
 const VALID_BYTES32 =
@@ -588,6 +587,94 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
 
       const callArg = insertMock.mock.calls[0]?.[0];
       expect(Object.keys(callArg)).toEqual(["user_pseudonym", "proof_hash", "streak_count"]);
+    });
+
+    it("detects biometric keys case-insensitively and in snake_case / kebab-case", () => {
+      const variants: Array<Record<string, unknown>> = [
+        { StepCount: 8000 },
+        { WEIGHTKG: 72 },
+        { BodyFatPct: 18 },
+        { GOAL: "cut" },
+        { step_count: 8000 },
+        { avg_heart_rate_bpm: 130 },
+        { "logged-calories-kcal": 1800 }
+      ];
+
+      for (const variant of variants) {
+        expect(() =>
+          assertZeroRawBiometrics({
+            user_pseudonym: "athlete_one",
+            proof_hash: VALID_BYTES32,
+            streak_count: 4,
+            ...variant
+          })
+        ).toThrow(DataSovereigntyViolationError);
+      }
+    });
+
+    it("recursively rejects biometric keys nested inside objects, arrays, Sets, and Maps", () => {
+      const nestedPayloads: unknown[] = [
+        { meta: { stepCount: 5000 } },
+        { deep: { level2: { Age: 29 } } },
+        { items: [{ activeMinutes: 30 }] },
+        [{ weight_kg: 71.5 }],
+        { tags: ["ok", { nested: { loggedCaloriesKcal: 2100 } }] },
+        { container: new Set([{ muscleMassKg: 35 }]) },
+        { mapData: new Map<string, unknown>([["body_fat_pct", 16.5]]) },
+        { mapNested: new Map<string, unknown>([["safe", { weeklyWorkoutFrequency: 4 }]]) }
+      ];
+
+      for (const payload of nestedPayloads) {
+        expect(() => assertZeroRawBiometrics(payload)).toThrow(
+          DataSovereigntyViolationError
+        );
+      }
+    });
+
+    it("handles circular object references without infinite recursion", () => {
+      const cleanCircular: Record<string, unknown> = {
+        user_pseudonym: "athlete_one",
+        proof_hash: VALID_BYTES32,
+        streak_count: 4
+      };
+      cleanCircular.self = cleanCircular;
+      expect(() => assertZeroRawBiometrics(cleanCircular)).not.toThrow();
+
+      const taintedCircular: Record<string, unknown> = {
+        user_pseudonym: "athlete_one",
+        nested: { heartRateBpm: 140 }
+      };
+      taintedCircular.self = taintedCircular;
+      expect(() => assertZeroRawBiometrics(taintedCircular)).toThrow(
+        DataSovereigntyViolationError
+      );
+    });
+
+    it("rejects nested biometric payloads and unknown non-biometric extra fields in publishProofMilestone without network calls", async () => {
+      const insertMock = vi.fn();
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      await expect(
+        publishProofMilestone({
+          user_pseudonym: "tainted_nested",
+          proof_hash: VALID_BYTES32,
+          streak_count: 3,
+          meta: { step_count: 4200 }
+        } as unknown as AnonymizedFeedInsert)
+      ).rejects.toThrow(DataSovereigntyViolationError);
+
+      await expect(
+        publishProofMilestone({
+          user_pseudonym: "extra_field_user",
+          proof_hash: VALID_BYTES32,
+          streak_count: 3,
+          unexpectedKey: "should-be-rejected-by-strict-schema"
+        } as unknown as AnonymizedFeedInsert)
+      ).rejects.toThrow();
+
+      expect(fromMock).not.toHaveBeenCalled();
+      expect(insertMock).not.toHaveBeenCalled();
     });
   });
 
