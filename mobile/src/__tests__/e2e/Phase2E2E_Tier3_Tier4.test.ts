@@ -1,42 +1,20 @@
 import {
-  ACTIVITY_LEVELS,
-  ActivityLevel,
   AdaptivePlanCycle,
-  AdaptivePlanCycleSchema,
   Address,
   ARBITRUM_SEPOLIA_CHAIN_ID,
-  Bytes32,
   DailyPlan,
   DailyPlanSchema,
   DEFAULT_BASELINE_BIOMETRICS,
-  FITNESS_GOALS,
-  FitnessGoal,
-  FoodPresetItem,
-  FoodPresetItemSchema,
-  GENDER_TYPES,
-  GenderType,
-  MacroSplit,
-  MacroSplitSchema,
-  PLAN_CYCLE_STATUSES,
-  PLAN_REVIEW_STATUSES,
-  PlanCycleStatus,
-  PlanReviewStatus,
   ProposedPlanReview,
-  ProposedPlanReviewSchema,
-  SignedWorkoutClaimPayload,
   STANDARD_FOOD_PRESETS,
   TelemetryData,
-  TelemetryDataSchema,
   UserBiometrics,
   UserBiometricsSchema,
-  UserProfile,
   WeightLogEntry,
   WeightLogEntrySchema,
-  WorkoutExerciseItem,
-  WorkoutExerciseItemSchema,
   WorkoutProof
 } from "@dehealth/shared";
-import { ethers, Wallet } from "ethers";
+import { Wallet } from "ethers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("react-native", () => ({
@@ -52,7 +30,6 @@ vi.mock("react-native", () => ({
 }));
 
 import {
-  computeWorkoutProofDigest,
   hashTelemetry as hashTelemetryCommitment,
   signWorkoutProof,
   verifyWorkoutProofSignature
@@ -79,8 +56,6 @@ import {
   scaleFoodPresetPortion
 } from "../../services/adaptivePlanEngine";
 import {
-  FATIGUE_GAP_THRESHOLD_MS,
-  FATIGUE_SCALING_MULTIPLIER,
   scaleTargetForInactivityGap
 } from "../../services/profileEngine";
 import { ADAPTIVE_STORAGE_KEYS as STORAGE_KEYS } from "../../storage/adaptiveStorage";
@@ -968,6 +943,7 @@ describe("Phase 2.0 E2E Tier 3 & Tier 4 Test Suite", () => {
         exercises: completedExercises,
         completed: true
       };
+      expect(day1Completed.completed).toBe(true);
 
       // Both tracks completed -> unlock cryptographic telemetry proof
       const telemetry: TelemetryData = {

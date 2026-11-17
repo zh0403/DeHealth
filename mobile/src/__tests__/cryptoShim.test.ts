@@ -4,7 +4,7 @@ import {
   SecureRandomUnavailableError
 } from "../runtime/cryptoShim";
 
-type Host = Parameters<typeof installCryptoShim>[0];
+type Host = NonNullable<Parameters<typeof installCryptoShim>[0]>;
 
 /** A host that looks like React Native / Hermes: no Web Crypto at all. */
 function bareHost(): Host {

@@ -386,7 +386,11 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
         expect(raw).toBeDefined();
 
         const envelope = JSON.parse(raw!);
-        envelope.ciphertext = envelope.ciphertext.slice(0, -2) + "99";
+        // Pick a replacement byte that differs from the real one, otherwise a
+        // ciphertext already ending in it (1 in 256) would be left unchanged.
+        const originalTail = envelope.ciphertext.slice(-2);
+        envelope.ciphertext =
+          envelope.ciphertext.slice(0, -2) + (originalTail === "99" ? "00" : "99");
         backend.setRaw(ADAPTIVE_STORAGE_KEYS.USER_BIOMETRICS, JSON.stringify(envelope));
 
         await expect(getUserBiometrics()).rejects.toThrow("tampering detected");

@@ -1,11 +1,10 @@
 import {
   ARBITRUM_SEPOLIA_CHAIN_ID,
-  createDeHealthDomain,
   TelemetryData,
   UserProfile,
   WorkoutProof
 } from "@dehealth/shared";
-import { ethers, keccak256, toUtf8Bytes, Wallet } from "ethers";
+import { keccak256, toUtf8Bytes, Wallet } from "ethers";
 import { describe, expect, it } from "vitest";
 import {
   computeWorkoutProofDigest,
@@ -84,8 +83,11 @@ describe("Mobile Client Crypto & Profile Unit Test Suite", () => {
       expect(raw).toBeDefined();
 
       const envelope = JSON.parse(raw!);
-      // Tamper ciphertext
-      envelope.ciphertext = envelope.ciphertext.slice(0, -2) + "ff";
+      // Tamper ciphertext. Pick a replacement byte that differs from the real one,
+      // otherwise a ciphertext already ending in it (1 in 256) would be unchanged.
+      const originalTail = envelope.ciphertext.slice(-2);
+      envelope.ciphertext =
+        envelope.ciphertext.slice(0, -2) + (originalTail === "ff" ? "00" : "ff");
       backend.setRaw("tamper-test", JSON.stringify(envelope));
 
       await expect(adapter.getEncryptedItem("tamper-test")).rejects.toThrow(

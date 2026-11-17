@@ -1,60 +1,34 @@
 import {
-  ACTIVITY_LEVELS,
-  ActivityLevel,
   AdaptivePlanCycle,
   AdaptivePlanCycleSchema,
   Address,
   AddressSchema,
   ARBITRUM_SEPOLIA_CHAIN_ID,
   Bytes32,
-  Bytes32Schema,
-  createDeHealthDomain,
   DailyPlan,
   DailyPlanSchema,
   DEFAULT_BASELINE_BIOMETRICS,
-  DEHEALTH_EIP712_DOMAIN_NAME,
-  DEHEALTH_EIP712_VERSION,
-  Eip712DomainSchema,
   FITNESS_GOALS,
   FitnessGoal,
   FitnessGoalSchema,
-  FoodPresetItem,
-  FoodPresetItemSchema,
-  GENDER_TYPES,
-  GenderType,
-  HexSignature,
   HexSignatureSchema,
-  MacroSplit,
   MacroSplitSchema,
-  PLAN_CYCLE_STATUSES,
-  PlanCycleStatus,
-  PlanCycleStatusSchema,
-  PLAN_REVIEW_STATUSES,
-  PlanReviewStatus,
-  PlanReviewStatusSchema,
   ProposedPlanReview,
   ProposedPlanReviewSchema,
   SignedWorkoutClaimPayload,
-  SignedWorkoutClaimPayloadSchema,
   STANDARD_FOOD_PRESETS,
   TelemetryData,
-  TelemetryDataSchema,
-  Uint256Schema,
   UserBiometrics,
   UserBiometricsSchema,
-  UserProfile,
-  UserProfileSchema,
   WeightLogEntry,
   WeightLogEntrySchema,
   WorkoutExerciseItem,
   WorkoutExerciseItemSchema,
-  WorkoutProof,
-  WorkoutProofSchema
+  WorkoutProof
 } from "@dehealth/shared";
 import { ethers, Wallet } from "ethers";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
-  computeWorkoutProofDigest,
   hashTelemetry as hashTelemetryCommitment,
   signWorkoutProof,
   verifyWorkoutProofSignature
@@ -66,7 +40,6 @@ const FIXED_TEST_SALT = `0x${"5a".repeat(32)}` as `0x${string}`;
 const hashTelemetry = (metrics: Parameters<typeof hashTelemetryCommitment>[0]): `0x${string}` =>
   hashTelemetryCommitment(metrics, FIXED_TEST_SALT).telemetryHash;
 import {
-  ACTIVITY_MULTIPLIERS,
   calculateBmr,
   calculateMacroSplit,
   calculateRollingWeightAverage,
@@ -74,8 +47,6 @@ import {
   calculateTdee,
   evaluateBiWeeklyReview,
   FATIGUE_GAP_THRESHOLD_MS,
-  FATIGUE_SCALING_MULTIPLIER as FATIGUE_SCALING_FACTOR,
-  SAFE_CALORIE_FLOOR_KCAL as SAFE_CALORIE_FLOOR,
   scaleExercisesForFatigue,
   scaleFoodPresetPortion
 } from "../../services/adaptivePlanEngine";

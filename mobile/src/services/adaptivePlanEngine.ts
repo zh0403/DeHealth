@@ -161,7 +161,7 @@ export function scaleExercisesForFatigue(
 export function scaleExercisesForFatigue(
   exercises: readonly WorkoutExerciseItem[],
   lastLogTimestampMs: number | null,
-  currentTimestampMs: number
+  currentTimestampMs?: number
 ): { exercises: WorkoutExerciseItem[]; isFatigueScaled: boolean };
 export function scaleExercisesForFatigue(
   exercises: readonly WorkoutExerciseItem[],
