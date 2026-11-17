@@ -1,29 +1,60 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import {
   AnonymizedFeedInsert,
   assertZeroRawBiometrics,
   DataSovereigntyViolationError,
   DEFAULT_FALLBACK_CHEER_COUNTS,
   DEFAULT_FALLBACK_FEED_ITEMS,
+  FeedProofVerificationError,
   fetchAnonymizedFeed,
   generateFallbackUuid,
   getLocalFallbackCheerCounts,
   getLocalFallbackFeedItems,
   getSupabaseClient,
+  getSupabaseAnonKey,
   isSupabaseConfigured,
+  MAX_RECURSION_DEPTH,
   PROHIBITED_BIOMETRIC_KEYS,
   publishProofMilestone,
+  resetFeedVerificationStateForTesting,
   resetLocalFeedStore,
   seedLocalFeedStore,
   sendPeerCheer,
   setSupabaseClient
 } from "../services/supabaseService";
-import { AnonymizedFeedRecord, Bytes32 } from "@dehealth/shared";
+import { signWorkoutProof } from "../services/cryptoService";
+import { DEMO_VERIFYING_CONTRACT, resetL2Config } from "../services/l2ContractService";
+import {
+  Address,
+  AnonymizedFeedRecord,
+  Bytes32,
+  SignedWorkoutClaimPayload,
+  WorkoutProof
+} from "@dehealth/shared";
 import { SupabaseClient } from "@supabase/supabase-js";
+import { Signer, Wallet } from "ethers";
 
 const VALID_BYTES32 =
   "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef" as Bytes32;
 const VALID_UUID = "550e8400-e29b-41d4-a716-446655440000";
+
+async function createSignedClaim(
+  telemetryHash: Bytes32 = VALID_BYTES32,
+  streakCount: number = 1,
+  verifyingContract: Address = DEMO_VERIFYING_CONTRACT,
+  signer: Signer & { readonly address: string } = Wallet.createRandom()
+): Promise<SignedWorkoutClaimPayload> {
+  const proof: WorkoutProof = {
+    user: signer.address as Address,
+    telemetryHash,
+    streakCount: BigInt(streakCount),
+    nonce: 0n,
+    deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+  };
+  return signWorkoutProof(signer, proof, verifyingContract);
+}
 
 describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
   const originalEnv = process.env;
@@ -33,6 +64,9 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
     process.env = { ...originalEnv };
     delete process.env.EXPO_PUBLIC_SUPABASE_URL;
     delete process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
+    delete process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    delete process.env.EXPO_PUBLIC_REWARD_GATE_ADDRESS;
+    resetL2Config();
     setSupabaseClient(undefined);
     resetLocalFeedStore();
   });
@@ -66,6 +100,88 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
       // Verify cached client is reused on subsequent calls
       const clientAgain = getSupabaseClient();
       expect(clientAgain).toBe(client);
+    });
+
+    describe("Publishable key alignment", () => {
+      it("resolves EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY and creates a client with it", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_URL = "https://mock-project.supabase.co";
+        process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_mock_key_123";
+
+        expect(getSupabaseAnonKey()).toBe("sb_publishable_mock_key_123");
+        expect(isSupabaseConfigured()).toBe(true);
+        expect(getSupabaseClient()).not.toBeNull();
+      });
+
+      it("falls back to the legacy EXPO_PUBLIC_SUPABASE_ANON_KEY when no publishable key is set", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_URL = "https://mock-project.supabase.co";
+        process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = "legacy-anon-key-456";
+
+        expect(getSupabaseAnonKey()).toBe("legacy-anon-key-456");
+        expect(isSupabaseConfigured()).toBe(true);
+        expect(getSupabaseClient()).not.toBeNull();
+      });
+
+      it("prefers the publishable key when both variables are set", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_new";
+        process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = "legacy-anon-old";
+
+        expect(getSupabaseAnonKey()).toBe("sb_publishable_new");
+      });
+
+      it("falls back to the legacy key when the publishable key is empty or whitespace", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = "legacy-anon-key";
+
+        for (const blank of ["", "   ", "\t\n"]) {
+          process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = blank;
+          expect(getSupabaseAnonKey()).toBe("legacy-anon-key");
+        }
+      });
+
+      it("trims surrounding whitespace from either key", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "  sb_publishable_trim  ";
+        expect(getSupabaseAnonKey()).toBe("sb_publishable_trim");
+
+        delete process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+        process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = "  legacy-trim  ";
+        expect(getSupabaseAnonKey()).toBe("legacy-trim");
+      });
+
+      it("returns undefined and stays unconfigured when neither key is set", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_URL = "https://mock-project.supabase.co";
+
+        expect(getSupabaseAnonKey()).toBeUndefined();
+        expect(isSupabaseConfigured()).toBe(false);
+        expect(getSupabaseClient()).toBeNull();
+      });
+
+      it("stays unconfigured when only a key is present and the URL is missing", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_only";
+
+        expect(isSupabaseConfigured()).toBe(false);
+        expect(getSupabaseClient()).toBeNull();
+      });
+
+      it("rebuilds the client when the resolved key changes", () => {
+        process.env.EXPO_PUBLIC_SUPABASE_URL = "https://mock-project.supabase.co";
+        process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = "legacy-key";
+        const first = getSupabaseClient();
+
+        process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY = "sb_publishable_switched";
+        const second = getSupabaseClient();
+
+        expect(first).not.toBeNull();
+        expect(second).not.toBeNull();
+        expect(second).not.toBe(first);
+      });
+    });
+
+    it("documents the publishable key (and the legacy fallback) in mobile/.env.example", () => {
+      const example = readFileSync(resolvePath(__dirname, "../../.env.example"), "utf8");
+
+      expect(example).toMatch(/^EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY=/m);
+      expect(example).toContain("EXPO_PUBLIC_SUPABASE_ANON_KEY");
+      // The documented variable must be the one the client actually reads.
+      expect(example).not.toMatch(/^EXPO_PUBLIC_SUPABASE_ANON_KEY=/m);
     });
 
     it("handles createClient failure gracefully and returns null", () => {
@@ -116,8 +232,9 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
         proof_hash: VALID_BYTES32,
         streak_count: 5
       };
+      const signedClaim = await createSignedClaim(VALID_BYTES32, 5);
 
-      const result = await publishProofMilestone(payload);
+      const result = await publishProofMilestone(payload, signedClaim);
 
       expect(result.mode).toBe("local-fallback");
       expect(result.data.user_pseudonym).toBe("fallback_warrior");
@@ -227,8 +344,17 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
         proof_hash: VALID_BYTES32,
         streak_count: 12
       };
+      const signedClaim = await createSignedClaim(
+        VALID_BYTES32,
+        12,
+        DEMO_VERIFYING_CONTRACT
+      );
 
-      const result = await publishProofMilestone(payload);
+      const result = await publishProofMilestone(
+        payload,
+        signedClaim,
+        DEMO_VERIFYING_CONTRACT
+      );
 
       expect(fromMock).toHaveBeenCalledWith("anonymized_feed");
       expect(insertMock).toHaveBeenCalledWith({
@@ -327,8 +453,9 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
         proof_hash: VALID_BYTES32,
         streak_count: 8
       };
+      const signedClaim = await createSignedClaim(VALID_BYTES32, 8);
 
-      const result = await publishProofMilestone(payload);
+      const result = await publishProofMilestone(payload, signedClaim);
 
       expect(result.mode).toBe("local-fallback");
       expect(result.data.user_pseudonym).toBe("offline_survivor");
@@ -352,8 +479,9 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
         proof_hash: VALID_BYTES32,
         streak_count: 3
       };
+      const signedClaim = await createSignedClaim(VALID_BYTES32, 3);
 
-      const result = await publishProofMilestone(payload);
+      const result = await publishProofMilestone(payload, signedClaim);
 
       expect(result.mode).toBe("local-fallback");
       expect(result.data.user_pseudonym).toBe("socket_drop_hero");
@@ -573,11 +701,17 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
 
       setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
 
-      await publishProofMilestone({
-        user_pseudonym: "clean_user",
-        proof_hash: VALID_BYTES32,
-        streak_count: 1
-      });
+      const signedClaim = await createSignedClaim(VALID_BYTES32, 1);
+
+      await publishProofMilestone(
+        {
+          user_pseudonym: "clean_user",
+          proof_hash: VALID_BYTES32,
+          streak_count: 1
+        },
+        signedClaim,
+        DEMO_VERIFYING_CONTRACT
+      );
 
       expect(insertMock).toHaveBeenCalledWith({
         user_pseudonym: "clean_user",
@@ -733,6 +867,304 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
 
       resetLocalFeedStore();
       expect(getLocalFallbackFeedItems().length).toBe(DEFAULT_FALLBACK_FEED_ITEMS.length);
+    });
+  });
+
+  // ============================================================================
+  // 8. Depth guard and EIP-712 feed anti-spam
+  // ============================================================================
+  describe("Depth limit and feed proof verification", () => {
+    it("allows clean objects up to MAX_RECURSION_DEPTH (20) and clean primitives at depth 21", () => {
+      expect(MAX_RECURSION_DEPTH).toBe(20);
+      // Build a chain of 20 nested objects (depths 0..20) with a primitive leaf at depth 21
+      let node: Record<string, unknown> = { label: "leaf_ok" };
+      for (let i = 0; i < MAX_RECURSION_DEPTH; i += 1) {
+        node = { child: node };
+      }
+      expect(() => assertZeroRawBiometrics(node)).not.toThrow();
+    });
+
+    it("throws DataSovereigntyViolationError (not RangeError) when nesting exceeds MAX_RECURSION_DEPTH", () => {
+      let node21: Record<string, unknown> = { nested: { leaf: "ok" } };
+      for (let i = 0; i < MAX_RECURSION_DEPTH; i += 1) {
+        node21 = { child: node21 };
+      }
+      expect(() => assertZeroRawBiometrics(node21)).toThrow(
+        DataSovereigntyViolationError
+      );
+
+      // 5,000-level deep payload fails closed with DataSovereigntyViolationError
+      let deep5000: Record<string, unknown> = { leaf: "safe" };
+      for (let i = 0; i < 5_000; i += 1) {
+        deep5000 = { next: deep5000 };
+      }
+      expect(() => assertZeroRawBiometrics(deep5000)).toThrow(
+        DataSovereigntyViolationError
+      );
+      expect(() => assertZeroRawBiometrics(deep5000)).toThrow(
+        /maximum depth/i
+      );
+    });
+
+    it("rejects publishProofMilestone with FeedProofVerificationError when signedClaim is missing and makes 0 Supabase calls", async () => {
+      const insertMock = vi.fn();
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      await expect(
+        publishProofMilestone({
+          user_pseudonym: "no_sig_user",
+          proof_hash: VALID_BYTES32,
+          streak_count: 4
+        })
+      ).rejects.toThrow(FeedProofVerificationError);
+
+      expect(fromMock).not.toHaveBeenCalled();
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects publishProofMilestone with FeedProofVerificationError when signature is invalid or from wrong signer", async () => {
+      const insertMock = vi.fn();
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const validClaim = await createSignedClaim(VALID_BYTES32, 4);
+      const forgedClaim: SignedWorkoutClaimPayload = {
+        ...validClaim,
+        signature: ("0x" + "ab".repeat(65)) as SignedWorkoutClaimPayload["signature"]
+      };
+
+      await expect(
+        publishProofMilestone(
+          {
+            user_pseudonym: "forged_sig_user",
+            proof_hash: VALID_BYTES32,
+            streak_count: 4
+          },
+          forgedClaim,
+          DEMO_VERIFYING_CONTRACT
+        )
+      ).rejects.toThrow(FeedProofVerificationError);
+
+      // Claim signed for one address, but proof.user claims another address
+      const attacker = Wallet.createRandom();
+      const victim = Wallet.createRandom();
+      const mismatchedUserClaim = await signWorkoutProof(
+        attacker,
+        {
+          user: attacker.address as Address,
+          telemetryHash: VALID_BYTES32,
+          streakCount: 4n,
+          nonce: 0n,
+          deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+        },
+        DEMO_VERIFYING_CONTRACT
+      );
+      const spoofedClaim: SignedWorkoutClaimPayload = {
+        proof: {
+          ...mismatchedUserClaim.proof,
+          user: victim.address as Address
+        },
+        signature: mismatchedUserClaim.signature
+      };
+
+      await expect(
+        publishProofMilestone(
+          {
+            user_pseudonym: "spoofed_user",
+            proof_hash: VALID_BYTES32,
+            streak_count: 4
+          },
+          spoofedClaim,
+          DEMO_VERIFYING_CONTRACT
+        )
+      ).rejects.toThrow(FeedProofVerificationError);
+
+      expect(fromMock).not.toHaveBeenCalled();
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects publishProofMilestone with FeedProofVerificationError when verifyingContract does not match signature domain", async () => {
+      const insertMock = vi.fn();
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const signedForDemo = await createSignedClaim(
+        VALID_BYTES32,
+        6,
+        DEMO_VERIFYING_CONTRACT
+      );
+      const otherContract = "0x2222222222222222222222222222222222222222" as Address;
+
+      await expect(
+        publishProofMilestone(
+          {
+            user_pseudonym: "wrong_domain_user",
+            proof_hash: VALID_BYTES32,
+            streak_count: 6
+          },
+          signedForDemo,
+          otherContract
+        )
+      ).rejects.toThrow(FeedProofVerificationError);
+
+      expect(fromMock).not.toHaveBeenCalled();
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects publishProofMilestone with FeedProofVerificationError when signedClaim.proof.telemetryHash mismatches payload.proof_hash", async () => {
+      const insertMock = vi.fn();
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const otherHash =
+        "0xabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcdefabcd" as Bytes32;
+      const claimForOtherHash = await createSignedClaim(otherHash, 5);
+
+      await expect(
+        publishProofMilestone(
+          {
+            user_pseudonym: "hash_mismatch_user",
+            proof_hash: VALID_BYTES32,
+            streak_count: 5
+          },
+          claimForOtherHash,
+          DEMO_VERIFYING_CONTRACT
+        )
+      ).rejects.toThrow(FeedProofVerificationError);
+
+      expect(fromMock).not.toHaveBeenCalled();
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects publishProofMilestone with FeedProofVerificationError when signedClaim.proof.streakCount mismatches payload.streak_count and makes 0 Supabase calls", async () => {
+      const insertMock = vi.fn();
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const claimStreak1 = await createSignedClaim(VALID_BYTES32, 1);
+
+      await expect(
+        publishProofMilestone(
+          {
+            user_pseudonym: "spoof_streak_user",
+            proof_hash: VALID_BYTES32,
+            streak_count: 9999
+          },
+          claimStreak1,
+          DEMO_VERIFYING_CONTRACT
+        )
+      ).rejects.toThrow(FeedProofVerificationError);
+
+      expect(fromMock).not.toHaveBeenCalled();
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects publishProofMilestone with FeedProofVerificationError when signedClaim.proof.deadline is expired and makes 0 Supabase calls", async () => {
+      const insertMock = vi.fn();
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const signer = Wallet.createRandom();
+      const expiredClaim = await signWorkoutProof(
+        signer,
+        {
+          user: signer.address as Address,
+          telemetryHash: VALID_BYTES32,
+          streakCount: 3n,
+          nonce: 0n,
+          deadline: BigInt(Math.floor(Date.now() / 1000) - 60)
+        },
+        DEMO_VERIFYING_CONTRACT
+      );
+
+      await expect(
+        publishProofMilestone(
+          {
+            user_pseudonym: "expired_claim_user",
+            proof_hash: VALID_BYTES32,
+            streak_count: 3
+          },
+          expiredClaim,
+          DEMO_VERIFYING_CONTRACT
+        )
+      ).rejects.toThrow(FeedProofVerificationError);
+
+      expect(fromMock).not.toHaveBeenCalled();
+      expect(insertMock).not.toHaveBeenCalled();
+    });
+
+    it("rejects replayed (payload, signedClaim) or duplicate proof_hash with FeedProofVerificationError and makes 0 extra Supabase calls", async () => {
+      const singleMock = vi.fn().mockResolvedValue({
+        data: {
+          id: "feed-uuid-first",
+          user_pseudonym: "replay_tester",
+          proof_hash: VALID_BYTES32,
+          streak_count: 4,
+          created_at: "2026-11-17T00:00:00Z"
+        },
+        error: null
+      });
+      const selectMock = vi.fn().mockReturnValue({ single: singleMock });
+      const insertMock = vi.fn().mockReturnValue({ select: selectMock });
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const signer = Wallet.createRandom();
+      const signedClaim = await createSignedClaim(
+        VALID_BYTES32,
+        4,
+        DEMO_VERIFYING_CONTRACT,
+        signer
+      );
+      const payload: AnonymizedFeedInsert = {
+        user_pseudonym: "replay_tester",
+        proof_hash: VALID_BYTES32,
+        streak_count: 4
+      };
+
+      // First publish succeeds
+      const firstResult = await publishProofMilestone(
+        payload,
+        signedClaim,
+        DEMO_VERIFYING_CONTRACT
+      );
+      expect(firstResult.mode).toBe("live");
+      expect(insertMock).toHaveBeenCalledTimes(1);
+
+      // Exact replay fails before calling Supabase
+      await expect(
+        publishProofMilestone(payload, signedClaim, DEMO_VERIFYING_CONTRACT)
+      ).rejects.toThrow(FeedProofVerificationError);
+      expect(insertMock).toHaveBeenCalledTimes(1);
+
+      // Re-signing the same proof_hash with a fresh nonce also fails duplicate guard
+      const resignedSameHash = await signWorkoutProof(
+        signer,
+        {
+          user: signer.address as Address,
+          telemetryHash: VALID_BYTES32,
+          streakCount: 4n,
+          nonce: 1n,
+          deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+        },
+        DEMO_VERIFYING_CONTRACT
+      );
+      await expect(
+        publishProofMilestone(payload, resignedSameHash, DEMO_VERIFYING_CONTRACT)
+      ).rejects.toThrow(FeedProofVerificationError);
+      expect(insertMock).toHaveBeenCalledTimes(1);
+
+      // Resetting verification state and local feed store allows a clean subsequent test publish
+      resetFeedVerificationStateForTesting();
+      resetLocalFeedStore();
+      const secondResult = await publishProofMilestone(
+        payload,
+        signedClaim,
+        DEMO_VERIFYING_CONTRACT
+      );
+      expect(secondResult.mode).toBe("live");
+      expect(insertMock).toHaveBeenCalledTimes(2);
     });
   });
 });

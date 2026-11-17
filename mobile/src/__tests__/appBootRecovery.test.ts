@@ -94,6 +94,13 @@ import {
   initializeAdaptiveStorage,
   resetAdaptiveStorage
 } from "../storage/adaptiveStorage";
+import {
+  DEFAULT_GOVERNANCE_CONFIG,
+  GOVERNANCE_STORAGE_KEY,
+  GovernanceStorage,
+  initializeGovernanceStorage,
+  resetGovernanceStorage
+} from "../storage/governanceStorage";
 import { KeyValueStorageBackend } from "../storage/encryptedStorageAdapter";
 import {
   clearVaultSecret,
@@ -128,6 +135,8 @@ function makeDeps(
 ): VaultHydrationDeps {
   const ensureStorage = async (): Promise<AdaptiveStorage> =>
     initializeAdaptiveStorage(keyStore, backend);
+  const ensureGovStorage = async (): Promise<GovernanceStorage> =>
+    initializeGovernanceStorage(keyStore, backend);
 
   return {
     getUserBiometrics: async () => (await ensureStorage()).getUserBiometrics(),
@@ -136,6 +145,8 @@ function makeDeps(
     getOrCreatePersistentWallet: async () => getOrCreatePersistentWallet(keyStore),
     getDailyProofSignedMap: async () =>
       (await ensureStorage()).getDailyProofSignedMap(),
+    getGovernanceConfig: async () =>
+      (await ensureGovStorage()).getGovernanceConfig(),
     clearStoredWallet: async () => clearStoredWallet(keyStore),
     clearVaultSecret: async () => clearVaultSecret(keyStore),
     purgeAdaptiveStorageKeys: async () => {
@@ -143,31 +154,38 @@ function makeDeps(
         await backend.removeItem(key);
       }
       resetAdaptiveStorage();
+    },
+    purgeGovernanceStorageKey: async () => {
+      await backend.removeItem(GOVERNANCE_STORAGE_KEY);
+      resetGovernanceStorage();
     }
   };
 }
 
-describe("R5 (P3-04, P3-05): App Boot Hydration Error Surface & Vault Reset Recovery", () => {
+describe("App boot hydration error surface and vault reset recovery", () => {
   beforeEach(() => {
     capturedPressables.length = 0;
     resetAdaptiveStorage();
+    resetGovernanceStorage();
     resetWalletStorageForTesting();
   });
 
-  describe("VaultBootGate UI", () => {
+  describe("VaultBootGate UI (non-destructive retry + confirmed reset)", () => {
     it("renders loading spinner and Securing Cryptographic Enclave... when initError is null", () => {
       const markup = renderToStaticMarkup(
         React.createElement(VaultBootGate, {
           initError: null,
-          onResetVaultAndRetry: vi.fn()
+          onRetry: vi.fn(),
+          onResetVault: vi.fn()
         })
       );
 
       expect(markup).toContain("Securing Cryptographic Enclave...");
-      expect(markup).not.toContain("Reset Vault / Retry");
+      expect(markup).not.toContain("Reset Vault (Erases Wallet)");
     });
 
-    it("renders explicit error banner and Reset Vault / Retry button when initError is set", () => {
+    it("renders primary Retry button (non-destructive) and secondary Reset Vault (Erases Wallet) button without triggering reset immediately", () => {
+      const onRetry = vi.fn();
       const onReset = vi.fn();
       const errorMessage =
         "Stored wallet private key is malformed; refusing to open wallet to prevent fund loss.";
@@ -175,39 +193,90 @@ describe("R5 (P3-04, P3-05): App Boot Hydration Error Surface & Vault Reset Reco
       const markup = renderToStaticMarkup(
         React.createElement(VaultBootGate, {
           initError: errorMessage,
-          onResetVaultAndRetry: onReset
+          onRetry,
+          onResetVault: onReset
         })
       );
 
       expect(markup).toContain("Cryptographic Enclave Error");
       expect(markup).toContain(errorMessage);
-      expect(markup).toContain("Reset Vault / Retry");
+      expect(markup).toContain("Retry");
+      expect(markup).toContain("Reset Vault (Erases Wallet)");
+      expect(markup).not.toContain("Confirm Reset Vault");
       expect(markup).not.toContain("Securing Cryptographic Enclave...");
 
-      const retryBtn = capturedPressables.find((p) =>
-        p.text.includes("Reset Vault / Retry")
-      );
+      const retryBtn = capturedPressables.find((p) => p.text === "Retry");
       expect(retryBtn).toBeDefined();
       expect(retryBtn?.disabled).toBe(false);
-
       retryBtn?.onPress?.();
-      expect(onReset).toHaveBeenCalledTimes(1);
+      expect(onRetry).toHaveBeenCalledTimes(1);
+      expect(onReset).not.toHaveBeenCalled();
+
+      // Clicking "Reset Vault (Erases Wallet)" does NOT call onReset immediately; it enters confirmReset
+      const resetGateBtn = capturedPressables.find((p) =>
+        p.text.includes("Reset Vault (Erases Wallet)")
+      );
+      expect(resetGateBtn).toBeDefined();
+      expect(resetGateBtn?.disabled).toBe(false);
+      resetGateBtn?.onPress?.();
+      expect(onReset).not.toHaveBeenCalled();
     });
 
-    it("disables Reset Vault / Retry button while reset is in progress", () => {
+    it("renders explicit private-key erasure warning with Confirm Reset Vault & Cancel when confirmReset is active", () => {
+      const onRetry = vi.fn();
+      const onReset = vi.fn();
+
       const markup = renderToStaticMarkup(
         React.createElement(VaultBootGate, {
-          initError: "Vault MAC check failed",
-          isResetting: true,
-          onResetVaultAndRetry: vi.fn()
+          initError: "Keystore temporarily locked",
+          onRetry,
+          onResetVault: onReset,
+          initialConfirmReset: true
         })
       );
 
-      expect(markup).toContain("Resetting Vault...");
-      const retryBtn = capturedPressables.find((p) =>
+      expect(markup).toContain("permanently erases any unbacked-up private key");
+      expect(markup).toContain("Confirm Reset Vault");
+      expect(markup).toContain("Cancel");
+
+      const confirmBtn = capturedPressables.find((p) =>
+        p.text.includes("Confirm Reset Vault")
+      );
+      expect(confirmBtn).toBeDefined();
+      expect(confirmBtn?.disabled).toBe(false);
+      confirmBtn?.onPress?.();
+      expect(onReset).toHaveBeenCalledTimes(1);
+    });
+
+    it("disables actions while retrying or resetting is in progress", () => {
+      const retryingMarkup = renderToStaticMarkup(
+        React.createElement(VaultBootGate, {
+          initError: "Transient lock",
+          isRetrying: true,
+          onRetry: vi.fn(),
+          onResetVault: vi.fn()
+        })
+      );
+      expect(retryingMarkup).toContain("Retrying...");
+      const retryingBtn = capturedPressables.find((p) => p.text === "Retrying...");
+      expect(retryingBtn?.disabled).toBe(true);
+
+      capturedPressables.length = 0;
+      const resettingMarkup = renderToStaticMarkup(
+        React.createElement(VaultBootGate, {
+          initError: "Vault MAC check failed",
+          isResetting: true,
+          initialConfirmReset: true,
+          onRetry: vi.fn(),
+          onResetVault: vi.fn()
+        })
+      );
+
+      expect(resettingMarkup).toContain("Resetting Vault...");
+      const confirmBtn = capturedPressables.find((p) =>
         p.text.includes("Resetting Vault...")
       );
-      expect(retryBtn?.disabled).toBe(true);
+      expect(confirmBtn?.disabled).toBe(true);
     });
   });
 
@@ -273,6 +342,7 @@ describe("R5 (P3-04, P3-05): App Boot Hydration Error Surface & Vault Reset Reco
       const recovered = await resetVaultAndRecover(deps);
       expect(recovered.persistentWallet).toBeInstanceOf(Wallet);
       expect(recovered.storedBio).toBeNull();
+      expect(recovered.governanceConfig).toEqual(DEFAULT_GOVERNANCE_CONFIG);
     });
   });
 });

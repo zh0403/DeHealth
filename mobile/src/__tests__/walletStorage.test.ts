@@ -1,5 +1,6 @@
 import { Wallet } from "ethers";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as vaultKeyProvider from "../storage/vaultKeyProvider";
 import { InMemoryKeyStore } from "../storage/vaultKeyProvider";
 import {
   clearStoredWallet,
@@ -18,6 +19,7 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     resetWalletStorageForTesting();
   });
 
@@ -89,6 +91,24 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
       await expect(getOrCreatePersistentWallet(failingStore)).rejects.toThrow(WalletStorageError);
       await expect(getOrCreatePersistentWallet(failingStore)).rejects.toThrow(/could not be persisted/i);
     });
+
+    it("throws WalletStorageError when read-back returns a mismatched non-null key", async () => {
+      let readCount = 0;
+      const mismatchedStore = {
+        async getItem(_key: string): Promise<string | null> {
+          readCount += 1;
+          // First read returns null (fresh wallet); read-back verification returns wrong key
+          return readCount === 1 ? null : "0x" + "11".repeat(32);
+        },
+        async setItem(_key: string, _val: string): Promise<void> {
+          // Pretend write happened with stale value
+        }
+      };
+
+      await expect(getOrCreatePersistentWallet(mismatchedStore)).rejects.toThrow(WalletStorageError);
+      readCount = 0;
+      await expect(getOrCreatePersistentWallet(mismatchedStore)).rejects.toThrow(/could not be persisted/i);
+    });
   });
 
   describe("getStoredWallet & exportWalletPrivateKey", () => {
@@ -96,6 +116,14 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
       const store = new InMemoryKeyStore();
       const stored = await getStoredWallet(store);
       expect(stored).toBeNull();
+    });
+
+    it("throws WalletStorageError if stored key in getStoredWallet is malformed", async () => {
+      const store = new InMemoryKeyStore();
+      await store.setItem(WALLET_PRIVATE_KEY_STORAGE_KEY, "0xmalformed_key_data");
+
+      await expect(getStoredWallet(store)).rejects.toThrow(WalletStorageError);
+      await expect(getStoredWallet(store)).rejects.toThrow(/malformed/i);
     });
 
     it("returns the existing wallet if already initialized", async () => {
@@ -130,6 +158,25 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
       expect(isValidPrivateKey(freshWallet.privateKey)).toBe(true);
       expect(freshWallet.address).not.toBe(firstWallet.address);
     });
+
+    it("serializes concurrent first-boot getOrCreatePersistentWallet calls on an empty InMemoryKeyStore", async () => {
+      const store = new InMemoryKeyStore();
+      const setItemSpy = vi.spyOn(store, "setItem");
+
+      const [walletA, walletB, walletC] = await Promise.all([
+        getOrCreatePersistentWallet(store),
+        getOrCreatePersistentWallet(store),
+        getOrCreatePersistentWallet(store)
+      ]);
+
+      expect(walletA).toBeInstanceOf(Wallet);
+      expect(walletB).toBe(walletA);
+      expect(walletC).toBe(walletA);
+      expect(walletB.address).toBe(walletA.address);
+      expect(walletC.privateKey).toBe(walletA.privateKey);
+      expect(setItemSpy).toHaveBeenCalledTimes(1);
+      expect(await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(walletA.privateKey);
+    });
   });
 
   describe("Platform Keystore Fail-Closed Check", () => {
@@ -152,6 +199,131 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
           writable: true
         });
       }
+    });
+
+    it("caches default platform wallet on creation and reloads existing key from default store after cache reset", async () => {
+      const platformStore = new InMemoryKeyStore();
+      const spy = vi
+        .spyOn(vaultKeyProvider, "createPlatformKeyStore")
+        .mockResolvedValue(platformStore);
+
+      const created = await getOrCreatePersistentWallet();
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      // Second call hits in-memory cachedWallet without calling createPlatformKeyStore again
+      const cached = await getOrCreatePersistentWallet();
+      expect(cached.address).toBe(created.address);
+      expect(cached.privateKey).toBe(created.privateKey);
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      // Reset cache and reload existing key from default store (covers existing-key cache branch)
+      resetWalletStorageForTesting();
+      const reloaded = await getOrCreatePersistentWallet();
+      expect(reloaded.address).toBe(created.address);
+      expect(reloaded.privateKey).toBe(created.privateKey);
+      expect(spy).toHaveBeenCalledTimes(2);
+
+      // Subsequent call after reload hits cache again
+      const cachedAfterReload = await getOrCreatePersistentWallet();
+      expect(cachedAfterReload).toBe(reloaded);
+      expect(spy).toHaveBeenCalledTimes(2);
+
+      // getStoredWallet() without arguments also resolves default store
+      const stored = await getStoredWallet();
+      expect(stored?.address).toBe(created.address);
+      expect(spy).toHaveBeenCalledTimes(3);
+
+      // clearStoredWallet() without arguments resolves default store and deletes key
+      await clearStoredWallet();
+      expect(await platformStore.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBeNull();
+      expect(spy).toHaveBeenCalledTimes(4);
+    });
+
+    it("serializes concurrent first-boot getOrCreatePersistentWallet calls on the default platform keystore", async () => {
+      const platformStore = new InMemoryKeyStore();
+      const createStoreSpy = vi
+        .spyOn(vaultKeyProvider, "createPlatformKeyStore")
+        .mockResolvedValue(platformStore);
+      const setItemSpy = vi.spyOn(platformStore, "setItem");
+
+      const [walletA, walletB, walletC] = await Promise.all([
+        getOrCreatePersistentWallet(),
+        getOrCreatePersistentWallet(),
+        getOrCreatePersistentWallet()
+      ]);
+
+      expect(walletA).toBeInstanceOf(Wallet);
+      expect(walletB).toBe(walletA);
+      expect(walletC).toBe(walletA);
+      expect(createStoreSpy).toHaveBeenCalledTimes(1);
+      expect(setItemSpy).toHaveBeenCalledTimes(1);
+      expect(await platformStore.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
+        walletA.privateKey
+      );
+
+      // Subsequent call uses cachedWallet
+      const cached = await getOrCreatePersistentWallet();
+      expect(cached).toBe(walletA);
+      expect(createStoreSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("handles resetWalletStorageForTesting called while default platform wallet creation is in flight", async () => {
+      const platformStore = new InMemoryKeyStore();
+      let releaseStore!: (store: InMemoryKeyStore) => void;
+      const deferredStore = new Promise<InMemoryKeyStore>((resolve) => {
+        releaseStore = resolve;
+      });
+      vi.spyOn(vaultKeyProvider, "createPlatformKeyStore").mockReturnValueOnce(
+        deferredStore
+      );
+
+      const inflight = getOrCreatePersistentWallet();
+      resetWalletStorageForTesting();
+      releaseStore(platformStore);
+
+      const wallet = await inflight;
+      expect(wallet).toBeInstanceOf(Wallet);
+    });
+
+    it("re-throws unexpected non-VaultKeyUnavailableError errors from createPlatformKeyStore", async () => {
+      vi.spyOn(vaultKeyProvider, "createPlatformKeyStore").mockRejectedValueOnce(
+        new Error("Unexpected I/O subsystem failure")
+      );
+      await expect(getOrCreatePersistentWallet()).rejects.toThrow(
+        "Unexpected I/O subsystem failure"
+      );
+
+      vi.spyOn(vaultKeyProvider, "createPlatformKeyStore").mockRejectedValueOnce(
+        new Error("Unexpected keystore read fault")
+      );
+      await expect(getStoredWallet()).rejects.toThrow(
+        "Unexpected keystore read fault"
+      );
+    });
+
+    it("handles clearStoredWallet safely when deleteItem is absent or throws", async () => {
+      const storeWithoutDelete = {
+        async getItem(_key: string): Promise<string | null> {
+          return null;
+        },
+        async setItem(_key: string, _val: string): Promise<void> {
+          // no-op
+        }
+      };
+      await expect(clearStoredWallet(storeWithoutDelete)).resolves.toBeUndefined();
+
+      const storeWithFailingDelete = {
+        async getItem(_key: string): Promise<string | null> {
+          return null;
+        },
+        async setItem(_key: string, _val: string): Promise<void> {
+          // no-op
+        },
+        async deleteItem(_key: string): Promise<void> {
+          throw new Error("Hardware enclave busy");
+        }
+      };
+      await expect(clearStoredWallet(storeWithFailingDelete)).resolves.toBeUndefined();
     });
   });
 });
