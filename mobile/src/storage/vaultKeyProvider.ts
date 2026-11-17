@@ -27,6 +27,7 @@ export class VaultKeyUnavailableError extends Error {
 export interface SecureKeyStore {
   getItem(key: string): Promise<string | null>;
   setItem(key: string, value: string): Promise<void>;
+  deleteItem?(key: string): Promise<void>;
 }
 
 export function isValidVaultSecret(value: unknown): value is string {
@@ -47,11 +48,16 @@ export class InMemoryKeyStore implements SecureKeyStore {
   async setItem(key: string, value: string): Promise<void> {
     this.items.set(key, value);
   }
+
+  async deleteItem(key: string): Promise<void> {
+    this.items.delete(key);
+  }
 }
 
 interface WebStorageLike {
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
+  removeItem?(key: string): void;
 }
 
 export class WebLocalStorageKeyStore implements SecureKeyStore {
@@ -64,12 +70,17 @@ export class WebLocalStorageKeyStore implements SecureKeyStore {
   async setItem(key: string, value: string): Promise<void> {
     this.storage.setItem(key, value);
   }
+
+  async deleteItem(key: string): Promise<void> {
+    this.storage.removeItem?.(key);
+  }
 }
 
 interface ExpoSecureStoreModule {
   isAvailableAsync(): Promise<boolean>;
   getItemAsync(key: string): Promise<string | null>;
   setItemAsync(key: string, value: string): Promise<void>;
+  deleteItemAsync?(key: string): Promise<void>;
 }
 
 function isReactNativeRuntime(): boolean {
@@ -106,7 +117,11 @@ export async function createPlatformKeyStore(): Promise<SecureKeyStore> {
   if (secureStore) {
     return {
       getItem: (key) => secureStore.getItemAsync(key),
-      setItem: (key, value) => secureStore.setItemAsync(key, value)
+      setItem: (key, value) => secureStore.setItemAsync(key, value),
+      deleteItem: (key) =>
+        secureStore.deleteItemAsync
+          ? secureStore.deleteItemAsync(key)
+          : Promise.resolve()
     };
   }
 
@@ -161,4 +176,19 @@ export async function provisionVaultSecret(store: SecureKeyStore): Promise<strin
 export async function getVaultSecret(keyStore?: SecureKeyStore): Promise<string> {
   const store = keyStore ?? (await createPlatformKeyStore());
   return provisionVaultSecret(store);
+}
+
+/**
+ * Deletes the persisted vault secret from the platform keystore (used during
+ * explicit user-initiated vault reset recovery).
+ */
+export async function clearVaultSecret(keyStore?: SecureKeyStore): Promise<void> {
+  try {
+    const store = keyStore ?? (await createPlatformKeyStore());
+    if (typeof store.deleteItem === "function") {
+      await store.deleteItem(VAULT_SECRET_STORAGE_KEY);
+    }
+  } catch {
+    // Non-fatal if keystore unavailable during recovery teardown
+  }
 }

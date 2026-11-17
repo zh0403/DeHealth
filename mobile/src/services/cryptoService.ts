@@ -39,10 +39,20 @@ function getMutableWorkoutProofTypes(): {
 }
 
 export const TELEMETRY_COMMITMENT_DOMAIN = "dehealth.telemetry.commitment.v2";
+export const DAILY_CHECKIN_COMMITMENT_DOMAIN = "dehealth.daily.checkin.v2";
 
 export interface TelemetryCommitment {
   readonly telemetryHash: Bytes32;
   readonly salt: Bytes32;
+}
+
+export interface DailyCheckInCommitmentInput {
+  readonly vaultSecretHex: string;
+  readonly cycleId: string;
+  readonly dayIndex: number;
+  readonly planDate: string;
+  /** Accepted for retry call sites; excluded from the preimage so retries remain invariant. */
+  readonly timestampMs?: number;
 }
 
 /**
@@ -151,6 +161,40 @@ export function verifyTelemetryCommitment(
   } catch {
     return false;
   }
+}
+
+/**
+ * Produces a deterministic daily check-in commitment from day-level inputs
+ * (`cycleId`, `dayIndex`, `planDate`) keyed by `deriveDeterministicDailySalt`.
+ *
+ * Intentionally ignores volatile `timestampMs` so retries within the same day
+ * produce the byte-identical `telemetryHash` and engage on-chain replay protection.
+ */
+export function buildDailyCheckInCommitment(
+  input: DailyCheckInCommitmentInput
+): TelemetryCommitment {
+  if (typeof input.planDate !== "string" || input.planDate.trim().length === 0) {
+    throw new Error("planDate must be a non-empty string");
+  }
+  const salt = deriveDeterministicDailySalt(
+    input.vaultSecretHex,
+    input.cycleId,
+    input.dayIndex
+  );
+  const canonicalDay = JSON.stringify({
+    cycleId: input.cycleId.trim(),
+    dayIndex: input.dayIndex,
+    planDate: input.planDate.trim()
+  });
+  const telemetryHash = keccak256(
+    concat([
+      toUtf8Bytes(DAILY_CHECKIN_COMMITMENT_DOMAIN),
+      getBytes(salt),
+      toUtf8Bytes(canonicalDay)
+    ])
+  ) as Bytes32;
+
+  return { telemetryHash, salt };
 }
 /**
  * Computes the EIP-712 typed data digest for a WorkoutProof struct.

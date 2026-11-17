@@ -9,6 +9,9 @@ const secureStoreMock = vi.hoisted(() => ({
     secureStoreMock.items.get(key) ?? null,
   setItemAsync: async (key: string, value: string): Promise<void> => {
     secureStoreMock.items.set(key, value);
+  },
+  deleteItemAsync: async (key: string): Promise<void> => {
+    secureStoreMock.items.delete(key);
   }
 }));
 
@@ -16,7 +19,9 @@ vi.mock("expo-secure-store", () => ({
   isAvailableAsync: (): Promise<boolean> => secureStoreMock.isAvailableAsync(),
   getItemAsync: (key: string): Promise<string | null> => secureStoreMock.getItemAsync(key),
   setItemAsync: (key: string, value: string): Promise<void> =>
-    secureStoreMock.setItemAsync(key, value)
+    secureStoreMock.setItemAsync(key, value),
+  deleteItemAsync: (key: string): Promise<void> =>
+    secureStoreMock.deleteItemAsync(key)
 }));
 
 vi.mock("@react-native-async-storage/async-storage", () => {
@@ -44,6 +49,7 @@ import {
 } from "../storage/adaptiveStorage";
 import { KeyValueStorageBackend } from "../storage/encryptedStorageAdapter";
 import {
+  clearVaultSecret,
   createPlatformKeyStore,
   generateVaultSecret,
   InMemoryKeyStore,
@@ -327,6 +333,36 @@ describe("SOV-01: per-install vault key provisioning", () => {
 
       await saveUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
       expect(await getUserBiometrics()).toEqual(DEFAULT_BASELINE_BIOMETRICS);
+    });
+
+    it("deletes keys cleanly via deleteItem and clearVaultSecret across InMemory, WebLocalStorage, and expo-secure-store", async () => {
+      const mem = new InMemoryKeyStore();
+      await provisionVaultSecret(mem);
+      expect(await mem.getItem(VAULT_SECRET_STORAGE_KEY)).not.toBeNull();
+      await clearVaultSecret(mem);
+      expect(await mem.getItem(VAULT_SECRET_STORAGE_KEY)).toBeNull();
+
+      const webMap = new Map<string, string>();
+      const webStore = new WebLocalStorageKeyStore({
+        getItem: (k: string) => webMap.get(k) ?? null,
+        setItem: (k: string, v: string) => {
+          webMap.set(k, v);
+        },
+        removeItem: (k: string) => {
+          webMap.delete(k);
+        }
+      });
+      await provisionVaultSecret(webStore);
+      expect(webMap.has(VAULT_SECRET_STORAGE_KEY)).toBe(true);
+      await clearVaultSecret(webStore);
+      expect(webMap.has(VAULT_SECRET_STORAGE_KEY)).toBe(false);
+
+      secureStoreMock.available = true;
+      const platformStore = await createPlatformKeyStore();
+      await provisionVaultSecret(platformStore);
+      expect(secureStoreMock.items.has(VAULT_SECRET_STORAGE_KEY)).toBe(true);
+      await clearVaultSecret(platformStore);
+      expect(secureStoreMock.items.has(VAULT_SECRET_STORAGE_KEY)).toBe(false);
     });
   });
 });

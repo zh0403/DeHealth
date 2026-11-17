@@ -144,7 +144,9 @@ export async function clearStoredWallet(
   cachedWallet = null;
   try {
     const store = keyStore ?? (await createPlatformKeyStore());
-    await store.setItem(WALLET_PRIVATE_KEY_STORAGE_KEY, "");
+    if (typeof store.deleteItem === "function") {
+      await store.deleteItem(WALLET_PRIVATE_KEY_STORAGE_KEY);
+    }
   } catch {
     // Non-fatal if keystore unavailable during teardown
   }

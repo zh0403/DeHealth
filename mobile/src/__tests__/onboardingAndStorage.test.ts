@@ -1,5 +1,4 @@
 import {
-  AdaptivePlanCycle,
   DEFAULT_BASELINE_BIOMETRICS,
   UserBiometrics,
   WeightLogEntry
@@ -29,13 +28,20 @@ import {
   clearAllAdaptiveData,
   getActivePlanCycle,
   getAdaptiveStorage,
+  getDailyProofSigned,
+  getDailyProofSignedMap,
   getDailyTaskCompletion,
+  getDailyTelemetryCommitment,
   getPlanHistory,
   getTelemetrySalt,
   getUserBiometrics,
   getWeightLogs,
+  makeDailyProofSignedKey,
+  purgeAdaptiveStorageKeys,
   saveActivePlanCycle,
+  saveDailyProofSigned,
   saveDailyTaskCompletion,
+  saveDailyTelemetryCommitment,
   savePlanHistory,
   saveTelemetrySalt,
   saveUserBiometrics,
@@ -312,18 +318,22 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
     });
 
     describe("clearAllAdaptiveData & Sovereignty", () => {
-      it("removes all 6 adaptive storage keys leaving storage completely reset", async () => {
+      it("removes all 7 adaptive storage keys leaving storage completely reset", async () => {
         await saveUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
         const plan = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now(), null);
         await saveActivePlanCycle(plan);
         await saveWeightLog({ id: "w-1", timestampMs: Date.now(), weightKg: 70 });
         await saveDailyTaskCompletion(1, "nutrition", true);
+        await saveDailyProofSigned(plan.id, 0, true);
         await savePlanHistory([plan]);
         const saltedHash = `0x${"11".repeat(32)}` as `0x${string}`;
         await saveTelemetrySalt(saltedHash, `0x${"22".repeat(32)}` as `0x${string}`);
+        await saveDailyTelemetryCommitment(plan.id, 0, saltedHash);
 
         // Verify items were persisted
         expect(await getTelemetrySalt(saltedHash)).not.toBeNull();
+        expect(await getDailyTelemetryCommitment(plan.id, 0)).toBe(saltedHash);
+        expect(await getDailyProofSigned(plan.id, 0)).toBe(true);
         expect(await getUserBiometrics()).not.toBeNull();
         expect(await getActivePlanCycle()).not.toBeNull();
         expect((await getWeightLogs()).length).toBe(1);
@@ -336,8 +346,31 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
         expect(await getActivePlanCycle()).toBeNull();
         expect(await getWeightLogs()).toEqual([]);
         expect(await getDailyTaskCompletion()).toEqual({});
+        expect(await getDailyProofSigned(plan.id, 0)).toBe(false);
+        expect(await getDailyProofSignedMap()).toEqual({});
         expect(await getPlanHistory()).toEqual([]);
         expect(await getTelemetrySalt(saltedHash)).toBeNull();
+        expect(await getDailyTelemetryCommitment(plan.id, 0)).toBeNull();
+      });
+
+      it("isolates daily_proof_signed flags across cycles and days", async () => {
+        await saveDailyProofSigned("cycle_1", 0, true);
+        expect(await getDailyProofSigned("cycle_1", 0)).toBe(true);
+        expect(await getDailyProofSigned("cycle_1", 1)).toBe(false);
+        expect(await getDailyProofSigned("cycle_2", 0)).toBe(false);
+
+        const map = await getDailyProofSignedMap();
+        expect(map[makeDailyProofSignedKey("cycle_1", 0)]).toBe(true);
+      });
+
+      it("purgeAdaptiveStorageKeys clears raw keys even if envelopes are tampered", async () => {
+        await saveUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
+        await saveDailyProofSigned("cycle_1", 0, true);
+        backend.setRaw(ADAPTIVE_STORAGE_KEYS.USER_BIOMETRICS, "{corrupt-envelope");
+
+        await purgeAdaptiveStorageKeys(backend);
+        expect(backend.getRaw(ADAPTIVE_STORAGE_KEYS.USER_BIOMETRICS)).toBeUndefined();
+        expect(backend.getRaw(ADAPTIVE_STORAGE_KEYS.DAILY_COMPLETION_STATE)).toBeUndefined();
       });
 
       it("is idempotent when invoked on already empty storage", async () => {

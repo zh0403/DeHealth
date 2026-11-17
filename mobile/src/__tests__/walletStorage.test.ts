@@ -1,5 +1,5 @@
 import { Wallet } from "ethers";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { InMemoryKeyStore } from "../storage/vaultKeyProvider";
 import {
   clearStoredWallet,
@@ -116,13 +116,19 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
       expect(exported).toBe(created.privateKey);
     });
 
-    it("clears stored wallet on request", async () => {
+    it("deletes stored wallet key on clearStoredWallet so subsequent getStoredWallet returns null and a fresh wallet can be created", async () => {
       const store = new InMemoryKeyStore();
-      await getOrCreatePersistentWallet(store);
+      const firstWallet = await getOrCreatePersistentWallet(store);
       expect(await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).not.toBeNull();
 
       await clearStoredWallet(store);
-      expect(await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe("");
+      expect(await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBeNull();
+      expect(await getStoredWallet(store)).toBeNull();
+
+      const freshWallet = await getOrCreatePersistentWallet(store);
+      expect(freshWallet).toBeInstanceOf(Wallet);
+      expect(isValidPrivateKey(freshWallet.privateKey)).toBe(true);
+      expect(freshWallet.address).not.toBe(firstWallet.address);
     });
   });
 

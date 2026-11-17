@@ -1,3 +1,4 @@
+import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   AdaptivePlanCycle,
   AdaptivePlanCycleSchema,
@@ -25,10 +26,33 @@ export const ADAPTIVE_STORAGE_KEYS = {
   WEIGHT_LOGS: "@dehealth/weight_logs",
   PLAN_HISTORY: "@dehealth/plan_history",
   DAILY_COMPLETION_STATE: "@dehealth/daily_completion_state",
-  TELEMETRY_SALTS: "@dehealth/telemetry_salts"
+  TELEMETRY_SALTS: "@dehealth/telemetry_salts",
+  DAILY_TELEMETRY_COMMITMENTS: "@dehealth/daily_telemetry_commitments"
 } as const;
 
 export const STORAGE_KEYS = ADAPTIVE_STORAGE_KEYS;
+
+export const DAILY_PROOF_SIGNED_KEY_PREFIX = "daily_proof_signed:";
+
+export function makeDailyProofSignedKey(cycleId: string, dayIndex: number): string {
+  if (typeof cycleId !== "string" || cycleId.trim().length === 0) {
+    throw new Error("cycleId must be a non-empty string");
+  }
+  if (!Number.isInteger(dayIndex) || dayIndex < 0) {
+    throw new Error("dayIndex must be a non-negative integer");
+  }
+  return `${DAILY_PROOF_SIGNED_KEY_PREFIX}${cycleId.trim()}:${dayIndex}`;
+}
+
+export function makeDailyCommitmentKey(cycleId: string, dayIndex: number): string {
+  if (typeof cycleId !== "string" || cycleId.trim().length === 0) {
+    throw new Error("cycleId must be a non-empty string");
+  }
+  if (!Number.isInteger(dayIndex) || dayIndex < 0) {
+    throw new Error("dayIndex must be a non-negative integer");
+  }
+  return `${cycleId.trim()}:${dayIndex}`;
+}
 
 /**
  * AdaptiveStorage provides typed, local-only encrypted persistence for all
@@ -187,7 +211,105 @@ export class AdaptiveStorage {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
       return {};
     }
-    return raw as Record<string, boolean>;
+    const sanitized: Record<string, boolean> = {};
+    for (const [key, val] of Object.entries(raw)) {
+      if (typeof val === "boolean") {
+        sanitized[key] = val;
+      }
+    }
+    return sanitized;
+  }
+
+  /**
+   * Persists whether the daily EIP-712 proof has been signed & dispatched for `(cycleId, dayIndex)`.
+   */
+  async saveDailyProofSigned(
+    cycleId: string,
+    dayIndex: number,
+    signed: boolean
+  ): Promise<void> {
+    const key = makeDailyProofSignedKey(cycleId, dayIndex);
+    const existing = await this.getDailyTaskCompletion();
+    await this.adapter.setEncryptedItem(
+      ADAPTIVE_STORAGE_KEYS.DAILY_COMPLETION_STATE,
+      {
+        ...existing,
+        [key]: signed
+      }
+    );
+  }
+
+  /**
+   * Returns true if a daily EIP-712 proof has already been signed & claimed for `(cycleId, dayIndex)`.
+   */
+  async getDailyProofSigned(cycleId: string, dayIndex: number): Promise<boolean> {
+    const key = makeDailyProofSignedKey(cycleId, dayIndex);
+    const existing = await this.getDailyTaskCompletion();
+    return existing[key] === true;
+  }
+
+  /**
+   * Returns a map of `daily_proof_signed:${cycleId}:${dayIndex}` -> boolean from encrypted storage.
+   */
+  async getDailyProofSignedMap(): Promise<Record<string, boolean>> {
+    const existing = await this.getDailyTaskCompletion();
+    const result: Record<string, boolean> = {};
+    for (const [key, value] of Object.entries(existing)) {
+      if (key.startsWith(DAILY_PROOF_SIGNED_KEY_PREFIX) && typeof value === "boolean") {
+        result[key] = value;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Persists the deterministic telemetryHash commitment for `(cycleId, dayIndex)` so retries
+   * reproduce the identical on-chain commitment.
+   */
+  async saveDailyTelemetryCommitment(
+    cycleId: string,
+    dayIndex: number,
+    telemetryHash: Bytes32
+  ): Promise<void> {
+    const key = makeDailyCommitmentKey(cycleId, dayIndex);
+    const validatedHash = Bytes32Schema.parse(telemetryHash).toLowerCase() as Bytes32;
+    const existing = await this.readDailyTelemetryCommitments();
+    await this.adapter.setEncryptedItem(
+      ADAPTIVE_STORAGE_KEYS.DAILY_TELEMETRY_COMMITMENTS,
+      {
+        ...existing,
+        [key]: validatedHash
+      }
+    );
+  }
+
+  /**
+   * Retrieves the persisted telemetryHash commitment for `(cycleId, dayIndex)`, or null if none.
+   */
+  async getDailyTelemetryCommitment(
+    cycleId: string,
+    dayIndex: number
+  ): Promise<Bytes32 | null> {
+    const key = makeDailyCommitmentKey(cycleId, dayIndex);
+    const commitments = await this.readDailyTelemetryCommitments();
+    return commitments[key] ?? null;
+  }
+
+  private async readDailyTelemetryCommitments(): Promise<Record<string, Bytes32>> {
+    const raw = await this.adapter.getEncryptedItem<unknown>(
+      ADAPTIVE_STORAGE_KEYS.DAILY_TELEMETRY_COMMITMENTS
+    );
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+      return {};
+    }
+    const result: Record<string, Bytes32> = {};
+    for (const [key, value] of Object.entries(raw)) {
+      const parsed = Bytes32Schema.safeParse(value);
+      if (parsed.success) {
+        result[key] = parsed.data;
+      }
+    }
+    return result;
   }
 
   /**
@@ -405,4 +527,57 @@ export async function saveTelemetrySalt(
 
 export async function getTelemetrySalt(telemetryHash: Bytes32): Promise<Bytes32 | null> {
   return (await resolveStorage()).getTelemetrySalt(telemetryHash);
+}
+
+export async function saveDailyProofSigned(
+  cycleId: string,
+  dayIndex: number,
+  signed: boolean
+): Promise<void> {
+  return (await resolveStorage()).saveDailyProofSigned(cycleId, dayIndex, signed);
+}
+
+export async function getDailyProofSigned(
+  cycleId: string,
+  dayIndex: number
+): Promise<boolean> {
+  return (await resolveStorage()).getDailyProofSigned(cycleId, dayIndex);
+}
+
+export async function getDailyProofSignedMap(): Promise<Record<string, boolean>> {
+  return (await resolveStorage()).getDailyProofSignedMap();
+}
+
+export async function saveDailyTelemetryCommitment(
+  cycleId: string,
+  dayIndex: number,
+  telemetryHash: Bytes32
+): Promise<void> {
+  return (await resolveStorage()).saveDailyTelemetryCommitment(
+    cycleId,
+    dayIndex,
+    telemetryHash
+  );
+}
+
+export async function getDailyTelemetryCommitment(
+  cycleId: string,
+  dayIndex: number
+): Promise<Bytes32 | null> {
+  return (await resolveStorage()).getDailyTelemetryCommitment(cycleId, dayIndex);
+}
+
+/**
+ * Directly removes all adaptive storage keys from the underlying storage backend
+ * without requiring a valid vault key (used during vault reset recovery).
+ */
+export async function purgeAdaptiveStorageKeys(
+  backend?: KeyValueStorageBackend
+): Promise<void> {
+  const targetBackend =
+    backend ?? (AsyncStorage as unknown as KeyValueStorageBackend);
+  for (const key of Object.values(ADAPTIVE_STORAGE_KEYS)) {
+    await targetBackend.removeItem(key);
+  }
+  resetAdaptiveStorage();
 }

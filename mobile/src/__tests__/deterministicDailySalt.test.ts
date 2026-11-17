@@ -1,6 +1,7 @@
-import { Bytes32, TelemetryData } from "@dehealth/shared";
+import { TelemetryData } from "@dehealth/shared";
 import { describe, expect, it } from "vitest";
 import {
+  buildDailyCheckInCommitment,
   deriveDeterministicDailySalt,
   generateTelemetrySalt,
   hashTelemetry
@@ -122,5 +123,80 @@ describe("Milestone 1 NEW-01: Deterministic Daily Salt (HMAC-SHA256)", () => {
     expect(retrievedSecret).toBe(secret);
     const salt = deriveDeterministicDailySalt(retrievedSecret, cycleA, 2);
     expect(salt).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  describe("buildDailyCheckInCommitment (R2 / NEW-01 Retry Invariance)", () => {
+    it("produces identical telemetryHash across retries 5000ms apart for the same cycle/day/date", () => {
+      const t1 = 1_700_000_000_000;
+      const t2 = t1 + 5_000;
+
+      const c1 = buildDailyCheckInCommitment({
+        vaultSecretHex: mockVaultSecret1,
+        cycleId: cycleA,
+        dayIndex: 0,
+        planDate: "2026-11-17",
+        timestampMs: t1
+      });
+      const c2 = buildDailyCheckInCommitment({
+        vaultSecretHex: mockVaultSecret1,
+        cycleId: cycleA,
+        dayIndex: 0,
+        planDate: "2026-11-17",
+        timestampMs: t2
+      });
+
+      expect(c1.telemetryHash).toMatch(/^0x[0-9a-f]{64}$/);
+      expect(c1.telemetryHash).toBe(c2.telemetryHash);
+      expect(c1.salt).toBe(c2.salt);
+    });
+
+    it("produces distinct commitments when cycleId, dayIndex, planDate, or vaultSecretHex changes", () => {
+      const base = buildDailyCheckInCommitment({
+        vaultSecretHex: mockVaultSecret1,
+        cycleId: cycleA,
+        dayIndex: 0,
+        planDate: "2026-11-17"
+      });
+      const diffCycle = buildDailyCheckInCommitment({
+        vaultSecretHex: mockVaultSecret1,
+        cycleId: cycleB,
+        dayIndex: 0,
+        planDate: "2026-11-17"
+      });
+      const diffDay = buildDailyCheckInCommitment({
+        vaultSecretHex: mockVaultSecret1,
+        cycleId: cycleA,
+        dayIndex: 1,
+        planDate: "2026-11-17"
+      });
+      const diffDate = buildDailyCheckInCommitment({
+        vaultSecretHex: mockVaultSecret1,
+        cycleId: cycleA,
+        dayIndex: 0,
+        planDate: "2026-11-18"
+      });
+      const diffSecret = buildDailyCheckInCommitment({
+        vaultSecretHex: mockVaultSecret2,
+        cycleId: cycleA,
+        dayIndex: 0,
+        planDate: "2026-11-17"
+      });
+
+      expect(base.telemetryHash).not.toBe(diffCycle.telemetryHash);
+      expect(base.telemetryHash).not.toBe(diffDay.telemetryHash);
+      expect(base.telemetryHash).not.toBe(diffDate.telemetryHash);
+      expect(base.telemetryHash).not.toBe(diffSecret.telemetryHash);
+    });
+
+    it("rejects empty or whitespace-only planDate", () => {
+      expect(() =>
+        buildDailyCheckInCommitment({
+          vaultSecretHex: mockVaultSecret1,
+          cycleId: cycleA,
+          dayIndex: 0,
+          planDate: "   "
+        })
+      ).toThrow("planDate must be a non-empty string");
+    });
   });
 });
