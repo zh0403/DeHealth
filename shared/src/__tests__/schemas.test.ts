@@ -505,6 +505,17 @@ describe("Shared Domain Layer & Cryptographic Schemas", () => {
         })
       ).toThrow();
     });
+
+    it("rejects unknown extra fields in PeerCheerInsertSchema via strict() mode", () => {
+      expect(() =>
+        PeerCheerInsertSchema.parse({
+          feed_id: "550e8400-e29b-41d4-a716-446655440000",
+          sender_pseudonym: "cheerleader_99",
+          extraMetadata: "unexpected",
+          avgHeartRateBpm: 132
+        })
+      ).toThrow();
+    });
   });
 
   // ==========================================================================

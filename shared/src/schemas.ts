@@ -151,15 +151,17 @@ export const AnonymizedFeedInsertSchema = z
   })
   .strict();
 
-export const PeerCheerInsertSchema = z.object({
-  feed_id: z.string().uuid(),
-  sender_pseudonym: z
-    .string()
-    .trim()
-    .min(3)
-    .max(64)
-    .regex(/^[a-zA-Z0-9_-]+$/, "Pseudonym must be alphanumeric with underscores or hyphens")
-});
+export const PeerCheerInsertSchema = z
+  .object({
+    feed_id: z.string().uuid(),
+    sender_pseudonym: z
+      .string()
+      .trim()
+      .min(3)
+      .max(64)
+      .regex(/^[a-zA-Z0-9_-]+$/, "Pseudonym must be alphanumeric with underscores or hyphens")
+  })
+  .strict();
 
 // ============================================================================
 // Phase 2.0 Adaptive Fitness & Nutrition Schemas
