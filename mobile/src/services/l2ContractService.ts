@@ -1,5 +1,6 @@
 import {
   Address,
+  ARBITRUM_SEPOLIA_CHAIN_ID,
   Bytes32,
   SignedWorkoutClaimPayload
 } from "@dehealth/shared";
@@ -43,6 +44,29 @@ export const DEMO_VERIFYING_CONTRACT: Address =
   "0x1111111111111111111111111111111111111111" as Address;
 
 export const ARBISCAN_SEPOLIA_BASE_URL = "https://sepolia.arbiscan.io/tx";
+export const ARBISCAN_SEPOLIA_ADDRESS_BASE_URL =
+  "https://sepolia.arbiscan.io/address";
+
+/**
+ * Returns a clickable Arbiscan Sepolia contract/address explorer URL when
+ * given a valid non-zero EVM address, or null otherwise.
+ */
+export function getArbiscanAddressUrl(address: Address | null): string | null {
+  const normalized = normalizeConfiguredAddress(address);
+  return normalized ? `${ARBISCAN_SEPOLIA_ADDRESS_BASE_URL}/${normalized}` : null;
+}
+
+export interface L2InspectorStatus {
+  readonly networkLabel: "Arbitrum Sepolia 421614" | "Local Fallback";
+  readonly chainId: number | null;
+  readonly isLiveConfigured: boolean;
+  readonly rewardGateAddress: Address | null;
+  readonly tokenAddress: Address | null;
+  readonly rewardGateExplorerUrl: string | null;
+  readonly tokenExplorerUrl: string | null;
+  readonly liveNonce: bigint | null;
+  readonly rpcReachable: boolean;
+}
 
 export const DEHEALTH_REWARD_GATE_ABI = [
   "function nonces(address user) view returns (uint256)",
@@ -270,6 +294,65 @@ export async function fetchOnChainNonce(
   } catch {
     return fallback;
   }
+}
+
+/**
+ * Queries live Arbitrum Sepolia network/contract inspector status without
+ * masking RPC failures as `0n`. Distinguishes `"Arbitrum Sepolia 421614"` vs
+ * `"Local Fallback"`, exposes valid contract explorer URLs, and reports
+ * `rpcReachable: false` + `liveNonce: null` when RPC is unconfigured or offline.
+ */
+export async function fetchLiveL2InspectorStatus(
+  userAddress: Address
+): Promise<L2InspectorStatus> {
+  const provider = getL2Provider();
+  const rewardGateAddress = getRewardGateAddress();
+  const tokenAddress = getTokenAddress();
+  const liveConfigured = Boolean(
+    provider && rewardGateAddress && !isZeroAddress(rewardGateAddress)
+  );
+  const networkLabel = liveConfigured
+    ? "Arbitrum Sepolia 421614"
+    : "Local Fallback";
+  const chainId = liveConfigured ? ARBITRUM_SEPOLIA_CHAIN_ID : null;
+  const rewardGateExplorerUrl = getArbiscanAddressUrl(rewardGateAddress);
+  const tokenExplorerUrl = getArbiscanAddressUrl(tokenAddress);
+
+  let liveNonce: bigint | null = null;
+  let rpcReachable = false;
+
+  if (provider && rewardGateAddress) {
+    try {
+      const gateContract = getRewardGateContract(rewardGateAddress, provider);
+      const nonceResult = await gateContract.nonces(userAddress);
+      liveNonce = BigInt(String(nonceResult));
+      rpcReachable = true;
+    } catch {
+      liveNonce = null;
+      rpcReachable = false;
+    }
+  } else if (provider) {
+    try {
+      const txCount = await provider.getTransactionCount(userAddress);
+      liveNonce = BigInt(txCount);
+      rpcReachable = true;
+    } catch {
+      liveNonce = null;
+      rpcReachable = false;
+    }
+  }
+
+  return {
+    networkLabel,
+    chainId,
+    isLiveConfigured: liveConfigured,
+    rewardGateAddress,
+    tokenAddress,
+    rewardGateExplorerUrl,
+    tokenExplorerUrl,
+    liveNonce,
+    rpcReachable
+  };
 }
 
 /**

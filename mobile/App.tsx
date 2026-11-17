@@ -59,6 +59,12 @@ import {
   saveDailyProofSigned,
   savePlanHistory
 } from "./src/storage/adaptiveStorage";
+import {
+  DEFAULT_GOVERNANCE_CONFIG,
+  getGovernanceConfig,
+  GovernanceConfig,
+  purgeGovernanceStorageKey
+} from "./src/storage/governanceStorage";
 import { clearVaultSecret } from "./src/storage/vaultKeyProvider";
 import {
   clearStoredWallet,
@@ -121,6 +127,7 @@ export interface HydratedVaultState {
   readonly storedLogs: readonly WeightLogEntry[];
   readonly persistentWallet: Wallet;
   readonly proofSignedMap: Readonly<Record<string, boolean>>;
+  readonly governanceConfig: GovernanceConfig;
 }
 
 export interface VaultHydrationDeps {
@@ -129,9 +136,11 @@ export interface VaultHydrationDeps {
   readonly getWeightLogs: () => Promise<WeightLogEntry[]>;
   readonly getOrCreatePersistentWallet: () => Promise<Wallet>;
   readonly getDailyProofSignedMap: () => Promise<Record<string, boolean>>;
+  readonly getGovernanceConfig?: () => Promise<GovernanceConfig>;
   readonly clearStoredWallet: () => Promise<void>;
   readonly clearVaultSecret: () => Promise<void>;
   readonly purgeAdaptiveStorageKeys: () => Promise<void>;
+  readonly purgeGovernanceStorageKey?: () => Promise<void>;
 }
 
 const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
@@ -140,14 +149,17 @@ const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
   getWeightLogs,
   getOrCreatePersistentWallet,
   getDailyProofSignedMap,
+  getGovernanceConfig,
   clearStoredWallet,
   clearVaultSecret,
-  purgeAdaptiveStorageKeys
+  purgeAdaptiveStorageKeys,
+  purgeGovernanceStorageKey
 };
 
 export async function hydrateVaultData(
   deps: VaultHydrationDeps = DEFAULT_VAULT_HYDRATION_DEPS
 ): Promise<HydratedVaultState> {
+  const resolveGov = deps.getGovernanceConfig ?? getGovernanceConfig;
   const [
     storedBio,
     storedCycle,
@@ -162,12 +174,17 @@ export async function hydrateVaultData(
     deps.getDailyProofSignedMap()
   ]);
 
+  // Hydrate governance after primary vault secret provisioning completes
+  // so two independent platform keystore handles never race on first boot.
+  const governanceConfig = await resolveGov();
+
   return {
     storedBio,
     storedCycle,
     storedLogs,
     persistentWallet,
-    proofSignedMap
+    proofSignedMap,
+    governanceConfig
   };
 }
 
@@ -177,6 +194,8 @@ export async function resetVaultAndRecover(
   await deps.clearStoredWallet();
   await deps.clearVaultSecret();
   await deps.purgeAdaptiveStorageKeys();
+  const purgeGov = deps.purgeGovernanceStorageKey ?? purgeGovernanceStorageKey;
+  await purgeGov();
   return hydrateVaultData(deps);
 }
 
@@ -391,6 +410,9 @@ export default function App(): React.ReactElement {
   const [initError, setInitError] = useState<string | null>(null);
   const [isRetryingVault, setIsRetryingVault] = useState<boolean>(false);
   const [isResettingVault, setIsResettingVault] = useState<boolean>(false);
+  const [governanceConfig, setGovernanceConfig] = useState<GovernanceConfig>(
+    DEFAULT_GOVERNANCE_CONFIG
+  );
 
   const applyHydratedState = (
     hydrated: HydratedVaultState,
@@ -402,11 +424,13 @@ export default function App(): React.ReactElement {
       storedCycle,
       storedLogs,
       persistentWallet,
-      proofSignedMap: hydratedProofMap
+      proofSignedMap: hydratedProofMap,
+      governanceConfig: hydratedGovernance
     } = hydrated;
     setInitError(null);
     setWallet(persistentWallet);
     setProofSignedMap(hydratedProofMap);
+    setGovernanceConfig(hydratedGovernance);
 
     const addr = persistentWallet.address as Address;
     void fetchOnChainNonce(addr, 0n)
@@ -517,8 +541,12 @@ export default function App(): React.ReactElement {
   );
 
   const targetAssessment = useMemo(
-    () => evaluateDailyTarget(userProfile, lastLogTimestampMs, Date.now()),
-    [userProfile, lastLogTimestampMs]
+    () =>
+      evaluateDailyTarget(userProfile, lastLogTimestampMs, Date.now(), {
+        inactivityThresholdHours: governanceConfig.inactivityThresholdHours,
+        fatigueScalingMultiplier: governanceConfig.fatigueScalingMultiplier
+      }),
+    [userProfile, lastLogTimestampMs, governanceConfig]
   );
 
   const activeDayIndex = useMemo<number>(
@@ -611,13 +639,18 @@ export default function App(): React.ReactElement {
     const nextStreak = Number(payload.proof.streakCount);
     const expectedBalance = (Number.parseFloat(tokenBalanceDht) + 10).toFixed(1);
 
-    // 2. Publish milestone to Supabase (strict data sovereignty: pseudonym, proof_hash, streak_count)
+    // 2. Publish milestone to Supabase (strict data sovereignty + EIP-712 proof gate)
     const userPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
-    const milestoneResult = await publishProofMilestone({
-      user_pseudonym: userPseudonym,
-      proof_hash: payload.proof.telemetryHash,
-      streak_count: nextStreak
-    });
+    const verifyingContract = getRewardGateAddress() || DEMO_VERIFYING_CONTRACT;
+    const milestoneResult = await publishProofMilestone(
+      {
+        user_pseudonym: userPseudonym,
+        proof_hash: payload.proof.telemetryHash,
+        streak_count: nextStreak
+      },
+      payload,
+      verifyingContract
+    );
 
     setStreakCount(nextStreak);
     setLastProofHash(payload.proof.telemetryHash);
@@ -712,6 +745,9 @@ export default function App(): React.ReactElement {
                   cycleId={activeCycle.id}
                   isProofSigned={isTodayProofSigned}
                   lastLogTimestampMs={lastLogTimestampMs}
+                  dailyStepGoal={governanceConfig.dailyStepGoal}
+                  inactivityThresholdHours={governanceConfig.inactivityThresholdHours}
+                  fatigueScalingMultiplier={governanceConfig.fatigueScalingMultiplier}
                   onUpdateDailyPlan={handleUpdateDailyPlan}
                   onDispatchSignedClaim={handleDispatchSignedClaim}
                   lastTxHash={lastTxHash}
@@ -736,6 +772,8 @@ export default function App(): React.ReactElement {
                   weightLogs={weightLogs}
                   adherencePct={adherencePct}
                   currentTimestampMs={nowMs}
+                  governanceConfig={governanceConfig}
+                  onUpdateGovernanceConfig={setGovernanceConfig}
                   onLogWeightEntry={(entry) => {
                     setWeightLogs((prev) => [...prev, entry]);
                   }}

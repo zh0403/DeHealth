@@ -36,6 +36,11 @@ import {
 } from "../services/cryptoService";
 import { L2ServiceMode } from "../services/l2ContractService";
 import {
+  getTodayStepCount,
+  isPedometerAvailable,
+  StepSource
+} from "../services/sensorService";
+import {
   getActivePlanCycle,
   getDailyTelemetryCommitment,
   makeDailyProofSignedKey,
@@ -44,6 +49,11 @@ import {
   saveDailyTelemetryCommitment,
   saveTelemetrySalt
 } from "../storage/adaptiveStorage";
+import {
+  DEFAULT_DAILY_STEP_GOAL,
+  DEFAULT_FATIGUE_SCALING_MULTIPLIER,
+  DEFAULT_INACTIVITY_THRESHOLD_HOURS
+} from "../storage/governanceStorage";
 import { getVaultSecret } from "../storage/vaultKeyProvider";
 
 export interface HabitCardDefinition {
@@ -197,13 +207,23 @@ export function toggleExerciseInDailyPlan(
 
 /**
  * Minimum completion gate: a Daily Proof may only be generated once the day has
- * at least one completed exercise OR any logged nutrition intake. Prevents
+ * at least one completed exercise, any logged nutrition intake, or step count
+ * meeting the configured dailyStepGoal (default 5,000 steps). Prevents
  * signing (and minting against) an empty day.
  */
-export function hasMinimumDailyProgress(plan: DailyPlan): boolean {
+export function hasMinimumDailyProgress(
+  plan: DailyPlan,
+  stepCount: number = 0,
+  dailyStepGoal: number = DEFAULT_DAILY_STEP_GOAL
+): boolean {
   const hasCompletedExercise = plan.exercises.some((ex) => ex.completed);
   const hasLoggedNutrition = plan.loggedCaloriesKcal > 0;
-  return hasCompletedExercise || hasLoggedNutrition;
+  const hasMetStepGoal =
+    Number.isFinite(stepCount) &&
+    Number.isFinite(dailyStepGoal) &&
+    dailyStepGoal > 0 &&
+    stepCount >= dailyStepGoal;
+  return hasCompletedExercise || hasLoggedNutrition || hasMetStepGoal;
 }
 
 export const MINIMUM_PROGRESS_MESSAGE =
@@ -291,8 +311,14 @@ export interface MicroCheckInScreenProps {
   readonly cycleId?: string;
   readonly vaultSecretHex?: string;
   readonly isProofSigned?: boolean;
-  /** Timestamp of the last verified proof; drives runtime 48h fatigue scaling. */
+  /** Timestamp of the last verified proof; drives runtime fatigue scaling. */
   readonly lastLogTimestampMs?: number | null;
+  readonly dailyStepGoal?: number;
+  readonly inactivityThresholdHours?: number;
+  readonly fatigueScalingMultiplier?: number;
+  readonly initialStepCount?: number;
+  readonly initialStepSource?: StepSource;
+  readonly initialPedometerAvailable?: boolean;
   readonly onUpdateDailyPlan?: (updatedPlan: DailyPlan) => void;
   readonly onDispatchSignedClaim: (payload: SignedWorkoutClaimPayload) => Promise<void>;
   readonly lastTxHash?: string | null;
@@ -315,12 +341,26 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   vaultSecretHex,
   isProofSigned: externalIsProofSigned = false,
   lastLogTimestampMs = null,
+  dailyStepGoal = DEFAULT_DAILY_STEP_GOAL,
+  inactivityThresholdHours = DEFAULT_INACTIVITY_THRESHOLD_HOURS,
+  fatigueScalingMultiplier = DEFAULT_FATIGUE_SCALING_MULTIPLIER,
+  initialStepCount,
+  initialStepSource,
+  initialPedometerAvailable,
   onUpdateDailyPlan,
   onDispatchSignedClaim,
   lastTxHash,
   lastExplorerUrl,
   lastClaimMode = null
 }) => {
+  const fatigueOptions = useMemo(
+    () => ({
+      inactivityThresholdHours,
+      fatigueScalingMultiplier
+    }),
+    [inactivityThresholdHours, fatigueScalingMultiplier]
+  );
+
   const defaultInitialPlan = useMemo<DailyPlan>(() => {
     const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now());
     return cycle.dailyPlans[0]!;
@@ -330,7 +370,8 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     applyRuntimeFatigueScaling(
       externalDailyPlan ?? defaultInitialPlan,
       lastLogTimestampMs,
-      Date.now()
+      Date.now(),
+      fatigueOptions
     )
   );
 
@@ -339,14 +380,63 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
       const resolved = applyRuntimeFatigueScaling(
         externalDailyPlan,
         lastLogTimestampMs,
-        Date.now()
+        Date.now(),
+        fatigueOptions
       );
       setLocalPlan(resolved);
       if (resolved !== externalDailyPlan && onUpdateDailyPlan) {
         onUpdateDailyPlan(resolved);
       }
     }
-  }, [externalDailyPlan, lastLogTimestampMs]);
+  }, [externalDailyPlan, lastLogTimestampMs, fatigueOptions]);
+
+  const [pedometerAvailable, setPedometerAvailable] = useState<boolean>(
+    initialPedometerAvailable ?? false
+  );
+  const [todaySteps, setTodaySteps] = useState<number>(() =>
+    typeof initialStepCount === "number" &&
+    Number.isFinite(initialStepCount) &&
+    initialStepCount >= 0
+      ? Math.round(initialStepCount)
+      : 0
+  );
+  const [stepSource, setStepSource] = useState<StepSource>(
+    initialStepSource ??
+      (initialPedometerAvailable ? "hardware" : "manual-fallback")
+  );
+  const [manualStepsInput, setManualStepsInput] = useState<string>(() =>
+    String(
+      typeof initialStepCount === "number" &&
+        Number.isFinite(initialStepCount) &&
+        initialStepCount >= 0
+        ? Math.round(initialStepCount)
+        : 0
+    )
+  );
+  const [stepInputError, setStepInputError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (
+      initialPedometerAvailable !== undefined ||
+      initialStepCount !== undefined
+    ) {
+      return;
+    }
+    let mounted = true;
+    const syncSteps = async (): Promise<void> => {
+      const available = await isPedometerAvailable();
+      const reading = await getTodayStepCount(0);
+      if (!mounted) return;
+      setPedometerAvailable(available);
+      setTodaySteps(reading.steps);
+      setStepSource(reading.source);
+      setManualStepsInput(String(reading.steps));
+    };
+    void syncSteps();
+    return () => {
+      mounted = false;
+    };
+  }, [initialPedometerAvailable, initialStepCount]);
 
   const [selectedPresetId, setSelectedPresetId] = useState<string>(
     DUAL_TRACK_FOOD_PRESETS[0]!.id
@@ -392,9 +482,16 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   );
 
   const canSignProof = useMemo<boolean>(
-    () => hasMinimumDailyProgress(localPlan),
-    [localPlan]
+    () => hasMinimumDailyProgress(localPlan, todaySteps, dailyStepGoal),
+    [localPlan, todaySteps, dailyStepGoal]
   );
+
+  const stepGoalProgressPct = useMemo<number>(() => {
+    if (dailyStepGoal <= 0) return 0;
+    return Math.min(100, Math.round((todaySteps / dailyStepGoal) * 100));
+  }, [todaySteps, dailyStepGoal]);
+
+  const fatigueReductionPct = Math.round((1 - fatigueScalingMultiplier) * 100);
 
   const resolvedCycleId =
     cycleId && cycleId.trim().length > 0 ? cycleId.trim() : "default_cycle";
@@ -488,11 +585,33 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     }
   };
 
+  const handleApplyManualSteps = (): void => {
+    const trimmed = manualStepsInput.trim();
+    const parsed = Number(trimmed);
+    if (
+      trimmed === "" ||
+      !Number.isInteger(parsed) ||
+      parsed < 0 ||
+      parsed > 200_000
+    ) {
+      setStepInputError("Enter a valid step count between 0 and 200,000.");
+      return;
+    }
+    setStepInputError(null);
+    setTodaySteps(parsed);
+    setStepSource("manual-fallback");
+    setStatusStep(
+      parsed >= dailyStepGoal
+        ? `Manual step goal met (${parsed} / ${dailyStepGoal} steps) — Daily Proof unlocked!`
+        : `Updated local step count: ${parsed} / ${dailyStepGoal} steps (on-device only).`
+    );
+  };
+
   const handleSignAndDispatchProof = async (
     cardOverride?: HabitCardDefinition
   ): Promise<void> => {
     if (isSubmitting || isProofLocked) return;
-    if (!hasMinimumDailyProgress(localPlan)) {
+    if (!hasMinimumDailyProgress(localPlan, todaySteps, dailyStepGoal)) {
       setStatusStep(MINIMUM_PROGRESS_MESSAGE);
       return;
     }
@@ -635,7 +754,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
           <Text style={styles.dayBadge}>DAY {localPlan.dayNumber} OF 14</Text>
           {localPlan.isFatigueScaled ? (
             <Text style={styles.fatiguePill}>
-              🛡️ Recovery Mode (-30% Volume)
+              🛡️ Recovery Mode (-{fatigueReductionPct}% Volume)
             </Text>
           ) : (
             <Text style={styles.sovereigntyPill}>🔒 100% On-Device Biometrics</Text>
@@ -950,12 +1069,97 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
                 </Text>
                 <Text style={styles.exerciseMeta}>
                   {exercise.category} • {detailText}
-                  {exercise.scaledForFatigue ? " • -30% Fatigue Scaled" : ""}
+                  {exercise.scaledForFatigue
+                    ? ` • -${fatigueReductionPct}% Fatigue Scaled`
+                    : ""}
                 </Text>
               </View>
             </Pressable>
           );
         })}
+      </View>
+
+      {/* ===================================================================== */}
+      {/* TRACK 3: ON-DEVICE STEP COUNTER / MANUAL FALLBACK CARD                */}
+      {/* ===================================================================== */}
+      <View style={styles.trackCard}>
+        <View style={styles.trackHeaderRow}>
+          <View>
+            <Text style={styles.trackTag}>TRACK 3 • ON-DEVICE TELEMETRY</Text>
+            <Text style={styles.trackTitle}>👟 Daily Step Counter</Text>
+          </View>
+          <View
+            style={
+              pedometerAvailable && stepSource === "hardware"
+                ? styles.workoutProgressBadge
+                : styles.manualStepBadge
+            }
+          >
+            <Text
+              style={
+                pedometerAvailable && stepSource === "hardware"
+                  ? styles.workoutProgressBadgeText
+                  : styles.manualStepBadgeText
+              }
+            >
+              {pedometerAvailable && stepSource === "hardware"
+                ? "Hardware Pedometer"
+                : "Manual Step Fallback"}
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.stepSummaryRow}>
+          <Text style={styles.stepCountText}>
+            {todaySteps.toLocaleString()} / {dailyStepGoal.toLocaleString()} steps
+          </Text>
+          <Text style={styles.stepPctText}>{stepGoalProgressPct}%</Text>
+        </View>
+
+        <View style={styles.progressBarBg}>
+          <View
+            style={[
+              styles.progressBarFill,
+              { width: `${stepGoalProgressPct}%` }
+            ]}
+          />
+        </View>
+
+        {todaySteps >= dailyStepGoal ? (
+          <Text style={styles.stepGoalMetText}>
+            ✓ Daily step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — Daily Proof eligible
+          </Text>
+        ) : (
+          <Text style={styles.stepSovereigntyHint}>
+            Raw step counts stay strictly on-device and never leave to Supabase or L2.
+          </Text>
+        )}
+
+        {!pedometerAvailable || stepSource === "manual-fallback" ? (
+          <View style={styles.manualStepRow}>
+            <TextInput
+              accessibilityLabel="Manual step count input"
+              style={styles.manualStepInput}
+              value={manualStepsInput}
+              onChangeText={setManualStepsInput}
+              keyboardType="numeric"
+              placeholder="Enter today's steps"
+              placeholderTextColor="#64748B"
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Apply Manual Steps"
+              style={styles.applyStepsBtn}
+              onPress={handleApplyManualSteps}
+            >
+              <Text style={styles.applyStepsBtnText}>Apply Steps</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {stepInputError ? (
+          <Text style={styles.stepErrorText}>{stepInputError}</Text>
+        ) : null}
       </View>
 
       {/* ===================================================================== */}
@@ -1639,5 +1843,80 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: "#F8FAFC"
+  },
+  manualStepBadge: {
+    backgroundColor: "#422006",
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "#F59E0B"
+  },
+  manualStepBadgeText: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#FBBF24"
+  },
+  stepSummaryRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8
+  },
+  stepCountText: {
+    fontSize: 15,
+    fontWeight: "800",
+    color: "#F8FAFC"
+  },
+  stepPctText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#38BDF8"
+  },
+  stepGoalMetText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#34D399",
+    marginBottom: 8
+  },
+  stepSovereigntyHint: {
+    fontSize: 11,
+    color: "#94A3B8",
+    marginBottom: 8
+  },
+  manualStepRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    marginTop: 4
+  },
+  manualStepInput: {
+    flex: 1,
+    backgroundColor: "#0F172A",
+    borderWidth: 1,
+    borderColor: "#334155",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    color: "#F8FAFC",
+    fontSize: 13,
+    fontWeight: "700"
+  },
+  applyStepsBtn: {
+    backgroundColor: "#38BDF8",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10
+  },
+  applyStepsBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#082F49"
+  },
+  stepErrorText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#F87171",
+    marginTop: 6
   }
 });

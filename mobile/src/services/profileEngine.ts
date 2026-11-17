@@ -6,6 +6,33 @@ export const FATIGUE_SCALING_MULTIPLIER = 1 - FATIGUE_DECREMENT_RATIO; // 0.70
 
 export type FitnessTier = "metabolic-rebuild" | "balanced-conditioning" | "high-output";
 
+export interface FatigueScalingOptions {
+  readonly inactivityThresholdHours?: number;
+  readonly fatigueScalingMultiplier?: number;
+}
+
+function resolveFatigueParameters(options?: FatigueScalingOptions): {
+  readonly thresholdMs: number;
+  readonly multiplier: number;
+} {
+  const hours = options?.inactivityThresholdHours;
+  const thresholdMs =
+    typeof hours === "number" && Number.isFinite(hours) && hours > 0
+      ? hours * 60 * 60 * 1000
+      : FATIGUE_GAP_THRESHOLD_MS;
+
+  const rawMult = options?.fatigueScalingMultiplier;
+  const multiplier =
+    typeof rawMult === "number" &&
+    Number.isFinite(rawMult) &&
+    rawMult > 0 &&
+    rawMult <= 1
+      ? rawMult
+      : FATIGUE_SCALING_MULTIPLIER;
+
+  return { thresholdMs, multiplier };
+}
+
 export interface DailyTargetAssessment {
   readonly fitnessTier: FitnessTier;
   readonly baselineSteps: number;
@@ -63,7 +90,8 @@ export function calculateBaselineTarget(profile: UserProfile): {
 export function scaleTargetForInactivityGap(
   baselineTarget: number,
   lastLogTimestampMs: number | null,
-  currentTimestampMs: number
+  currentTimestampMs: number,
+  options?: FatigueScalingOptions
 ): {
   readonly adjustedTarget: number;
   readonly isFatigueScaled: boolean;
@@ -87,15 +115,16 @@ export function scaleTargetForInactivityGap(
     throw new Error("currentTimestampMs cannot precede lastLogTimestampMs");
   }
 
+  const { thresholdMs, multiplier } = resolveFatigueParameters(options);
   const elapsedMs = currentTimestampMs - lastLogTimestampMs;
   const hoursSinceLastLog = Number((elapsedMs / (60 * 60 * 1000)).toFixed(2));
 
-  if (elapsedMs > FATIGUE_GAP_THRESHOLD_MS) {
+  if (elapsedMs > thresholdMs) {
     return {
-      adjustedTarget: Math.round(baselineTarget * FATIGUE_SCALING_MULTIPLIER),
+      adjustedTarget: Math.round(baselineTarget * multiplier),
       isFatigueScaled: true,
       hoursSinceLastLog,
-      scalingFactorApplied: FATIGUE_SCALING_MULTIPLIER
+      scalingFactorApplied: multiplier
     };
   }
 
@@ -109,23 +138,26 @@ export function scaleTargetForInactivityGap(
 
 /**
  * Full profile-sorting and fatigue-scaling pipeline combining biometric
- * baseline calculation and >48h churn-prevention target scaling.
+ * baseline calculation and churn-prevention target scaling.
  */
 export function evaluateDailyTarget(
   profile: UserProfile,
   lastLogTimestampMs: number | null,
-  currentTimestampMs: number
+  currentTimestampMs: number,
+  options?: FatigueScalingOptions
 ): DailyTargetAssessment {
   const baseline = calculateBaselineTarget(profile);
   const scaledSteps = scaleTargetForInactivityGap(
     baseline.baselineSteps,
     lastLogTimestampMs,
-    currentTimestampMs
+    currentTimestampMs,
+    options
   );
   const scaledMinutes = scaleTargetForInactivityGap(
     baseline.baselineActiveMinutes,
     lastLogTimestampMs,
-    currentTimestampMs
+    currentTimestampMs,
+    options
   );
 
   return {

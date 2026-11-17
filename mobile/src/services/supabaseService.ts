@@ -1,12 +1,16 @@
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 import {
+  Address,
   AnonymizedFeedInsertSchema,
   AnonymizedFeedRecord,
   Bytes32,
-  PeerCheerInsertSchema
+  PeerCheerInsertSchema,
+  SignedWorkoutClaimPayload
 } from "@dehealth/shared";
 import { randomBytes } from "ethers";
 import { z } from "zod";
+import { verifyWorkoutProofSignature } from "./cryptoService";
+import { DEMO_VERIFYING_CONTRACT, getRewardGateAddress } from "./l2ContractService";
 
 export type AnonymizedFeedInsert = z.infer<typeof AnonymizedFeedInsertSchema>;
 export type PeerCheerInsert = z.infer<typeof PeerCheerInsertSchema>;
@@ -83,6 +87,13 @@ export class DataSovereigntyViolationError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "DataSovereigntyViolationError";
+  }
+}
+
+export class FeedProofVerificationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "FeedProofVerificationError";
   }
 }
 
@@ -214,13 +225,24 @@ export const DEFAULT_FALLBACK_CHEER_COUNTS: Readonly<Record<string, number>> = {
 // In-memory fallback state preserving UI responsiveness and real local progression
 let localFeedItems: AnonymizedFeedRecord[] = [...DEFAULT_FALLBACK_FEED_ITEMS];
 let localCheerCounts: Record<string, number> = { ...DEFAULT_FALLBACK_CHEER_COUNTS };
+const seenVerifiedClaimKeys = new Set<string>();
+const seenVerifiedProofHashes = new Set<string>();
 
 /**
- * Resets local in-memory feed store to defaults.
+ * Clears in-memory replay/duplicate verification state for verified feed proofs.
+ */
+export function resetFeedVerificationStateForTesting(): void {
+  seenVerifiedClaimKeys.clear();
+  seenVerifiedProofHashes.clear();
+}
+
+/**
+ * Resets local in-memory feed store and proof replay tracking to defaults.
  */
 export function resetLocalFeedStore(): void {
   localFeedItems = [...DEFAULT_FALLBACK_FEED_ITEMS];
   localCheerCounts = { ...DEFAULT_FALLBACK_CHEER_COUNTS };
+  resetFeedVerificationStateForTesting();
 }
 
 /**
@@ -294,8 +316,27 @@ export function isSupabaseConfigured(): boolean {
 }
 
 /**
+ * Resolves the Supabase client key from the environment.
+ *
+ * `EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY` takes precedence. The legacy
+ * `EXPO_PUBLIC_SUPABASE_ANON_KEY` is used only when the publishable key is
+ * missing, empty or whitespace, so existing setups keep working.
+ * Returns undefined when neither is set.
+ */
+export function getSupabaseAnonKey(): string | undefined {
+  const publishable = process.env.EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY?.trim();
+  if (publishable) {
+    return publishable;
+  }
+  const legacy = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY?.trim();
+  return legacy ? legacy : undefined;
+}
+
+/**
  * Resolves or creates a Supabase client instance.
- * Returns null if EXPO_PUBLIC_SUPABASE_URL or EXPO_PUBLIC_SUPABASE_ANON_KEY are missing or empty.
+ * Returns null if EXPO_PUBLIC_SUPABASE_URL or a client key
+ * (EXPO_PUBLIC_SUPABASE_PUBLISHABLE_KEY, or the legacy EXPO_PUBLIC_SUPABASE_ANON_KEY)
+ * is missing or empty.
  */
 export function getSupabaseClient(): SupabaseClient | null {
   if (customClient !== undefined) {
@@ -303,7 +344,7 @@ export function getSupabaseClient(): SupabaseClient | null {
   }
 
   const url = process.env.EXPO_PUBLIC_SUPABASE_URL?.trim();
-  const anonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY?.trim();
+  const anonKey = getSupabaseAnonKey();
 
   if (!url || !anonKey) {
     cachedClient = null;
@@ -404,17 +445,72 @@ export async function fetchAnonymizedFeed(
 
 /**
  * Publishes an anonymized proof milestone to Supabase anonymized_feed.
- * Validates with AnonymizedFeedInsertSchema and enforces zero raw biometric leakage.
+ * Validates with AnonymizedFeedInsertSchema, enforces zero raw biometric leakage,
+ * and requires a valid EIP-712 SignedWorkoutClaimPayload matching `payload.proof_hash`
+ * before writing to Supabase or the local store.
  * Automatically falls back to local fallback store if Supabase is unconfigured or network is offline.
  */
 export async function publishProofMilestone(
-  payload: AnonymizedFeedInsert
-): Promise<{
-  data: AnonymizedFeedRecord;
-  mode: ServiceMode;
-}> {
+  payload: AnonymizedFeedInsert,
+  signedClaim?: SignedWorkoutClaimPayload,
+  verifyingContract?: Address
+): Promise<PublishMilestoneResult> {
   assertZeroRawBiometrics(payload);
   const validated = AnonymizedFeedInsertSchema.parse(payload);
+
+  if (!signedClaim) {
+    throw new FeedProofVerificationError(
+      "Missing EIP-712 SignedWorkoutClaimPayload: cryptographic workout proof is required before publishing to the community feed."
+    );
+  }
+
+  const effectiveVerifyingContract =
+    verifyingContract ?? getRewardGateAddress() ?? DEMO_VERIFYING_CONTRACT;
+
+  if (!verifyWorkoutProofSignature(signedClaim, effectiveVerifyingContract)) {
+    throw new FeedProofVerificationError(
+      "Invalid EIP-712 workout proof signature: feed milestone publish rejected."
+    );
+  }
+
+  if (
+    signedClaim.proof.telemetryHash.toLowerCase() !==
+    validated.proof_hash.toLowerCase()
+  ) {
+    throw new FeedProofVerificationError(
+      "EIP-712 proof telemetryHash mismatch: signed claim does not match payload proof_hash."
+    );
+  }
+
+  if (signedClaim.proof.streakCount !== BigInt(validated.streak_count)) {
+    throw new FeedProofVerificationError(
+      "EIP-712 proof streakCount mismatch: signed claim streakCount does not match payload streak_count."
+    );
+  }
+
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  if (signedClaim.proof.deadline < nowSec) {
+    throw new FeedProofVerificationError(
+      "EIP-712 workout proof expired: signed claim deadline is in the past."
+    );
+  }
+
+  const normalizedProofHash = validated.proof_hash.toLowerCase();
+  const claimReplayKey = `${signedClaim.proof.telemetryHash.toLowerCase()}:${signedClaim.signature.toLowerCase()}`;
+  if (
+    seenVerifiedClaimKeys.has(claimReplayKey) ||
+    seenVerifiedProofHashes.has(normalizedProofHash) ||
+    localFeedItems.some(
+      (item) => item.proof_hash.toLowerCase() === normalizedProofHash
+    )
+  ) {
+    throw new FeedProofVerificationError(
+      "EIP-712 workout proof replay detected: signed claim or proof_hash has already been published."
+    );
+  }
+
+  seenVerifiedClaimKeys.add(claimReplayKey);
+  seenVerifiedProofHashes.add(normalizedProofHash);
 
   const client = getSupabaseClient();
   if (!client) {

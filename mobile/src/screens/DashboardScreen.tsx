@@ -20,6 +20,9 @@ import {
   View
 } from "react-native";
 import {
+  AdminGovernanceModal
+} from "../components/AdminGovernanceModal";
+import {
   applyApprovedPlanReview,
   isBiWeeklyReviewDue,
   keepCurrentPlanOnReview,
@@ -31,12 +34,21 @@ import {
   evaluateBiWeeklyReview,
   generate14DayPlan
 } from "../services/adaptivePlanEngine";
-import { L2ServiceMode } from "../services/l2ContractService";
+import {
+  L2InspectorStatus,
+  L2ServiceMode
+} from "../services/l2ContractService";
 import { DailyTargetAssessment } from "../services/profileEngine";
 import {
   saveActivePlanCycle,
   saveWeightLog
 } from "../storage/adaptiveStorage";
+import {
+  DEFAULT_GOVERNANCE_CONFIG,
+  GovernanceConfig,
+  resetGovernanceConfig,
+  saveGovernanceConfig
+} from "../storage/governanceStorage";
 
 export interface WeightLogValidationResult {
   readonly isValid: boolean;
@@ -139,6 +151,12 @@ export interface DashboardScreenProps {
   readonly lastTxHash?: string | null;
   readonly lastExplorerUrl?: string | null;
   readonly lastClaimMode?: L2ServiceMode | null;
+  /** Protocol governance configuration and inspector modal overrides */
+  readonly governanceConfig?: GovernanceConfig;
+  readonly onUpdateGovernanceConfig?: (config: GovernanceConfig) => void;
+  readonly initialGovernanceModalOpen?: boolean;
+  readonly initialInspectorStatus?: L2InspectorStatus | null;
+  readonly loadInspectorStatus?: (userAddress: Address) => Promise<L2InspectorStatus>;
 }
 
 const WEEK_DAYS: ReadonlyArray<{
@@ -172,9 +190,23 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onExportPrivateKey,
   lastTxHash,
   lastExplorerUrl,
-  lastClaimMode = null
+  lastClaimMode = null,
+  governanceConfig: externalGovernanceConfig,
+  onUpdateGovernanceConfig,
+  initialGovernanceModalOpen = false,
+  initialInspectorStatus = null,
+  loadInspectorStatus
 }) => {
   const isLiveClaim = lastClaimMode === "live";
+  const [localGovernanceConfig, setLocalGovernanceConfig] =
+    useState<GovernanceConfig>(
+      externalGovernanceConfig ?? DEFAULT_GOVERNANCE_CONFIG
+    );
+  const effectiveGovernanceConfig =
+    externalGovernanceConfig ?? localGovernanceConfig;
+  const [isGovernanceModalOpen, setIsGovernanceModalOpen] = useState<boolean>(
+    initialGovernanceModalOpen
+  );
   const defaultCycle = useMemo<AdaptivePlanCycle>(() => {
     const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
     return generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, fifteenDaysAgo);
@@ -245,6 +277,37 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const [exportedPrivateKey, setExportedPrivateKey] = useState<string | null>(null);
   const [isExportingKey, setIsExportingKey] = useState<boolean>(false);
   const [walletFeedback, setWalletFeedback] = useState<string | null>(null);
+
+  const effectiveUserAddress = (userAddress ??
+    "0x0000000000000000000000000000000000000000") as Address;
+
+  const handleSaveGovernanceParameters = async (
+    nextConfig: GovernanceConfig
+  ): Promise<void> => {
+    let persisted = nextConfig;
+    try {
+      persisted = await saveGovernanceConfig(nextConfig);
+    } catch {
+      // Non-fatal in preview environments without initialized vault storage
+    }
+    setLocalGovernanceConfig(persisted);
+    if (onUpdateGovernanceConfig) {
+      onUpdateGovernanceConfig(persisted);
+    }
+  };
+
+  const handleResetGovernanceParameters = async (): Promise<void> => {
+    let restored = DEFAULT_GOVERNANCE_CONFIG;
+    try {
+      restored = await resetGovernanceConfig();
+    } catch {
+      // Non-fatal in preview environments without initialized vault storage
+    }
+    setLocalGovernanceConfig(restored);
+    if (onUpdateGovernanceConfig) {
+      onUpdateGovernanceConfig(restored);
+    }
+  };
 
   const handleCopy = async (text: string, label: string): Promise<void> => {
     try {
@@ -573,7 +636,9 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </Text>
           {targetAssessment.isFatigueScaled ? (
             <View style={styles.adaptiveBadgePill}>
-              <Text style={styles.adaptiveBadgeText}>🛡️ -30% Fatigue Guard</Text>
+              <Text style={styles.adaptiveBadgeText}>
+                🛡️ -{Math.round((1 - targetAssessment.scalingFactorApplied) * 100)}% Fatigue Guard
+              </Text>
             </View>
           ) : (
             <View style={styles.standardBadgePill}>
@@ -588,13 +653,46 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
         {targetAssessment.isFatigueScaled ? (
           <Text style={styles.fatigueBadge}>
-            🛡️ Adaptive Guard Active: -30% fatigue scaling applied (&gt;48h gap detected).
+            🛡️ Adaptive Guard Active: -
+            {Math.round(
+              (1 - targetAssessment.scalingFactorApplied) * 100
+            )}
+            % fatigue scaling applied (&gt;
+            {effectiveGovernanceConfig.inactivityThresholdHours}h gap detected).
           </Text>
         ) : (
           <Text style={styles.standardSubtext}>
             Daily target maintained by on-device profile rule engine.
           </Text>
         )}
+      </View>
+
+      {/* Admin Governance & On-Chain Contract Inspector Launcher Card */}
+      <View style={styles.card}>
+        <View style={styles.cardHeaderRow}>
+          <Text style={styles.label}>Protocol Governance &amp; L2 Inspector</Text>
+          <Text style={styles.proofBadgeTag}>FR-08 • Arbitrum Sepolia</Text>
+        </View>
+        <Text style={styles.walletDescription}>
+          Threshold: {effectiveGovernanceConfig.inactivityThresholdHours}h • Scaling:{" "}
+          {effectiveGovernanceConfig.fatigueScalingMultiplier.toFixed(2)}x • Step Goal:{" "}
+          {effectiveGovernanceConfig.dailyStepGoal.toLocaleString()} steps
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Governance & Contract Inspector"
+          style={({ pressed }) => [
+            styles.governanceBtn,
+            pressed ? styles.btnPressed : null
+          ]}
+          onPress={() => {
+            setIsGovernanceModalOpen(true);
+          }}
+        >
+          <Text style={styles.governanceBtnText}>
+            ⚙️ Governance &amp; Contract Inspector
+          </Text>
+        </Pressable>
       </View>
 
       {/* Reward Perks Vault Launcher Card */}
@@ -920,6 +1018,20 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         onClose={() => {
           setIsReviewModalOpen(false);
         }}
+      />
+
+      {/* Admin Governance & Protocol Contract Inspector Modal */}
+      <AdminGovernanceModal
+        visible={isGovernanceModalOpen}
+        userAddress={effectiveUserAddress}
+        currentConfig={effectiveGovernanceConfig}
+        onSaveConfig={handleSaveGovernanceParameters}
+        onResetDefaults={handleResetGovernanceParameters}
+        onClose={() => {
+          setIsGovernanceModalOpen(false);
+        }}
+        initialInspectorStatus={initialInspectorStatus}
+        loadInspectorStatus={loadInspectorStatus}
       />
     </ScrollView>
   );
@@ -1584,5 +1696,19 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#38BDF8",
     textDecorationLine: "underline"
+  },
+  governanceBtn: {
+    backgroundColor: "#1E293B",
+    borderRadius: 10,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#38BDF8"
+  },
+  governanceBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#38BDF8"
   }
 });

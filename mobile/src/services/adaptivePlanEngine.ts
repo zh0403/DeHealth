@@ -18,10 +18,11 @@ import {
 
 import {
   FATIGUE_GAP_THRESHOLD_MS,
-  FATIGUE_SCALING_MULTIPLIER
+  FATIGUE_SCALING_MULTIPLIER,
+  FatigueScalingOptions
 } from "./profileEngine";
 
-export { FATIGUE_GAP_THRESHOLD_MS, FATIGUE_SCALING_MULTIPLIER };
+export { FATIGUE_GAP_THRESHOLD_MS, FATIGUE_SCALING_MULTIPLIER, FatigueScalingOptions };
 
 export const SAFE_CALORIE_FLOOR_KCAL = 1200;
 
@@ -148,38 +149,65 @@ export function calculateMacroSplit(targetCalories: number, goal: FitnessGoal): 
   });
 }
 
+function resolvePlanFatigueParams(options?: FatigueScalingOptions): {
+  readonly thresholdMs: number;
+  readonly multiplier: number;
+} {
+  const hours = options?.inactivityThresholdHours;
+  const thresholdMs =
+    typeof hours === "number" && Number.isFinite(hours) && hours > 0
+      ? hours * 60 * 60 * 1000
+      : FATIGUE_GAP_THRESHOLD_MS;
+
+  const rawMult = options?.fatigueScalingMultiplier;
+  const multiplier =
+    typeof rawMult === "number" &&
+    Number.isFinite(rawMult) &&
+    rawMult > 0 &&
+    rawMult <= 1
+      ? rawMult
+      : FATIGUE_SCALING_MULTIPLIER;
+
+  return { thresholdMs, multiplier };
+}
+
 /**
- * Scales exercises down for fatigue (30% reduction in sets/duration).
+ * Scales exercises down for fatigue (default 30% reduction in sets/duration).
  * Supports both:
- * 1. `scaleExercisesForFatigue(exercises, isFatigued)` -> returns WorkoutExerciseItem[]
- * 2. `scaleExercisesForFatigue(exercises, lastLogTimestampMs, currentTimestampMs)` -> returns { exercises, isFatigueScaled }
+ * 1. `scaleExercisesForFatigue(exercises, isFatigued, options?)` -> returns WorkoutExerciseItem[]
+ * 2. `scaleExercisesForFatigue(exercises, lastLogTimestampMs, currentTimestampMs?, options?)` -> returns { exercises, isFatigueScaled }
  */
 export function scaleExercisesForFatigue(
   exercises: readonly WorkoutExerciseItem[],
-  isFatigued: boolean
+  isFatigued: boolean,
+  options?: FatigueScalingOptions
 ): WorkoutExerciseItem[];
 export function scaleExercisesForFatigue(
   exercises: readonly WorkoutExerciseItem[],
   lastLogTimestampMs: number | null,
-  currentTimestampMs?: number
+  currentTimestampMs?: number,
+  options?: FatigueScalingOptions
 ): { exercises: WorkoutExerciseItem[]; isFatigueScaled: boolean };
 export function scaleExercisesForFatigue(
   exercises: readonly WorkoutExerciseItem[],
   arg2: boolean | number | null,
-  arg3?: number
+  arg3?: number | FatigueScalingOptions,
+  arg4?: FatigueScalingOptions
 ): WorkoutExerciseItem[] | { exercises: WorkoutExerciseItem[]; isFatigueScaled: boolean } {
   if (typeof arg2 === "boolean") {
     const isFatigued = arg2;
+    const opts = typeof arg3 === "object" && arg3 !== null ? arg3 : undefined;
+    const { multiplier } = resolvePlanFatigueParams(opts);
     return exercises.map((ex) => {
       if (!isFatigued) {
         return { ...ex, scaledForFatigue: false };
       }
       return {
         ...ex,
-        sets: Math.max(1, Math.round(ex.sets * FATIGUE_SCALING_MULTIPLIER)),
+        sets: Math.max(1, Math.round(ex.sets * multiplier)),
         durationMinutes:
           ex.durationMinutes !== undefined
-            ? Math.max(1, Math.round(ex.durationMinutes * FATIGUE_SCALING_MULTIPLIER))
+            ? Math.max(1, Math.round(ex.durationMinutes * multiplier))
             : undefined,
         scaledForFatigue: true
       };
@@ -187,10 +215,12 @@ export function scaleExercisesForFatigue(
   }
 
   const lastLogTimestampMs = arg2;
-  const currentTimestampMs = arg3 ?? Date.now();
+  const currentTimestampMs = typeof arg3 === "number" ? arg3 : Date.now();
+  const opts = typeof arg3 === "object" && arg3 !== null ? arg3 : arg4;
+  const { thresholdMs, multiplier } = resolvePlanFatigueParams(opts);
   const isFatigued =
     lastLogTimestampMs !== null &&
-    currentTimestampMs - lastLogTimestampMs > FATIGUE_GAP_THRESHOLD_MS;
+    currentTimestampMs - lastLogTimestampMs > thresholdMs;
 
   const scaled = exercises.map((ex) => {
     if (!isFatigued) {
@@ -198,10 +228,10 @@ export function scaleExercisesForFatigue(
     }
     return {
       ...ex,
-      sets: Math.max(1, Math.round(ex.sets * FATIGUE_SCALING_MULTIPLIER)),
+      sets: Math.max(1, Math.round(ex.sets * multiplier)),
       durationMinutes:
         ex.durationMinutes !== undefined
-          ? Math.max(1, Math.round(ex.durationMinutes * FATIGUE_SCALING_MULTIPLIER))
+          ? Math.max(1, Math.round(ex.durationMinutes * multiplier))
           : undefined,
       scaledForFatigue: true
     };
@@ -211,9 +241,9 @@ export function scaleExercisesForFatigue(
 }
 
 /**
- * Applies the 48h/-30% fatigue rule to an already-generated, in-progress DailyPlan
- * at runtime, so a mid-cycle inactivity gap takes effect immediately without
- * regenerating the 14-day cycle.
+ * Applies the configured inactivity fatigue rule (default 48h / 0.70x) to an
+ * already-generated, in-progress DailyPlan at runtime, so a mid-cycle inactivity
+ * gap takes effect immediately without regenerating the 14-day cycle.
  *
  * - Idempotent: exercises already flagged `scaledForFatigue` are never scaled twice.
  * - Completed exercises and already-completed plans are left untouched.
@@ -223,11 +253,13 @@ export function scaleExercisesForFatigue(
 export function applyRuntimeFatigueScaling(
   plan: DailyPlan,
   lastLogTimestampMs: number | null,
-  currentTimestampMs: number
+  currentTimestampMs: number,
+  options?: FatigueScalingOptions
 ): DailyPlan {
+  const { thresholdMs, multiplier } = resolvePlanFatigueParams(options);
   const isFatigued =
     lastLogTimestampMs !== null &&
-    currentTimestampMs - lastLogTimestampMs > FATIGUE_GAP_THRESHOLD_MS;
+    currentTimestampMs - lastLogTimestampMs > thresholdMs;
 
   if (!isFatigued || plan.completed) {
     return plan;
@@ -241,10 +273,10 @@ export function applyRuntimeFatigueScaling(
     changed = true;
     return {
       ...ex,
-      sets: Math.max(1, Math.round(ex.sets * FATIGUE_SCALING_MULTIPLIER)),
+      sets: Math.max(1, Math.round(ex.sets * multiplier)),
       durationMinutes:
         ex.durationMinutes !== undefined
-          ? Math.max(1, Math.round(ex.durationMinutes * FATIGUE_SCALING_MULTIPLIER))
+          ? Math.max(1, Math.round(ex.durationMinutes * multiplier))
           : undefined,
       scaledForFatigue: true
     };
