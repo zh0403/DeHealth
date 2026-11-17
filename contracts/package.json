@@ -5,7 +5,7 @@
   "scripts": {
     "compile": "hardhat compile",
     "build": "hardhat compile",
-    "test": "hardhat test test/DeHealthRewardGate.test.ts",
+    "test": "hardhat test test/DeHealthRewardGate.test.ts test/deployScript.test.ts test/hardhatEnvLoading.test.ts",
     "test:e2e": "hardhat test test/e2e/DeHealthE2E_Tier1_Tier2.test.ts test/e2e/DeHealthE2E_Tier3_Tier4.test.ts",
     "coverage": "hardhat coverage",
     "gas": "hardhat test"
@@ -25,6 +25,7 @@
     "@types/chai": "^4.3.20",
     "@types/mocha": "^10.0.10",
     "chai": "^4.5.0",
+    "dotenv": "^16.4.7",
     "ethers": "^6.13.4",
     "hardhat": "^2.22.17",
     "hardhat-gas-reporter": "^2.2.2",

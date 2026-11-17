@@ -1,9 +1,31 @@
+import path from "path";
+import * as dotenv from "dotenv";
 import { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-ethers";
 import "@nomicfoundation/hardhat-chai-matchers";
 import "@typechain/hardhat";
 import "hardhat-gas-reporter";
 import "solidity-coverage";
+
+/**
+ * Loads environment variables from `contracts/.env` (higher precedence) and
+ * repository root `../.env` (fallback), preserving any explicit shell env vars.
+ */
+export function loadHardhatEnvironment(
+  baseDir: string = __dirname,
+  targetEnv: Record<string, string | undefined> = process.env
+): dotenv.DotenvConfigOutput {
+  const envPaths = [
+    path.resolve(baseDir, ".env"),
+    path.resolve(baseDir, "../.env")
+  ];
+  return dotenv.config({
+    path: envPaths,
+    processEnv: targetEnv as Record<string, string>
+  });
+}
+
+loadHardhatEnvironment();
 
 const config: HardhatUserConfig = {
   solidity: {

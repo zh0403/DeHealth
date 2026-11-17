@@ -45,7 +45,7 @@ export async function deployContracts(): Promise<DeployContractsResult> {
     process.env.ARBITRUM_SEPOLIA_RPC_URL || "https://sepolia-rollup.arbitrum.io/rpc";
 
   console.log("\n========================================================");
-  console.log("Arbitrum Sepolia Deployment Successful! Ready-to-copy .env:");
+  console.log("Arbitrum Sepolia Deployment Successful! Ready-to-copy mobile/.env:");
   console.log("========================================================");
   console.log(`EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL=${rpcUrl}`);
   console.log(`EXPO_PUBLIC_DHT_TOKEN_ADDRESS=${tokenAddress}`);
