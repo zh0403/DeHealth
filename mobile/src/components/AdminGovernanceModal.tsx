@@ -1,5 +1,5 @@
 import { Address } from "@dehealth/shared";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Linking,
   Modal,
@@ -22,13 +22,18 @@ import {
   DEFAULT_GOVERNANCE_CONFIG,
   GovernanceConfig,
   GovernanceConfigSchema,
+  isValidUserGovernancePin,
   MAX_DAILY_STEP_GOAL,
   MAX_FATIGUE_SCALING_MULTIPLIER,
   MAX_INACTIVITY_THRESHOLD_HOURS,
   MIN_DAILY_STEP_GOAL,
   MIN_FATIGUE_SCALING_MULTIPLIER,
-  MIN_INACTIVITY_THRESHOLD_HOURS
+  MIN_INACTIVITY_THRESHOLD_HOURS,
+  resolveGovernancePinMode,
+  setGovernancePin,
+  verifyGovernancePin
 } from "../storage/governanceStorage";
+import { SecureKeyStore } from "../storage/vaultKeyProvider";
 
 export interface GovernanceValidationResult {
   readonly isValid: boolean;
@@ -108,6 +113,95 @@ export function validateGovernanceInput(
   };
 }
 
+export type GovernanceModalPinUiMode = "loading" | "setup" | "unlock";
+
+export interface GovernanceUnlockResult {
+  readonly unlocked: boolean;
+  readonly error: string | null;
+}
+
+/**
+ * Validates an admin PIN candidate against `.env` override or `SecureKeyStore`
+ * for unlocking governance parameter edits.
+ */
+export async function attemptGovernanceUnlock(
+  pinInput: string,
+  keyStore?: SecureKeyStore
+): Promise<GovernanceUnlockResult> {
+  const trimmed = typeof pinInput === "string" ? pinInput.trim() : "";
+  if (trimmed.length === 0) {
+    return {
+      unlocked: false,
+      error: "Invalid governance PIN. Parameter editing remains locked."
+    };
+  }
+  try {
+    const mode = await resolveGovernancePinMode(keyStore);
+    if (mode === "unset") {
+      return {
+        unlocked: false,
+        error:
+          "No governance PIN is configured yet. Create a 4–8 digit PIN first."
+      };
+    }
+    const verified = await verifyGovernancePin(trimmed, keyStore);
+    if (verified) {
+      return { unlocked: true, error: null };
+    }
+    return {
+      unlocked: false,
+      error: "Invalid governance PIN. Parameter editing remains locked."
+    };
+  } catch (err: unknown) {
+    return {
+      unlocked: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Unable to verify governance PIN. Parameter editing remains locked."
+    };
+  }
+}
+
+/**
+ * Validates, confirms, and persists a new 4–8 digit governance PIN into
+ * on-device `SecureKeyStore`, unlocking governance edits upon success.
+ */
+export async function attemptGovernancePinSetup(
+  pinInput: string,
+  keyStore?: SecureKeyStore,
+  confirmPinInput?: string
+): Promise<GovernanceUnlockResult> {
+  const trimmed = typeof pinInput === "string" ? pinInput.trim() : "";
+  if (!isValidUserGovernancePin(trimmed)) {
+    return {
+      unlocked: false,
+      error: "Governance PIN must be 4 to 8 digits."
+    };
+  }
+  if (
+    confirmPinInput !== undefined &&
+    trimmed !== confirmPinInput.trim()
+  ) {
+    return {
+      unlocked: false,
+      error: "Governance PINs do not match."
+    };
+  }
+  try {
+    await setGovernancePin(trimmed, keyStore);
+    return { unlocked: true, error: null };
+  } catch (err: unknown) {
+    return {
+      unlocked: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : "Failed to save governance PIN."
+    };
+  }
+}
+
 function buildSynchronousFallbackStatus(): L2InspectorStatus {
   const rewardGateAddress = getRewardGateAddress();
   const tokenAddress = getTokenAddress();
@@ -136,6 +230,20 @@ export interface AdminGovernanceModalProps {
   readonly loadInspectorStatus?: (
     userAddress: Address
   ) => Promise<L2InspectorStatus>;
+  /**
+   * Optional initial unlock state (defaults to `false` so edits remain locked
+   * behind the local admin PIN in production; used by stateless render tests).
+   */
+  readonly initialUnlocked?: boolean;
+  /**
+   * Optional `SecureKeyStore` override for PIN storage/verification in tests.
+   */
+  readonly pinKeyStore?: SecureKeyStore;
+  /**
+   * Optional initial PIN UI mode (`"loading" | "setup" | "unlock"`) used by
+   * stateless render tests; omitted in production so mode resolves dynamically.
+   */
+  readonly initialPinMode?: GovernanceModalPinUiMode;
 }
 
 export const AdminGovernanceModal: React.FC<AdminGovernanceModalProps> = ({
@@ -146,8 +254,21 @@ export const AdminGovernanceModal: React.FC<AdminGovernanceModalProps> = ({
   onResetDefaults,
   onClose,
   initialInspectorStatus = null,
-  loadInspectorStatus
+  loadInspectorStatus,
+  initialUnlocked = false,
+  pinKeyStore,
+  initialPinMode
 }) => {
+  const [isUnlocked, setIsUnlocked] = useState<boolean>(initialUnlocked);
+  const [pinUiMode, setPinUiMode] = useState<GovernanceModalPinUiMode>(
+    initialPinMode ?? (initialUnlocked ? "unlock" : "loading")
+  );
+  const [pinInput, setPinInput] = useState<string>("");
+  const [confirmPinInput, setConfirmPinInput] = useState<string>("");
+  const [pinError, setPinError] = useState<string | null>(null);
+  const [isPinSubmitting, setIsPinSubmitting] = useState<boolean>(false);
+  const authSessionRef = useRef<number>(0);
+
   const [hoursInput, setHoursInput] = useState<string>(
     String(currentConfig.inactivityThresholdHours)
   );
@@ -173,11 +294,59 @@ export const AdminGovernanceModal: React.FC<AdminGovernanceModalProps> = ({
   }, [currentConfig, visible]);
 
   useEffect(() => {
-    if (visible) {
-      setFormError(null);
-      setSaveNotice(null);
+    authSessionRef.current += 1;
+    const sessionId = authSessionRef.current;
+
+    setFormError(null);
+    setSaveNotice(null);
+    setPinInput("");
+    setConfirmPinInput("");
+    setPinError(null);
+    setIsPinSubmitting(false);
+    setIsUnlocked(initialUnlocked);
+
+    if (!visible) {
+      setPinUiMode(initialPinMode ?? (initialUnlocked ? "unlock" : "loading"));
+      return;
     }
-  }, [visible]);
+
+    if (initialUnlocked) {
+      setPinUiMode(initialPinMode ?? "unlock");
+      return;
+    }
+
+    if (initialPinMode !== undefined) {
+      setPinUiMode(initialPinMode);
+      return;
+    }
+
+    setPinUiMode("loading");
+    void (async (): Promise<void> => {
+      try {
+        const mode = await resolveGovernancePinMode(pinKeyStore);
+        if (authSessionRef.current !== sessionId) {
+          return;
+        }
+        setPinUiMode(mode === "unset" ? "setup" : "unlock");
+      } catch (err: unknown) {
+        if (authSessionRef.current !== sessionId) {
+          return;
+        }
+        setPinUiMode("unlock");
+        setPinError(
+          err instanceof Error
+            ? err.message
+            : "Unable to access secure PIN storage."
+        );
+      }
+    })();
+
+    return () => {
+      if (authSessionRef.current === sessionId) {
+        authSessionRef.current += 1;
+      }
+    };
+  }, [visible, initialUnlocked, initialPinMode, pinKeyStore]);
 
   const refreshInspector = async (): Promise<void> => {
     setIsRefreshingStatus(true);
@@ -201,7 +370,67 @@ export const AdminGovernanceModal: React.FC<AdminGovernanceModalProps> = ({
     void refreshInspector();
   }, [visible, userAddress, initialInspectorStatus]);
 
+  const handleSetupGovernancePin = async (): Promise<void> => {
+    if (isPinSubmitting) {
+      return;
+    }
+    const sessionId = authSessionRef.current;
+    setIsPinSubmitting(true);
+    setPinError(null);
+    try {
+      const result = await attemptGovernancePinSetup(
+        pinInput,
+        pinKeyStore,
+        confirmPinInput
+      );
+      if (authSessionRef.current !== sessionId) {
+        return;
+      }
+      setIsUnlocked(result.unlocked);
+      setPinError(result.error);
+      if (result.unlocked) {
+        setPinInput("");
+        setConfirmPinInput("");
+        setPinUiMode("unlock");
+      }
+    } finally {
+      if (authSessionRef.current === sessionId) {
+        setIsPinSubmitting(false);
+      }
+    }
+  };
+
+  const handleUnlockGovernance = async (): Promise<void> => {
+    if (isPinSubmitting) {
+      return;
+    }
+    const sessionId = authSessionRef.current;
+    setIsPinSubmitting(true);
+    setPinError(null);
+    try {
+      const result = await attemptGovernanceUnlock(pinInput, pinKeyStore);
+      if (authSessionRef.current !== sessionId) {
+        return;
+      }
+      setIsUnlocked(result.unlocked);
+      setPinError(result.error);
+      if (result.unlocked) {
+        setPinInput("");
+      }
+    } finally {
+      if (authSessionRef.current === sessionId) {
+        setIsPinSubmitting(false);
+      }
+    }
+  };
+
   const handleSave = async (): Promise<void> => {
+    if (!isUnlocked) {
+      setFormError(
+        "Unlock governance controls with the admin PIN before saving changes."
+      );
+      return;
+    }
     setSaveNotice(null);
     const validation = validateGovernanceInput(
       hoursInput,
@@ -230,6 +459,12 @@ export const AdminGovernanceModal: React.FC<AdminGovernanceModalProps> = ({
   };
 
   const handleReset = async (): Promise<void> => {
+    if (!isUnlocked) {
+      setFormError(
+        "Unlock governance controls with the admin PIN before resetting defaults."
+      );
+      return;
+    }
     setFormError(null);
     setSaveNotice(null);
     setIsSaving(true);
@@ -287,89 +522,254 @@ export const AdminGovernanceModal: React.FC<AdminGovernanceModalProps> = ({
 
             {/* Section 1: Governance Parameters */}
             <View style={styles.sectionCard}>
-              <Text style={styles.sectionTitle}>Adaptive Rule Parameters</Text>
+              <View style={styles.inspectorHeaderRow}>
+                <Text style={styles.sectionTitle}>Adaptive Rule Parameters</Text>
+                <View
+                  style={[
+                    styles.lockBadge,
+                    isUnlocked ? styles.lockBadgeUnlocked : styles.lockBadgeLocked
+                  ]}
+                >
+                  <Text
+                    style={[
+                      styles.lockBadgeText,
+                      isUnlocked
+                        ? styles.lockBadgeTextUnlocked
+                        : styles.lockBadgeTextLocked
+                    ]}
+                  >
+                    {isUnlocked ? "Unlocked" : "Read-Only"}
+                  </Text>
+                </View>
+              </View>
               <Text style={styles.sectionSub}>
                 Encrypted locally on-device. Controls fatigue recovery thresholds and daily step proof eligibility.
               </Text>
 
-              <Text style={styles.inputLabel}>
-                Inactivity Threshold Hours ({MIN_INACTIVITY_THRESHOLD_HOURS}–{MAX_INACTIVITY_THRESHOLD_HOURS}h)
-              </Text>
-              <TextInput
-                accessibilityLabel="Inactivity Threshold Hours Input"
-                style={styles.textInput}
-                value={hoursInput}
-                onChangeText={setHoursInput}
-                keyboardType="numeric"
-                placeholder="48"
-                placeholderTextColor="#64748B"
-              />
+              {!isUnlocked ? (
+                <View>
+                  <View style={styles.readOnlyParamList}>
+                    <View style={styles.readOnlyParamRow}>
+                      <Text style={styles.readOnlyParamLabel}>
+                        Inactivity Threshold Hours
+                      </Text>
+                      <Text style={styles.readOnlyParamValue}>
+                        {currentConfig.inactivityThresholdHours}h
+                      </Text>
+                    </View>
+                    <View style={styles.readOnlyParamRow}>
+                      <Text style={styles.readOnlyParamLabel}>
+                        Fatigue Scaling Multiplier
+                      </Text>
+                      <Text style={styles.readOnlyParamValue}>
+                        {currentConfig.fatigueScalingMultiplier.toFixed(2)}x
+                      </Text>
+                    </View>
+                    <View style={styles.readOnlyParamRow}>
+                      <Text style={styles.readOnlyParamLabel}>
+                        Daily Step Goal
+                      </Text>
+                      <Text style={styles.readOnlyParamValue}>
+                        {currentConfig.dailyStepGoal.toLocaleString()} steps
+                      </Text>
+                    </View>
+                  </View>
 
-              <Text style={styles.inputLabel}>
-                Fatigue Scaling Multiplier ({MIN_FATIGUE_SCALING_MULTIPLIER.toFixed(2)}–{MAX_FATIGUE_SCALING_MULTIPLIER.toFixed(2)})
-              </Text>
-              <TextInput
-                accessibilityLabel="Fatigue Scaling Multiplier Input"
-                style={styles.textInput}
-                value={multiplierInput}
-                onChangeText={setMultiplierInput}
-                keyboardType="numeric"
-                placeholder="0.70"
-                placeholderTextColor="#64748B"
-              />
+                  <View style={styles.unlockBox}>
+                    {pinUiMode === "loading" ? (
+                      <View>
+                        <Text style={styles.inputLabel}>
+                          Checking Governance PIN
+                        </Text>
+                        <Text style={styles.unlockHint}>
+                          Checking secure PIN configuration...
+                        </Text>
+                      </View>
+                    ) : pinUiMode === "setup" ? (
+                      <View>
+                        <Text style={styles.inputLabel}>
+                          Create Governance PIN
+                        </Text>
+                        <Text style={styles.unlockHint}>
+                          No governance PIN is configured yet. Create a 4–8 digit PIN to protect protocol parameter edits on this device.
+                        </Text>
+                        <TextInput
+                          accessibilityLabel="Create Governance PIN Input"
+                          style={styles.textInput}
+                          value={pinInput}
+                          onChangeText={setPinInput}
+                          secureTextEntry
+                          keyboardType="number-pad"
+                          maxLength={8}
+                          placeholder="Enter 4–8 digit PIN"
+                          placeholderTextColor="#64748B"
+                        />
+                        <TextInput
+                          accessibilityLabel="Confirm Governance PIN Input"
+                          style={styles.textInput}
+                          value={confirmPinInput}
+                          onChangeText={setConfirmPinInput}
+                          secureTextEntry
+                          keyboardType="number-pad"
+                          maxLength={8}
+                          placeholder="Confirm 4–8 digit PIN"
+                          placeholderTextColor="#64748B"
+                        />
 
-              <Text style={styles.inputLabel}>
-                Daily Step Goal ({MIN_DAILY_STEP_GOAL}–{MAX_DAILY_STEP_GOAL} steps)
-              </Text>
-              <TextInput
-                accessibilityLabel="Daily Step Goal Input"
-                style={styles.textInput}
-                value={stepGoalInput}
-                onChangeText={setStepGoalInput}
-                keyboardType="numeric"
-                placeholder="5000"
-                placeholderTextColor="#64748B"
-              />
+                        {pinError ? (
+                          <View style={styles.errorBox}>
+                            <Text style={styles.errorText}>{pinError}</Text>
+                          </View>
+                        ) : null}
 
-              {formError ? (
-                <View style={styles.errorBox}>
-                  <Text style={styles.errorText}>{formError}</Text>
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel="Set Governance PIN Button"
+                          disabled={isPinSubmitting}
+                          style={[
+                            styles.unlockBtn,
+                            isPinSubmitting ? styles.btnDisabled : null
+                          ]}
+                          onPress={() => {
+                            void handleSetupGovernancePin();
+                          }}
+                        >
+                          <Text style={styles.unlockBtnText}>
+                            {isPinSubmitting
+                              ? "Saving PIN..."
+                              : "Set Governance PIN & Unlock"}
+                          </Text>
+                        </Pressable>
+                      </View>
+                    ) : (
+                      <View>
+                        <Text style={styles.inputLabel}>
+                          Unlock Governance Controls
+                        </Text>
+                        <Text style={styles.unlockHint}>
+                          Parameters are read-only. Enter your governance PIN to edit parameters or reset defaults.
+                        </Text>
+                        <TextInput
+                          accessibilityLabel="Unlock Governance Controls"
+                          style={styles.textInput}
+                          value={pinInput}
+                          onChangeText={setPinInput}
+                          secureTextEntry
+                          keyboardType="default"
+                          placeholder="Enter governance PIN"
+                          placeholderTextColor="#64748B"
+                        />
+
+                        {pinError ? (
+                          <View style={styles.errorBox}>
+                            <Text style={styles.errorText}>{pinError}</Text>
+                          </View>
+                        ) : null}
+
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityLabel="Unlock Governance Controls Button"
+                          disabled={isPinSubmitting}
+                          style={[
+                            styles.unlockBtn,
+                            isPinSubmitting ? styles.btnDisabled : null
+                          ]}
+                          onPress={() => {
+                            void handleUnlockGovernance();
+                          }}
+                        >
+                          <Text style={styles.unlockBtnText}>
+                            {isPinSubmitting
+                              ? "Verifying PIN..."
+                              : "Unlock Governance Controls"}
+                          </Text>
+                        </Pressable>
+                      </View>
+                    )}
+                  </View>
                 </View>
-              ) : null}
-
-              {saveNotice ? (
-                <View style={styles.successBox}>
-                  <Text style={styles.successText}>✓ {saveNotice}</Text>
-                </View>
-              ) : null}
-
-              <View style={styles.actionRow}>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Save Governance Parameters"
-                  disabled={isSaving}
-                  style={[styles.saveBtn, isSaving ? styles.btnDisabled : null]}
-                  onPress={() => {
-                    void handleSave();
-                  }}
-                >
-                  <Text style={styles.saveBtnText}>
-                    {isSaving ? "Saving..." : "Save Parameters"}
+              ) : (
+                <View>
+                  <Text style={styles.inputLabel}>
+                    Inactivity Threshold Hours ({MIN_INACTIVITY_THRESHOLD_HOURS}–{MAX_INACTIVITY_THRESHOLD_HOURS}h)
                   </Text>
-                </Pressable>
+                  <TextInput
+                    accessibilityLabel="Inactivity Threshold Hours Input"
+                    style={styles.textInput}
+                    value={hoursInput}
+                    onChangeText={setHoursInput}
+                    keyboardType="numeric"
+                    placeholder="48"
+                    placeholderTextColor="#64748B"
+                  />
 
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel="Reset Governance Defaults"
-                  disabled={isSaving}
-                  style={[styles.resetBtn, isSaving ? styles.btnDisabled : null]}
-                  onPress={() => {
-                    void handleReset();
-                  }}
-                >
-                  <Text style={styles.resetBtnText}>Reset Defaults</Text>
-                </Pressable>
-              </View>
+                  <Text style={styles.inputLabel}>
+                    Fatigue Scaling Multiplier ({MIN_FATIGUE_SCALING_MULTIPLIER.toFixed(2)}–{MAX_FATIGUE_SCALING_MULTIPLIER.toFixed(2)})
+                  </Text>
+                  <TextInput
+                    accessibilityLabel="Fatigue Scaling Multiplier Input"
+                    style={styles.textInput}
+                    value={multiplierInput}
+                    onChangeText={setMultiplierInput}
+                    keyboardType="numeric"
+                    placeholder="0.70"
+                    placeholderTextColor="#64748B"
+                  />
+
+                  <Text style={styles.inputLabel}>
+                    Daily Step Goal ({MIN_DAILY_STEP_GOAL}–{MAX_DAILY_STEP_GOAL} steps)
+                  </Text>
+                  <TextInput
+                    accessibilityLabel="Daily Step Goal Input"
+                    style={styles.textInput}
+                    value={stepGoalInput}
+                    onChangeText={setStepGoalInput}
+                    keyboardType="numeric"
+                    placeholder="5000"
+                    placeholderTextColor="#64748B"
+                  />
+
+                  {formError ? (
+                    <View style={styles.errorBox}>
+                      <Text style={styles.errorText}>{formError}</Text>
+                    </View>
+                  ) : null}
+
+                  {saveNotice ? (
+                    <View style={styles.successBox}>
+                      <Text style={styles.successText}>✓ {saveNotice}</Text>
+                    </View>
+                  ) : null}
+
+                  <View style={styles.actionRow}>
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel="Save Governance Parameters"
+                      disabled={isSaving}
+                      style={[styles.saveBtn, isSaving ? styles.btnDisabled : null]}
+                      onPress={() => {
+                        void handleSave();
+                      }}
+                    >
+                      <Text style={styles.saveBtnText}>
+                        {isSaving ? "Saving..." : "Save Parameters"}
+                      </Text>
+                    </Pressable>
+
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel="Reset Governance Defaults"
+                      disabled={isSaving}
+                      style={[styles.resetBtn, isSaving ? styles.btnDisabled : null]}
+                      onPress={() => {
+                        void handleReset();
+                      }}
+                    >
+                      <Text style={styles.resetBtnText}>Reset Defaults</Text>
+                    </Pressable>
+                  </View>
+                </View>
+              )}
             </View>
 
             {/* Section 2: On-Chain Contract & RPC Inspector */}
@@ -736,5 +1136,77 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "700",
     color: "#F8FAFC"
+  },
+  lockBadge: {
+    paddingHorizontal: 9,
+    paddingVertical: 4,
+    borderRadius: 999,
+    borderWidth: 1
+  },
+  lockBadgeLocked: {
+    backgroundColor: "#1E293B",
+    borderColor: "#475569"
+  },
+  lockBadgeUnlocked: {
+    backgroundColor: "#052E16",
+    borderColor: "#10B981"
+  },
+  lockBadgeText: {
+    fontSize: 10,
+    fontWeight: "800"
+  },
+  lockBadgeTextLocked: {
+    color: "#CBD5E1"
+  },
+  lockBadgeTextUnlocked: {
+    color: "#34D399"
+  },
+  readOnlyParamList: {
+    backgroundColor: "#0A101D",
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#1E293B",
+    marginBottom: 12,
+    gap: 8
+  },
+  readOnlyParamRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center"
+  },
+  readOnlyParamLabel: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#94A3B8"
+  },
+  readOnlyParamValue: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#F8FAFC"
+  },
+  unlockBox: {
+    backgroundColor: "#0F172A",
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: "#334155"
+  },
+  unlockHint: {
+    fontSize: 11,
+    color: "#94A3B8",
+    lineHeight: 16,
+    marginBottom: 8
+  },
+  unlockBtn: {
+    backgroundColor: "#38BDF8",
+    borderRadius: 10,
+    paddingVertical: 11,
+    alignItems: "center"
+  },
+  unlockBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#082F49"
   }
 });
