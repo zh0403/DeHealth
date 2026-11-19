@@ -12,7 +12,7 @@ import {
   WorkoutProof
 } from "@dehealth/shared";
 import { Signer } from "ethers";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Linking,
   Modal,
@@ -38,8 +38,9 @@ import { L2ServiceMode } from "../services/l2ContractService";
 import {
   getTodayStepCount,
   isPedometerAvailable,
-  StepSource
+  StepCountSource
 } from "../services/sensorService";
+export type { StepCountSource } from "../services/sensorService";
 import {
   getActivePlanCycle,
   getDailyTelemetryCommitment,
@@ -207,18 +208,21 @@ export function toggleExerciseInDailyPlan(
 
 /**
  * Minimum completion gate: a Daily Proof may only be generated once the day has
- * at least one completed exercise, any logged nutrition intake, or step count
- * meeting the configured dailyStepGoal (default 5,000 steps). Prevents
- * signing (and minting against) an empty day.
+ * at least one completed exercise, any logged nutrition intake, or a
+ * hardware-verified step count meeting the configured dailyStepGoal (default
+ * 5,000 steps). Manual step fallback entries are tracked for personal display
+ * only and never unlock step-only Daily Proof signing.
  */
 export function hasMinimumDailyProgress(
   plan: DailyPlan,
   stepCount: number = 0,
-  dailyStepGoal: number = DEFAULT_DAILY_STEP_GOAL
+  dailyStepGoal: number = DEFAULT_DAILY_STEP_GOAL,
+  stepSource: StepCountSource = "manual-fallback"
 ): boolean {
   const hasCompletedExercise = plan.exercises.some((ex) => ex.completed);
   const hasLoggedNutrition = plan.loggedCaloriesKcal > 0;
   const hasMetStepGoal =
+    stepSource === "hardware" &&
     Number.isFinite(stepCount) &&
     Number.isFinite(dailyStepGoal) &&
     dailyStepGoal > 0 &&
@@ -317,10 +321,11 @@ export interface MicroCheckInScreenProps {
   readonly inactivityThresholdHours?: number;
   readonly fatigueScalingMultiplier?: number;
   readonly initialStepCount?: number;
-  readonly initialStepSource?: StepSource;
+  readonly initialStepSource?: StepCountSource;
   readonly initialPedometerAvailable?: boolean;
   readonly onUpdateDailyPlan?: (updatedPlan: DailyPlan) => void;
   readonly onDispatchSignedClaim: (payload: SignedWorkoutClaimPayload) => Promise<void>;
+  readonly onError?: (error: unknown) => void;
   readonly lastTxHash?: string | null;
   readonly lastExplorerUrl?: string | null;
   readonly lastClaimMode?: L2ServiceMode | null;
@@ -349,10 +354,13 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   initialPedometerAvailable,
   onUpdateDailyPlan,
   onDispatchSignedClaim,
+  onError,
   lastTxHash,
   lastExplorerUrl,
   lastClaimMode = null
 }) => {
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
   const fatigueOptions = useMemo(
     () => ({
       inactivityThresholdHours,
@@ -391,7 +399,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   }, [externalDailyPlan, lastLogTimestampMs, fatigueOptions]);
 
   const [pedometerAvailable, setPedometerAvailable] = useState<boolean>(
-    initialPedometerAvailable ?? false
+    initialPedometerAvailable ?? initialStepSource === "hardware"
   );
   const [todaySteps, setTodaySteps] = useState<number>(() =>
     typeof initialStepCount === "number" &&
@@ -400,7 +408,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
       ? Math.round(initialStepCount)
       : 0
   );
-  const [stepSource, setStepSource] = useState<StepSource>(
+  const [stepSource, setStepSource] = useState<StepCountSource>(
     initialStepSource ??
       (initialPedometerAvailable ? "hardware" : "manual-fallback")
   );
@@ -414,6 +422,9 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     )
   );
   const [stepInputError, setStepInputError] = useState<string | null>(null);
+  const [isSyncingSteps, setIsSyncingSteps] = useState<boolean>(false);
+  const [isUpdatingTask, setIsUpdatingTask] = useState<boolean>(false);
+  const isUpdatingTaskRef = useRef<boolean>(false);
 
   useEffect(() => {
     if (
@@ -424,13 +435,23 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     }
     let mounted = true;
     const syncSteps = async (): Promise<void> => {
-      const available = await isPedometerAvailable();
-      const reading = await getTodayStepCount(0);
-      if (!mounted) return;
-      setPedometerAvailable(available);
-      setTodaySteps(reading.steps);
-      setStepSource(reading.source);
-      setManualStepsInput(String(reading.steps));
+      setIsSyncingSteps(true);
+      try {
+        const available = await isPedometerAvailable();
+        const reading = await getTodayStepCount(0);
+        if (!mounted) return;
+        setPedometerAvailable(available);
+        setTodaySteps(reading.steps);
+        setStepSource(reading.source);
+        setManualStepsInput(String(reading.steps));
+      } catch (err: unknown) {
+        if (!mounted) return;
+        setPedometerAvailable(false);
+        setStepSource("manual-fallback");
+        onErrorRef.current?.(err);
+      } finally {
+        setIsSyncingSteps(false);
+      }
     };
     void syncSteps();
     return () => {
@@ -445,6 +466,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   const [loggedMeals, setLoggedMeals] = useState<readonly LoggedMealRecord[]>([]);
 
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const isSubmittingRef = useRef<boolean>(false);
   const [activeCardId, setActiveCardId] = useState<string | null>(null);
   const [statusStep, setStatusStep] = useState<string>(
     "Track meals & tick off exercises to unlock your Daily Proof"
@@ -482,8 +504,9 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   );
 
   const canSignProof = useMemo<boolean>(
-    () => hasMinimumDailyProgress(localPlan, todaySteps, dailyStepGoal),
-    [localPlan, todaySteps, dailyStepGoal]
+    () =>
+      hasMinimumDailyProgress(localPlan, todaySteps, dailyStepGoal, stepSource),
+    [localPlan, todaySteps, dailyStepGoal, stepSource]
   );
 
   const stepGoalProgressPct = useMemo<number>(() => {
@@ -528,60 +551,90 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   };
 
   const handleLogFoodPortion = async (): Promise<void> => {
+    if (isUpdatingTaskRef.current || isUpdatingTask) {
+      return;
+    }
     if (parsedGrams <= 0) {
       setStatusStep("Please enter a valid portion weight in grams (> 0g).");
       return;
     }
 
-    const updatedPlan = addFoodPortionToDailyPlan(
-      localPlan,
-      selectedPreset,
-      parsedGrams
-    );
-    applyPlanUpdate(updatedPlan);
-
-    const newMeal: LoggedMealRecord = {
-      id: `meal_${Date.now()}_${loggedMeals.length + 1}`,
-      presetId: selectedPreset.id,
-      name: selectedPreset.name,
-      grams: parsedGrams,
-      caloriesKcal: scaledPreview.caloriesKcal,
-      proteinGrams: scaledPreview.proteinGrams,
-      carbsGrams: scaledPreview.carbsGrams,
-      fatGrams: scaledPreview.fatGrams
-    };
-    setLoggedMeals((prev) => [newMeal, ...prev]);
-    setStatusStep(
-      `Logged ${parsedGrams}g ${selectedPreset.name} (+${Math.round(scaledPreview.caloriesKcal)} kcal, +${scaledPreview.proteinGrams}g P)`
-    );
-
+    isUpdatingTaskRef.current = true;
+    setIsUpdatingTask(true);
     try {
-      await saveDailyTaskCompletion(localPlan.dayNumber, "nutrition_logged", true);
-    } catch {
-      // Non-fatal in preview environments
+      const updatedPlan = addFoodPortionToDailyPlan(
+        localPlan,
+        selectedPreset,
+        parsedGrams
+      );
+      applyPlanUpdate(updatedPlan);
+
+      const newMeal: LoggedMealRecord = {
+        id: `meal_${Date.now()}_${loggedMeals.length + 1}`,
+        presetId: selectedPreset.id,
+        name: selectedPreset.name,
+        grams: parsedGrams,
+        caloriesKcal: scaledPreview.caloriesKcal,
+        proteinGrams: scaledPreview.proteinGrams,
+        carbsGrams: scaledPreview.carbsGrams,
+        fatGrams: scaledPreview.fatGrams
+      };
+      setLoggedMeals((prev) => [newMeal, ...prev]);
+      setStatusStep(
+        `Logged ${parsedGrams}g ${selectedPreset.name} (+${Math.round(scaledPreview.caloriesKcal)} kcal, +${scaledPreview.proteinGrams}g P)`
+      );
+
+      try {
+        await saveDailyTaskCompletion(localPlan.dayNumber, "nutrition_logged", true);
+      } catch {
+        // Non-fatal in preview environments
+      }
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Failed to log food portion";
+      setStatusStep(`Meal log failed: ${message}`);
+      onErrorRef.current?.(err);
+    } finally {
+      isUpdatingTaskRef.current = false;
+      setIsUpdatingTask(false);
     }
   };
 
   const handleToggleExercise = async (exerciseId: string): Promise<void> => {
-    const updatedPlan = toggleExerciseInDailyPlan(localPlan, exerciseId);
-    applyPlanUpdate(updatedPlan);
+    if (isUpdatingTaskRef.current || isUpdatingTask) {
+      return;
+    }
+    isUpdatingTaskRef.current = true;
+    setIsUpdatingTask(true);
+    try {
+      const updatedPlan = toggleExerciseInDailyPlan(localPlan, exerciseId);
+      applyPlanUpdate(updatedPlan);
 
-    const toggled = updatedPlan.exercises.find((ex) => ex.id === exerciseId);
-    if (toggled) {
-      setStatusStep(
-        toggled.completed
-          ? `Checked off ${toggled.name} (${workoutStats.completedCount + 1}/${workoutStats.totalCount})`
-          : `Unchecked ${toggled.name}`
-      );
-      try {
-        await saveDailyTaskCompletion(
-          localPlan.dayNumber,
-          `exercise_${exerciseId}`,
+      const toggled = updatedPlan.exercises.find((ex) => ex.id === exerciseId);
+      if (toggled) {
+        setStatusStep(
           toggled.completed
+            ? `Checked off ${toggled.name} (${workoutStats.completedCount + 1}/${workoutStats.totalCount})`
+            : `Unchecked ${toggled.name}`
         );
-      } catch {
-        // Non-fatal in preview environments
+        try {
+          await saveDailyTaskCompletion(
+            localPlan.dayNumber,
+            `exercise_${exerciseId}`,
+            toggled.completed
+          );
+        } catch {
+          // Non-fatal in preview environments
+        }
       }
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Failed to update exercise";
+      setStatusStep(`Exercise update failed: ${message}`);
+      onErrorRef.current?.(err);
+    } finally {
+      isUpdatingTaskRef.current = false;
+      setIsUpdatingTask(false);
     }
   };
 
@@ -602,7 +655,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     setStepSource("manual-fallback");
     setStatusStep(
       parsed >= dailyStepGoal
-        ? `Manual step goal met (${parsed} / ${dailyStepGoal} steps) — Daily Proof unlocked!`
+        ? `Manual step goal reached (${parsed} / ${dailyStepGoal} steps) — tracked for personal progress (log a meal or exercise to unlock Daily Proof).`
         : `Updated local step count: ${parsed} / ${dailyStepGoal} steps (on-device only).`
     );
   };
@@ -610,11 +663,14 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   const handleSignAndDispatchProof = async (
     cardOverride?: HabitCardDefinition
   ): Promise<void> => {
-    if (isSubmitting || isProofLocked) return;
-    if (!hasMinimumDailyProgress(localPlan, todaySteps, dailyStepGoal)) {
+    if (isSubmittingRef.current || isSubmitting || isProofLocked) return;
+    if (
+      !hasMinimumDailyProgress(localPlan, todaySteps, dailyStepGoal, stepSource)
+    ) {
       setStatusStep(MINIMUM_PROGRESS_MESSAGE);
       return;
     }
+    isSubmittingRef.current = true;
     setIsSubmitting(true);
     setActiveCardId(cardOverride?.id ?? "dual-track-proof");
     setL2MintSimulation(null);
@@ -728,7 +784,9 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : "Unknown signing error";
       setStatusStep(`Check-in failed: ${message}`);
+      onErrorRef.current?.(err);
     } finally {
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
       setActiveCardId(null);
     }
@@ -986,7 +1044,14 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
           </View>
 
           <Pressable
-            style={styles.logFoodBtn}
+            accessibilityRole="button"
+            accessibilityLabel="Log Food Portion"
+            accessibilityState={{ disabled: isUpdatingTask }}
+            disabled={isUpdatingTask}
+            style={[
+              styles.logFoodBtn,
+              isUpdatingTask ? styles.buttonDisabled : null
+            ]}
             onPress={() => {
               void handleLogFoodPortion();
             }}
@@ -1039,9 +1104,14 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
           return (
             <Pressable
               key={exercise.id}
+              accessibilityRole="button"
+              accessibilityLabel={`Toggle Exercise ${exercise.name}`}
+              accessibilityState={{ disabled: isUpdatingTask }}
+              disabled={isUpdatingTask}
               style={[
                 styles.exerciseRow,
-                exercise.completed ? styles.exerciseRowCompleted : null
+                exercise.completed ? styles.exerciseRowCompleted : null,
+                isUpdatingTask ? styles.buttonDisabled : null
               ]}
               onPress={() => {
                 void handleToggleExercise(exercise.id);
@@ -1089,6 +1159,8 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
             <Text style={styles.trackTitle}>👟 Daily Step Counter</Text>
           </View>
           <View
+            accessibilityLabel="Daily Step Counter Status"
+            accessibilityState={{ busy: isSyncingSteps }}
             style={
               pedometerAvailable && stepSource === "hardware"
                 ? styles.workoutProgressBadge
@@ -1102,9 +1174,11 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
                   : styles.manualStepBadgeText
               }
             >
-              {pedometerAvailable && stepSource === "hardware"
-                ? "Hardware Pedometer"
-                : "Manual Step Fallback"}
+              {isSyncingSteps
+                ? "Syncing steps..."
+                : pedometerAvailable && stepSource === "hardware"
+                  ? "Hardware Pedometer"
+                  : "Manual Step Fallback"}
             </Text>
           </View>
         </View>
@@ -1126,9 +1200,15 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         </View>
 
         {todaySteps >= dailyStepGoal ? (
-          <Text style={styles.stepGoalMetText}>
-            ✓ Daily step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — Daily Proof eligible
-          </Text>
+          stepSource === "hardware" ? (
+            <Text style={styles.stepGoalMetText}>
+              ✓ Daily step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — Daily Proof eligible
+            </Text>
+          ) : (
+            <Text style={styles.stepGoalPersonalText}>
+              ✓ Personal step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — tracked on-device
+            </Text>
+          )
         ) : (
           <Text style={styles.stepSovereigntyHint}>
             Raw step counts stay strictly on-device and never leave to Supabase or L2.
@@ -1136,24 +1216,31 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         )}
 
         {!pedometerAvailable || stepSource === "manual-fallback" ? (
-          <View style={styles.manualStepRow}>
-            <TextInput
-              accessibilityLabel="Manual step count input"
-              style={styles.manualStepInput}
-              value={manualStepsInput}
-              onChangeText={setManualStepsInput}
-              keyboardType="numeric"
-              placeholder="Enter today's steps"
-              placeholderTextColor="#64748B"
-            />
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Apply Manual Steps"
-              style={styles.applyStepsBtn}
-              onPress={handleApplyManualSteps}
-            >
-              <Text style={styles.applyStepsBtnText}>Apply Steps</Text>
-            </Pressable>
+          <View>
+            <View style={styles.manualProgressBadge}>
+              <Text style={styles.manualProgressBadgeText}>
+                Manual entry tracked for personal progress (hardware pedometer required for step-only proof unlock)
+              </Text>
+            </View>
+            <View style={styles.manualStepRow}>
+              <TextInput
+                accessibilityLabel="Manual step count input"
+                style={styles.manualStepInput}
+                value={manualStepsInput}
+                onChangeText={setManualStepsInput}
+                keyboardType="numeric"
+                placeholder="Enter today's steps"
+                placeholderTextColor="#64748B"
+              />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Apply Manual Steps"
+                style={styles.applyStepsBtn}
+                onPress={handleApplyManualSteps}
+              >
+                <Text style={styles.applyStepsBtnText}>Apply Steps</Text>
+              </Pressable>
+            </View>
           </View>
         ) : null}
 
@@ -1878,6 +1965,27 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     color: "#34D399",
     marginBottom: 8
+  },
+  stepGoalPersonalText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#38BDF8",
+    marginBottom: 8
+  },
+  manualProgressBadge: {
+    backgroundColor: "#0F172A",
+    borderWidth: 1,
+    borderColor: "#334155",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    marginBottom: 8
+  },
+  manualProgressBadgeText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "#CBD5E1",
+    lineHeight: 16
   },
   stepSovereigntyHint: {
     fontSize: 11,

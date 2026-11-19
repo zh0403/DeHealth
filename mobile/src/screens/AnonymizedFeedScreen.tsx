@@ -1,5 +1,5 @@
 import { AnonymizedFeedRecord } from "@dehealth/shared";
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import {
   FlatList,
   Pressable,
@@ -11,7 +11,8 @@ import {
 export interface AnonymizedFeedScreenProps {
   readonly items: readonly AnonymizedFeedRecord[];
   readonly cheerCountsByFeedId?: Readonly<Record<string, number>>;
-  readonly onCheer?: (feedId: string) => void;
+  readonly onCheer?: (feedId: string) => void | Promise<void>;
+  readonly onError?: (error: unknown) => void;
 }
 
 const AVATAR_PALETTE = [
@@ -26,16 +27,45 @@ const AVATAR_PALETTE = [
 export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
   items,
   cheerCountsByFeedId = {},
-  onCheer
+  onCheer,
+  onError
 }) => {
   const [cheeredMap, setCheeredMap] = useState<Readonly<Record<string, boolean>>>({});
+  const [submittingFeedIds, setSubmittingFeedIds] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
+  const submittingFeedIdsRef = useRef<Record<string, boolean>>({});
 
-  const handleCheerPress = (feedId: string) => {
+  const handleCheerPress = async (feedId: string): Promise<void> => {
+    if (submittingFeedIdsRef.current[feedId] || submittingFeedIds[feedId]) {
+      return;
+    }
+    submittingFeedIdsRef.current[feedId] = true;
+    const wasAlreadyCheered = Boolean(cheeredMap[feedId]);
+    setSubmittingFeedIds((prev) => ({
+      ...prev,
+      [feedId]: true
+    }));
     setCheeredMap((prev) => ({
       ...prev,
       [feedId]: true
     }));
-    onCheer?.(feedId);
+
+    try {
+      await Promise.resolve(onCheer?.(feedId));
+    } catch (err: unknown) {
+      setCheeredMap((prev) => ({
+        ...prev,
+        [feedId]: wasAlreadyCheered
+      }));
+      onError?.(err);
+    } finally {
+      submittingFeedIdsRef.current[feedId] = false;
+      setSubmittingFeedIds((prev) => ({
+        ...prev,
+        [feedId]: false
+      }));
+    }
   };
 
   const getAvatarMeta = (pseudonym: string) => {
@@ -76,6 +106,7 @@ export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
         renderItem={({ item }) => {
           const cheerCount = cheerCountsByFeedId[item.id] ?? 0;
           const isCheered = cheeredMap[item.id] ?? false;
+          const isSubmitting = Boolean(submittingFeedIds[item.id]);
           const avatar = getAvatarMeta(item.user_pseudonym);
 
           return (
@@ -136,12 +167,17 @@ export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Cheer for @${item.user_pseudonym}`}
+                  accessibilityState={{ disabled: isSubmitting }}
+                  disabled={isSubmitting}
                   style={({ pressed }) => [
                     styles.cheerButton,
                     isCheered ? styles.cheerButtonActive : null,
+                    isSubmitting ? styles.cheerButtonDisabled : null,
                     pressed ? styles.buttonPressed : null
                   ]}
-                  onPress={() => handleCheerPress(item.id)}
+                  onPress={() => {
+                    void handleCheerPress(item.id);
+                  }}
                 >
                   <Text style={styles.cheerEmoji}>
                     {isCheered ? "🎉" : "👏"}
@@ -335,6 +371,9 @@ const styles = StyleSheet.create({
   cheerButtonActive: {
     backgroundColor: "rgba(56, 189, 248, 0.15)",
     borderColor: "#38BDF8"
+  },
+  cheerButtonDisabled: {
+    opacity: 0.6
   },
   buttonPressed: {
     opacity: 0.75

@@ -12,6 +12,7 @@ import {
   getBytes,
   JsonRpcProvider,
   keccak256,
+  parseEther,
   Provider,
   Signer,
   toUtf8Bytes
@@ -89,21 +90,68 @@ export interface ClaimStreakRewardResult {
   readonly mode: L2ServiceMode;
 }
 
+export const MIN_FALLBACK_GAS_BALANCE_WEI: bigint = parseEther("0.0001");
+
+export const DEFAULT_INSUFFICIENT_GAS_MESSAGE =
+  "Insufficient Arbitrum Sepolia ETH for gas. Copy your wallet address and fund testnet ETH.";
+
+export interface InsufficientGasErrorDetails {
+  readonly signerAddress?: Address;
+  readonly balanceWei?: bigint;
+  readonly requiredWei?: bigint;
+}
+
+export class InsufficientGasError extends Error {
+  readonly signerAddress?: Address;
+  readonly balanceWei?: bigint;
+  readonly requiredWei?: bigint;
+
+  constructor(
+    message: string = DEFAULT_INSUFFICIENT_GAS_MESSAGE,
+    details?: InsufficientGasErrorDetails
+  ) {
+    super(message);
+    this.name = "InsufficientGasError";
+    Object.setPrototypeOf(this, new.target.prototype);
+    if (details?.signerAddress !== undefined) {
+      this.signerAddress = details.signerAddress;
+    }
+    if (details?.balanceWei !== undefined) {
+      this.balanceWei = details.balanceWei;
+    }
+    if (details?.requiredWei !== undefined) {
+      this.requiredWei = details.requiredWei;
+    }
+  }
+}
+
+export interface RewardGateProofArg {
+  readonly user: Address;
+  readonly telemetryHash: Bytes32;
+  readonly streakCount: bigint;
+  readonly nonce: bigint;
+  readonly deadline: bigint;
+}
+
+export interface RewardGateClaimTxResponse {
+  readonly hash: string;
+  readonly wait: () => Promise<{ readonly hash?: string; readonly status?: number } | null>;
+}
+
+export interface RewardGateClaimMethod {
+  (
+    proof: RewardGateProofArg,
+    signature: string
+  ): Promise<RewardGateClaimTxResponse>;
+  estimateGas?: (
+    proof: RewardGateProofArg,
+    signature: string
+  ) => Promise<bigint>;
+}
+
 export interface RewardGateContractMethods {
   nonces(user: Address): Promise<bigint | number | string>;
-  claimStreakReward(
-    proof: {
-      user: Address;
-      telemetryHash: Bytes32;
-      streakCount: bigint;
-      nonce: bigint;
-      deadline: bigint;
-    },
-    signature: string
-  ): Promise<{
-    readonly hash: string;
-    readonly wait: () => Promise<{ readonly hash?: string; readonly status?: number } | null>;
-  }>;
+  claimStreakReward: RewardGateClaimMethod;
 }
 
 export interface TokenContractMethods {
@@ -429,13 +477,78 @@ export async function claimStreakReward(
 
     const gateContract = getRewardGateContract(gateAddress, effectiveSigner);
 
-    const proofStruct = {
+    const proofStruct: RewardGateProofArg = {
       user: payload.proof.user,
       telemetryHash: payload.proof.telemetryHash,
       streakCount: payload.proof.streakCount,
       nonce: payload.proof.nonce,
       deadline: payload.proof.deadline
     };
+
+    const signerAddress = (await effectiveSigner.getAddress()) as Address;
+    const claimFn = gateContract.claimStreakReward;
+
+    if (provider && typeof provider.getBalance === "function") {
+      const balanceWei = BigInt(await provider.getBalance(signerAddress));
+      let requiredWei = MIN_FALLBACK_GAS_BALANCE_WEI;
+
+      if (typeof claimFn.estimateGas === "function") {
+        try {
+          const estimatedGas = BigInt(
+            await claimFn.estimateGas(proofStruct, payload.signature)
+          );
+          if (estimatedGas > 0n && typeof provider.getFeeData === "function") {
+            const feeData = await provider.getFeeData();
+            const maxFee = feeData?.maxFeePerGas;
+            const legacyGasPrice = feeData?.gasPrice;
+            const gasPrice =
+              maxFee !== null && maxFee !== undefined && maxFee > 0n
+                ? maxFee
+                : (legacyGasPrice ?? 0n);
+            const estimatedCostWei = estimatedGas * gasPrice;
+            if (estimatedCostWei > requiredWei) {
+              requiredWei = estimatedCostWei;
+            }
+          }
+        } catch (estErr: unknown) {
+          const estMsg =
+            estErr instanceof Error ? estErr.message : String(estErr);
+          const isInsufficientFunds =
+            (typeof estErr === "object" &&
+              estErr !== null &&
+              "code" in estErr &&
+              (estErr as { readonly code?: unknown }).code ===
+                "INSUFFICIENT_FUNDS") ||
+            /insufficient\s+funds|not\s+enough\s+funds/i.test(estMsg);
+
+          if (balanceWei < MIN_FALLBACK_GAS_BALANCE_WEI || isInsufficientFunds) {
+            const details: InsufficientGasErrorDetails =
+              balanceWei < MIN_FALLBACK_GAS_BALANCE_WEI
+                ? {
+                    signerAddress,
+                    balanceWei,
+                    requiredWei: MIN_FALLBACK_GAS_BALANCE_WEI
+                  }
+                : {
+                    signerAddress,
+                    balanceWei
+                  };
+            throw new InsufficientGasError(
+              DEFAULT_INSUFFICIENT_GAS_MESSAGE,
+              details
+            );
+          }
+        }
+      }
+
+      if (balanceWei < requiredWei) {
+        throw new InsufficientGasError(DEFAULT_INSUFFICIENT_GAS_MESSAGE, {
+          signerAddress,
+          balanceWei,
+          requiredWei
+        });
+      }
+    }
 
     const tx = await gateContract.claimStreakReward(
       proofStruct,

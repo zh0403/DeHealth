@@ -1,4 +1,5 @@
 export type StepSource = "hardware" | "manual-fallback";
+export type StepCountSource = StepSource;
 
 export interface TodayStepCountResult {
   readonly steps: number;

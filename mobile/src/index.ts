@@ -17,3 +17,4 @@ export * from "./components/StreakFlameHeader";
 export * from "./components/RewardPerksDrawer";
 export * from "./components/PlanReviewModal";
 export * from "./components/AdminGovernanceModal";
+export * from "./components/ErrorNoticeModal";
