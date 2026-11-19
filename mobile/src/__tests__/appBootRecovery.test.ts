@@ -83,11 +83,19 @@ vi.mock("react-native", () => ({
 }));
 
 import {
+  deriveLiveMetricsFromVault,
   hydrateVaultData,
   resetVaultAndRecover,
   VaultBootGate,
   VaultHydrationDeps
 } from "../../App";
+import {
+  ErrorNoticeModal,
+  InsufficientGasError,
+  toErrorNoticePayload
+} from "../index";
+import { generate14DayPlan } from "../services/adaptivePlanEngine";
+import { makeDailyProofSignedKey } from "../storage/adaptiveStorage";
 import {
   ADAPTIVE_STORAGE_KEYS,
   AdaptiveStorage,
@@ -343,6 +351,43 @@ describe("App boot hydration error surface and vault reset recovery", () => {
       expect(recovered.persistentWallet).toBeInstanceOf(Wallet);
       expect(recovered.storedBio).toBeNull();
       expect(recovered.governanceConfig).toEqual(DEFAULT_GOVERNANCE_CONFIG);
+    });
+  });
+
+  describe("deriveLiveMetricsFromVault and barrel exports", () => {
+    it("derives zero streak, 0.0 DHT balance, and null lastLogTimestampMs on a fresh cycle without mock defaults", () => {
+      const startMs = Date.UTC(2026, 10, 10, 8, 0, 0);
+      const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, startMs);
+
+      const metrics = deriveLiveMetricsFromVault(cycle, {}, startMs);
+      expect(metrics.streakCount).toBe(0);
+      expect(metrics.fallbackBalanceDht).toBe("0.0");
+      expect(metrics.lastLogTimestampMs).toBeNull();
+    });
+
+    it("derives live streak, DHT balance, and latest signed day timestamp from proofSignedMap", () => {
+      const startMs = Date.UTC(2026, 10, 10, 8, 0, 0);
+      const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, startMs);
+      const day2NowMs = startMs + 2 * 24 * 60 * 60 * 1000;
+
+      const signedMap: Record<string, boolean> = {
+        [makeDailyProofSignedKey(cycle.id, 0)]: true,
+        [makeDailyProofSignedKey(cycle.id, 1)]: true,
+        [makeDailyProofSignedKey(cycle.id, 2)]: true
+      };
+
+      const metrics = deriveLiveMetricsFromVault(cycle, signedMap, day2NowMs);
+      expect(metrics.streakCount).toBe(3);
+      expect(metrics.fallbackBalanceDht).toBe("30.0");
+      expect(metrics.lastLogTimestampMs).toBe(
+        Date.parse(`${cycle.dailyPlans[2]!.date}T00:00:00.000Z`)
+      );
+    });
+
+    it("exports ErrorNoticeModal, toErrorNoticePayload, and InsufficientGasError from mobile/src/index.ts", () => {
+      expect(typeof ErrorNoticeModal).toBe("function");
+      expect(typeof toErrorNoticePayload).toBe("function");
+      expect(typeof InsufficientGasError).toBe("function");
     });
   });
 });

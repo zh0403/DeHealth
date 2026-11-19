@@ -1,10 +1,11 @@
 import { Address, Bytes32, SignedWorkoutClaimPayload, WorkoutProof } from "@dehealth/shared";
-import { Signer, Wallet, parseEther } from "ethers";
+import { Provider, Signer, Wallet, parseEther } from "ethers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { signWorkoutProof } from "../services/cryptoService";
 import {
   ARBISCAN_SEPOLIA_BASE_URL,
   claimStreakReward,
+  DEFAULT_INSUFFICIENT_GAS_MESSAGE,
   DEMO_VERIFYING_CONTRACT,
   fetchOnChainNonce,
   fetchTokenBalance,
@@ -12,7 +13,9 @@ import {
   getL2Provider,
   getRewardGateAddress,
   getTokenAddress,
+  InsufficientGasError,
   isL2Configured,
+  MIN_FALLBACK_GAS_BALANCE_WEI,
   resetL2Config,
   setContractFactory,
   setL2Provider,
@@ -442,6 +445,292 @@ describe("Milestone 3 R4: L2 Contract Service Unit Test Suite", () => {
       await expect(claimStreakReward(tamperedPayload)).rejects.toThrow(
         "Local EIP-712 signature verification failed"
       );
+    });
+  });
+
+  // ============================================================================
+  // 8. claimStreakReward: Gas & Balance Pre-Check (R1 / #6)
+  // ============================================================================
+  describe("claimStreakReward - Gas & Balance Pre-Check", () => {
+    async function makeLiveSignedPayload(nonce = 4n): Promise<SignedWorkoutClaimPayload> {
+      const proof: WorkoutProof = {
+        user: testWallet.address as Address,
+        telemetryHash:
+          "0x2424242424242424242424242424242424242424242424242424242424242424" as Bytes32,
+        streakCount: 6n,
+        nonce,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+      };
+      return signWorkoutProof(testWallet, proof, TEST_GATE_ADDRESS);
+    }
+
+    it("rejects with InsufficientGasError before broadcast when balance is 0 ETH or < 0.0001 ETH", async () => {
+      expect(MIN_FALLBACK_GAS_BALANCE_WEI).toBe(parseEther("0.0001"));
+
+      for (const lowBalance of [0n, parseEther("0.00009")]) {
+        const mockProvider = {
+          getBalance: vi.fn().mockResolvedValue(lowBalance)
+        } as unknown as Provider;
+        setL2Provider(mockProvider);
+        setRewardGateAddress(TEST_GATE_ADDRESS);
+
+        const claimMock = vi.fn();
+        setContractFactory(() => ({
+          claimStreakReward: claimMock
+        }));
+
+        const payload = await makeLiveSignedPayload(10n);
+
+        let caught: unknown;
+        try {
+          await claimStreakReward(payload, testWallet);
+        } catch (err: unknown) {
+          caught = err;
+        }
+
+        expect(caught).toBeInstanceOf(InsufficientGasError);
+        const gasErr = caught as InsufficientGasError;
+        expect(gasErr.name).toBe("InsufficientGasError");
+        expect(gasErr.message).toBe(DEFAULT_INSUFFICIENT_GAS_MESSAGE);
+        expect(gasErr.signerAddress).toBe(testWallet.address);
+        expect(gasErr.balanceWei).toBe(lowBalance);
+        expect(gasErr.requiredWei).toBe(MIN_FALLBACK_GAS_BALANCE_WEI);
+        expect(claimMock).not.toHaveBeenCalled();
+      }
+    });
+
+    it("rejects with InsufficientGasError when balance >= 0.0001 ETH but < estimateGas * maxFeePerGas", async () => {
+      const balanceWei = parseEther("0.00015");
+      const mockProvider = {
+        getBalance: vi.fn().mockResolvedValue(balanceWei),
+        getFeeData: vi.fn().mockResolvedValue({
+          maxFeePerGas: 1_000_000_000n,
+          gasPrice: 500_000_000n
+        })
+      } as unknown as Provider;
+      setL2Provider(mockProvider);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+
+      const claimFn = Object.assign(vi.fn(), {
+        estimateGas: vi.fn().mockResolvedValue(200_000n)
+      });
+      setContractFactory(() => ({
+        claimStreakReward: claimFn
+      }));
+
+      const payload = await makeLiveSignedPayload(11n);
+
+      let caught: unknown;
+      try {
+        await claimStreakReward(payload, testWallet);
+      } catch (err: unknown) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(InsufficientGasError);
+      const gasErr = caught as InsufficientGasError;
+      expect(gasErr.signerAddress).toBe(testWallet.address);
+      expect(gasErr.balanceWei).toBe(balanceWei);
+      expect(gasErr.requiredWei).toBe(parseEther("0.0002"));
+      expect(claimFn).not.toHaveBeenCalled();
+    });
+
+    it("uses legacy gasPrice when maxFeePerGas is null and rejects if balance < estimateGas * gasPrice", async () => {
+      const balanceWei = parseEther("0.00012");
+      const mockProvider = {
+        getBalance: vi.fn().mockResolvedValue(balanceWei),
+        getFeeData: vi.fn().mockResolvedValue({
+          maxFeePerGas: null,
+          gasPrice: 1_000_000_000n
+        })
+      } as unknown as Provider;
+      setL2Provider(mockProvider);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+
+      const claimFn = Object.assign(vi.fn(), {
+        estimateGas: vi.fn().mockResolvedValue(180_000n)
+      });
+      setContractFactory(() => ({
+        claimStreakReward: claimFn
+      }));
+
+      const payload = await makeLiveSignedPayload(12n);
+
+      let caught: unknown;
+      try {
+        await claimStreakReward(payload, testWallet);
+      } catch (err: unknown) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(InsufficientGasError);
+      const gasErr = caught as InsufficientGasError;
+      expect(gasErr.balanceWei).toBe(balanceWei);
+      expect(gasErr.requiredWei).toBe(parseEther("0.00018"));
+      expect(claimFn).not.toHaveBeenCalled();
+    });
+
+    it("passes at exact 0.0001 ETH boundary both with affordable estimateGas and without estimateGas", async () => {
+      const mockTxHash =
+        "0x9999999999999999999999999999999999999999999999999999999999999999";
+
+      // Case 1: With estimateGas returning cost <= 0.0001 ETH
+      const providerWithEstimate = {
+        getBalance: vi.fn().mockResolvedValue(MIN_FALLBACK_GAS_BALANCE_WEI),
+        getFeeData: vi.fn().mockResolvedValue({
+          maxFeePerGas: 500_000_000n,
+          gasPrice: 500_000_000n
+        })
+      } as unknown as Provider;
+      setL2Provider(providerWithEstimate);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+
+      const claimWithEstimate = Object.assign(
+        vi.fn().mockResolvedValue({
+          hash: mockTxHash,
+          wait: vi.fn().mockResolvedValue({ hash: mockTxHash, status: 1 })
+        }),
+        {
+          estimateGas: vi.fn().mockResolvedValue(100_000n) // 0.00005 ETH
+        }
+      );
+      setContractFactory(() => ({
+        claimStreakReward: claimWithEstimate
+      }));
+
+      const payload1 = await makeLiveSignedPayload(13n);
+      const result1 = await claimStreakReward(payload1, testWallet);
+      expect(result1.mode).toBe("live");
+      expect(result1.txHash).toBe(mockTxHash);
+      expect(result1.explorerUrl).toBe(`${ARBISCAN_SEPOLIA_BASE_URL}/${mockTxHash}`);
+      expect(claimWithEstimate).toHaveBeenCalledTimes(1);
+
+      // Case 2: Without estimateGas at exact 0.0001 ETH
+      const providerFallbackOnly = {
+        getBalance: vi.fn().mockResolvedValue(MIN_FALLBACK_GAS_BALANCE_WEI)
+      } as unknown as Provider;
+      setL2Provider(providerFallbackOnly);
+
+      const plainClaimMock = vi.fn().mockResolvedValue({
+        hash: mockTxHash,
+        wait: vi.fn().mockResolvedValue({ hash: mockTxHash, status: 1 })
+      });
+      setContractFactory(() => ({
+        claimStreakReward: plainClaimMock
+      }));
+
+      const payload2 = await makeLiveSignedPayload(14n);
+      const result2 = await claimStreakReward(payload2, testWallet);
+      expect(result2.mode).toBe("live");
+      expect(plainClaimMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("handles estimateGas failures: rejects low balance or INSUFFICIENT_FUNDS, falls back on transient RPC error, and preserves contract reverts", async () => {
+      const mockTxHash =
+        "0xabababababababababababababababababababababababababababababababab";
+
+      // Subcase A: low balance (< 0.0001 ETH) + generic estimateGas timeout -> InsufficientGasError
+      setL2Provider({
+        getBalance: vi.fn().mockResolvedValue(parseEther("0.00005"))
+      } as unknown as Provider);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+      const claimLow = Object.assign(vi.fn(), {
+        estimateGas: vi.fn().mockRejectedValue(new Error("RPC estimateGas timeout"))
+      });
+      setContractFactory(() => ({ claimStreakReward: claimLow }));
+      await expect(
+        claimStreakReward(await makeLiveSignedPayload(15n), testWallet)
+      ).rejects.toBeInstanceOf(InsufficientGasError);
+      expect(claimLow).not.toHaveBeenCalled();
+
+      // Subcase B: sufficient balance (>= 0.0001 ETH) + generic estimateGas error -> fallback passes
+      setL2Provider({
+        getBalance: vi.fn().mockResolvedValue(parseEther("0.0001"))
+      } as unknown as Provider);
+      const claimFallback = Object.assign(
+        vi.fn().mockResolvedValue({
+          hash: mockTxHash,
+          wait: vi.fn().mockResolvedValue({ hash: mockTxHash, status: 1 })
+        }),
+        {
+          estimateGas: vi.fn().mockRejectedValue(new Error("RPC estimateGas unsupported"))
+        }
+      );
+      setContractFactory(() => ({ claimStreakReward: claimFallback }));
+      const resB = await claimStreakReward(await makeLiveSignedPayload(16n), testWallet);
+      expect(resB.mode).toBe("live");
+      expect(claimFallback).toHaveBeenCalledTimes(1);
+
+      // Subcase C: sufficient balance (>= 0.0001 ETH) + estimateGas insufficient funds -> InsufficientGasError
+      setL2Provider({
+        getBalance: vi.fn().mockResolvedValue(parseEther("0.0002"))
+      } as unknown as Provider);
+      const claimInsufficientMsg = Object.assign(vi.fn(), {
+        estimateGas: vi
+          .fn()
+          .mockRejectedValue(new Error("insufficient funds for gas * price + value"))
+      });
+      setContractFactory(() => ({ claimStreakReward: claimInsufficientMsg }));
+      let errC: unknown;
+      try {
+        await claimStreakReward(await makeLiveSignedPayload(17n), testWallet);
+      } catch (err: unknown) {
+        errC = err;
+      }
+      expect(errC).toBeInstanceOf(InsufficientGasError);
+      expect((errC as InsufficientGasError).requiredWei).toBeUndefined();
+      expect(claimInsufficientMsg).not.toHaveBeenCalled();
+
+      // Subcase D: balance = 1 ETH + estimateGas contract revert -> surfaces genuine revert
+      setL2Provider({
+        getBalance: vi.fn().mockResolvedValue(parseEther("1.0"))
+      } as unknown as Provider);
+      const revertErr = new Error("execution reverted: SignatureReplay");
+      const claimRevert = Object.assign(vi.fn().mockRejectedValue(revertErr), {
+        estimateGas: vi.fn().mockRejectedValue(revertErr)
+      });
+      setContractFactory(() => ({ claimStreakReward: claimRevert }));
+      await expect(
+        claimStreakReward(await makeLiveSignedPayload(18n), testWallet)
+      ).rejects.toThrow("SignatureReplay");
+    });
+
+    it("bypasses gas check in local-fallback mode and remains compatible with {} mock providers", async () => {
+      // local-fallback mode (unconfigured)
+      resetL2Config();
+      const proof: WorkoutProof = {
+        user: testWallet.address as Address,
+        telemetryHash:
+          "0x3434343434343434343434343434343434343434343434343434343434343434" as Bytes32,
+        streakCount: 1n,
+        nonce: 0n,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+      };
+      const fallbackPayload = await signWorkoutProof(
+        testWallet,
+        proof,
+        DEMO_VERIFYING_CONTRACT
+      );
+      const fallbackRes = await claimStreakReward(fallbackPayload, testWallet);
+      expect(fallbackRes.mode).toBe("local-fallback");
+      expect(fallbackRes.explorerUrl).toBeNull();
+
+      // {} mock provider without getBalance or estimateGas
+      setL2Provider({} as unknown as Provider);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+      const mockTxHash =
+        "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+      const claimMock = vi.fn().mockResolvedValue({
+        hash: mockTxHash,
+        wait: vi.fn().mockResolvedValue({ hash: mockTxHash, status: 1 })
+      });
+      setContractFactory(() => ({ claimStreakReward: claimMock }));
+      const liveRes = await claimStreakReward(
+        await makeLiveSignedPayload(19n),
+        testWallet
+      );
+      expect(liveRes.mode).toBe("live");
+      expect(claimMock).toHaveBeenCalledTimes(1);
     });
   });
 });
