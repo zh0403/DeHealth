@@ -27,7 +27,8 @@ export const ADAPTIVE_STORAGE_KEYS = {
   PLAN_HISTORY: "@dehealth/plan_history",
   DAILY_COMPLETION_STATE: "@dehealth/daily_completion_state",
   TELEMETRY_SALTS: "@dehealth/telemetry_salts",
-  DAILY_TELEMETRY_COMMITMENTS: "@dehealth/daily_telemetry_commitments"
+  DAILY_TELEMETRY_COMMITMENTS: "@dehealth/daily_telemetry_commitments",
+  LAST_LOG_TIMESTAMP_MS: "@dehealth/last_log_timestamp_ms"
 } as const;
 
 export const STORAGE_KEYS = ADAPTIVE_STORAGE_KEYS;
@@ -382,6 +383,38 @@ export class AdaptiveStorage {
   }
 
   /**
+   * Persists the epoch timestamp (ms) of the most recent completed/signed workout log.
+   * Rejects non-finite or non-positive values before encryption.
+   */
+  async saveLastLogTimestampMs(timestampMs: number): Promise<void> {
+    if (
+      typeof timestampMs !== "number" ||
+      !Number.isFinite(timestampMs) ||
+      timestampMs <= 0
+    ) {
+      throw new Error("lastLogTimestampMs must be a positive finite number");
+    }
+    await this.adapter.setEncryptedItem(
+      ADAPTIVE_STORAGE_KEYS.LAST_LOG_TIMESTAMP_MS,
+      timestampMs
+    );
+  }
+
+  /**
+   * Retrieves the persisted last workout log timestamp (ms), or null if unset
+   * or if the stored payload fails validation. MAC/envelope tampering throws.
+   */
+  async getLastLogTimestampMs(): Promise<number | null> {
+    const raw = await this.adapter.getEncryptedItem<unknown>(
+      ADAPTIVE_STORAGE_KEYS.LAST_LOG_TIMESTAMP_MS
+    );
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) {
+      return null;
+    }
+    return raw;
+  }
+
+  /**
    * Completely removes all adaptive storage keys, resetting local state.
    */
   async clearAllAdaptiveData(): Promise<void> {
@@ -565,6 +598,14 @@ export async function getDailyTelemetryCommitment(
   dayIndex: number
 ): Promise<Bytes32 | null> {
   return (await resolveStorage()).getDailyTelemetryCommitment(cycleId, dayIndex);
+}
+
+export async function saveLastLogTimestampMs(timestampMs: number): Promise<void> {
+  return (await resolveStorage()).saveLastLogTimestampMs(timestampMs);
+}
+
+export async function getLastLogTimestampMs(): Promise<number | null> {
+  return (await resolveStorage()).getLastLogTimestampMs();
 }
 
 /**

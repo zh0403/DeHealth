@@ -8,7 +8,7 @@ import {
   WeightLogEntry,
   WeightLogEntrySchema
 } from "@dehealth/shared";
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   Linking,
   Modal,
@@ -24,15 +24,20 @@ import {
 } from "../components/AdminGovernanceModal";
 import {
   applyApprovedPlanReview,
-  isBiWeeklyReviewDue,
   keepCurrentPlanOnReview,
   PlanReviewModal
 } from "../components/PlanReviewModal";
 import {
+  buildSevenDayCadence,
+  CadenceDayPill,
   calculateAdherencePct,
-  calculateRollingWeightAverage,
+  computeRollingWeightAverage,
   evaluateBiWeeklyReview,
-  generate14DayPlan
+  evaluateWeighInAdaptation,
+  generate14DayPlan,
+  getActiveDayIndex,
+  isCycleBiWeeklyReviewDue,
+  WeighInAdaptationProjection
 } from "../services/adaptivePlanEngine";
 import {
   L2InspectorStatus,
@@ -40,6 +45,7 @@ import {
 } from "../services/l2ContractService";
 import { DailyTargetAssessment } from "../services/profileEngine";
 import {
+  makeDailyProofSignedKey,
   saveActivePlanCycle,
   saveWeightLog
 } from "../storage/adaptiveStorage";
@@ -157,21 +163,9 @@ export interface DashboardScreenProps {
   readonly initialGovernanceModalOpen?: boolean;
   readonly initialInspectorStatus?: L2InspectorStatus | null;
   readonly loadInspectorStatus?: (userAddress: Address) => Promise<L2InspectorStatus>;
+  readonly proofSignedMap?: Readonly<Record<string, boolean>>;
+  readonly onError?: (error: unknown) => void;
 }
-
-const WEEK_DAYS: ReadonlyArray<{
-  readonly day: string;
-  readonly completed: boolean;
-  readonly isToday?: boolean;
-}> = [
-  { day: "Mon", completed: true },
-  { day: "Tue", completed: true },
-  { day: "Wed", completed: true },
-  { day: "Thu", completed: true },
-  { day: "Fri", completed: true },
-  { day: "Sat", completed: false },
-  { day: "Sun", completed: true, isToday: true }
-];
 
 export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   streakCount,
@@ -195,8 +189,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onUpdateGovernanceConfig,
   initialGovernanceModalOpen = false,
   initialInspectorStatus = null,
-  loadInspectorStatus
+  loadInspectorStatus,
+  proofSignedMap = {},
+  onError
 }) => {
+  const onErrorRef = useRef(onError);
+  onErrorRef.current = onError;
   const isLiveClaim = lastClaimMode === "live";
   const [localGovernanceConfig, setLocalGovernanceConfig] =
     useState<GovernanceConfig>(
@@ -207,30 +205,19 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const [isGovernanceModalOpen, setIsGovernanceModalOpen] = useState<boolean>(
     initialGovernanceModalOpen
   );
+  const initialTimestampRef = useRef<number>(currentTimestampMs ?? Date.now());
   const defaultCycle = useMemo<AdaptivePlanCycle>(() => {
-    const fifteenDaysAgo = Date.now() - 15 * 24 * 60 * 60 * 1000;
-    return generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, fifteenDaysAgo);
+    return generate14DayPlan(
+      DEFAULT_BASELINE_BIOMETRICS,
+      initialTimestampRef.current
+    );
   }, []);
 
   const [localCycle, setLocalCycle] = useState<AdaptivePlanCycle>(
     externalCycle ?? defaultCycle
   );
   const [localWeightLogs, setLocalWeightLogs] = useState<readonly WeightLogEntry[]>(
-    externalWeightLogs ?? [
-      {
-        id: "wlog_initial",
-        timestampMs: Date.now() - 14 * 24 * 60 * 60 * 1000,
-        weightKg: 70.0,
-        bodyFatPct: 18.5,
-        note: "Cycle 1 baseline"
-      },
-      {
-        id: "wlog_mid",
-        timestampMs: Date.now() - 7 * 24 * 60 * 60 * 1000,
-        weightKg: 69.6,
-        bodyFatPct: 18.2
-      }
-    ]
+    externalWeightLogs ?? []
   );
 
   const effectiveCycle = externalCycle ?? localCycle;
@@ -239,39 +226,69 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const adherencePct =
     adherencePctProp ?? calculateAdherencePct(effectiveCycle, nowMs);
 
+  const activeDayIndex = useMemo<number>(
+    () => getActiveDayIndex(effectiveCycle.startDateMs, nowMs),
+    [effectiveCycle.startDateMs, nowMs]
+  );
+
+  const effectiveTodayPlan = useMemo<DailyPlan | undefined>(
+    () => todayPlan ?? effectiveCycle.dailyPlans[activeDayIndex],
+    [todayPlan, effectiveCycle.dailyPlans, activeDayIndex]
+  );
+
   const ringProgress = useMemo<{ readonly pct: number; readonly label: string }>(() => {
-    if (!todayPlan) {
+    if (!effectiveTodayPlan) {
       return { pct: 0, label: "No plan today" };
     }
-    if (todayPlan.completed) {
+    const dayIdx = Math.max(0, effectiveTodayPlan.dayNumber - 1);
+    const isProofSignedToday = Boolean(
+      effectiveCycle.id.trim().length > 0 &&
+        proofSignedMap[makeDailyProofSignedKey(effectiveCycle.id, dayIdx)]
+    );
+    if (effectiveTodayPlan.completed || isProofSignedToday) {
       return { pct: 100, label: "Ring Closed" };
     }
-    const total = todayPlan.exercises.length;
-    const done = todayPlan.exercises.filter((ex) => ex.completed).length;
+    const total = effectiveTodayPlan.exercises.length;
+    const done = effectiveTodayPlan.exercises.filter((ex) => ex.completed).length;
     return {
       pct: total === 0 ? 0 : Math.round((done / total) * 100),
-      label: `Day ${todayPlan.dayNumber} of 14`
+      label: `Day ${effectiveTodayPlan.dayNumber} of 14`
     };
-  }, [todayPlan]);
+  }, [effectiveTodayPlan, effectiveCycle.id, proofSignedMap]);
+
+  const sortedWeightLogs = useMemo<readonly WeightLogEntry[]>(() => {
+    return [...effectiveWeightLogs].sort(
+      (a, b) => a.timestampMs - b.timestampMs
+    );
+  }, [effectiveWeightLogs]);
+
+  const latestWeightEntry =
+    sortedWeightLogs.length > 0
+      ? sortedWeightLogs[sortedWeightLogs.length - 1]!
+      : null;
+  const latestWeightKg =
+    latestWeightEntry?.weightKg ?? effectiveCycle.baselineBiometrics.weightKg;
+  const latestBodyFatPct =
+    latestWeightEntry?.bodyFatPct ??
+    effectiveCycle.baselineBiometrics.bodyFatPct;
 
   const [isWeightModalOpen, setIsWeightModalOpen] = useState<boolean>(false);
   const [weightInputStr, setWeightInputStr] = useState<string>(
-    String(
-      effectiveWeightLogs[effectiveWeightLogs.length - 1]?.weightKg ??
-        effectiveCycle.baselineBiometrics.weightKg
-    )
+    String(latestWeightKg)
   );
   const [bodyFatInputStr, setBodyFatInputStr] = useState<string>(
-    effectiveCycle.baselineBiometrics.bodyFatPct !== undefined
-      ? String(effectiveCycle.baselineBiometrics.bodyFatPct)
-      : ""
+    latestBodyFatPct !== undefined ? String(latestBodyFatPct) : ""
   );
   const [weightNoteStr, setWeightNoteStr] = useState<string>("");
   const [weightError, setWeightError] = useState<string | null>(null);
   const [weightFeedback, setWeightFeedback] = useState<string | null>(null);
+  const [isSubmittingWeight, setIsSubmittingWeight] = useState<boolean>(false);
+  const isSubmittingWeightRef = useRef<boolean>(false);
 
   const [isReviewModalOpen, setIsReviewModalOpen] = useState<boolean>(false);
   const [reviewActionNotice, setReviewActionNotice] = useState<string | null>(null);
+  const [isSubmittingReview, setIsSubmittingReview] = useState<boolean>(false);
+  const isSubmittingReviewRef = useRef<boolean>(false);
 
   const [isPrivateKeyRevealed, setIsPrivateKeyRevealed] = useState<boolean>(false);
   const [exportedPrivateKey, setExportedPrivateKey] = useState<string | null>(null);
@@ -349,37 +366,71 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  const lastWeighInMs = useMemo<number | null>(() => {
-    if (effectiveWeightLogs.length === 0) return null;
-    const sorted = [...effectiveWeightLogs].sort(
-      (a, b) => a.timestampMs - b.timestampMs
-    );
-    return sorted[sorted.length - 1]!.timestampMs;
-  }, [effectiveWeightLogs]);
-
   const reviewDue = useMemo<boolean>(() => {
-    return isBiWeeklyReviewDue(effectiveCycle.startDateMs, lastWeighInMs, nowMs);
-  }, [effectiveCycle.startDateMs, lastWeighInMs, nowMs]);
+    return isCycleBiWeeklyReviewDue(effectiveCycle, nowMs);
+  }, [effectiveCycle, nowMs]);
 
   const rollingAvgWeight = useMemo<number | null>(() => {
-    return calculateRollingWeightAverage(effectiveWeightLogs);
-  }, [effectiveWeightLogs]);
+    return computeRollingWeightAverage(effectiveWeightLogs, nowMs);
+  }, [effectiveWeightLogs, nowMs]);
+
+  const adaptationProjection = useMemo<WeighInAdaptationProjection>(() => {
+    return evaluateWeighInAdaptation(effectiveCycle, effectiveWeightLogs, nowMs);
+  }, [effectiveCycle, effectiveWeightLogs, nowMs]);
+
+  const cadenceDays = useMemo<readonly CadenceDayPill[]>(() => {
+    return buildSevenDayCadence(effectiveCycle, nowMs, proofSignedMap);
+  }, [effectiveCycle, nowMs, proofSignedMap]);
 
   const proposedReview = useMemo<ProposedPlanReview>(() => {
-    return evaluateBiWeeklyReview(
+    const baseReview = evaluateBiWeeklyReview(
       effectiveCycle,
       effectiveWeightLogs,
       adherencePct,
       nowMs
     );
-  }, [effectiveCycle, effectiveWeightLogs, adherencePct, nowMs]);
+    if (!reviewDue) {
+      return baseReview;
+    }
+    return {
+      ...baseReview,
+      weightChangeKg: adaptationProjection.rollingWeightDeltaKg,
+      rollingAverageWeightKg:
+        adaptationProjection.rollingAverageWeightKg ?? latestWeightKg,
+      proposedDailyCalories: adaptationProjection.projectedDailyCalories,
+      calorieAdjustment: adaptationProjection.calorieDeltaFromCurrent,
+      proposedMacroSplit: adaptationProjection.projectedMacroSplit,
+      rationale: adaptationProjection.summaryMessage
+    };
+  }, [
+    effectiveCycle,
+    effectiveWeightLogs,
+    adherencePct,
+    nowMs,
+    reviewDue,
+    adaptationProjection,
+    latestWeightKg
+  ]);
+
+  const handleOpenWeightModal = (): void => {
+    setWeightInputStr(String(latestWeightKg));
+    setBodyFatInputStr(
+      latestBodyFatPct !== undefined ? String(latestBodyFatPct) : ""
+    );
+    setWeightNoteStr("");
+    setWeightError(null);
+    setIsWeightModalOpen(true);
+  };
 
   const handleSaveWeightLog = async (): Promise<void> => {
+    if (isSubmittingWeightRef.current || isSubmittingWeight) {
+      return;
+    }
     const result = validateWeightLogInput(
       weightInputStr,
       bodyFatInputStr,
       weightNoteStr,
-      Date.now()
+      nowMs
     );
 
     if (!result.isValid || !result.entry) {
@@ -387,75 +438,111 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
       return;
     }
 
+    isSubmittingWeightRef.current = true;
+    setIsSubmittingWeight(true);
     setWeightError(null);
     const entry = result.entry;
-    setLocalWeightLogs((prev) => [...prev, entry]);
-    setWeightFeedback(`Saved weigh-in: ${entry.weightKg} kg (Encrypted on-device)`);
-    setIsWeightModalOpen(false);
-    setWeightNoteStr("");
 
     try {
-      await saveWeightLog(entry);
-    } catch {
-      // Non-fatal in preview environments
-    }
-
-    if (onLogWeightEntry) {
-      await onLogWeightEntry(entry);
+      if (onLogWeightEntry) {
+        await Promise.resolve(onLogWeightEntry(entry));
+      }
+      try {
+        await saveWeightLog(entry);
+      } catch {
+        // Non-fatal in preview environments without initialized vault storage
+      }
+      const nextLogs = [
+        ...effectiveWeightLogs.filter((item) => item.id !== entry.id),
+        entry
+      ].sort((a, b) => a.timestampMs - b.timestampMs);
+      setLocalWeightLogs(nextLogs);
+      const nextAvg = computeRollingWeightAverage(nextLogs, nowMs) ?? entry.weightKg;
+      setWeightFeedback(
+        `Saved weigh-in: ${entry.weightKg} kg (7-day rolling avg: ${nextAvg} kg • today's targets & logged progress unchanged)`
+      );
+      setIsWeightModalOpen(false);
+      setWeightNoteStr("");
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error ? err.message : "Failed to save weigh-in.";
+      setWeightError(msg);
+      onErrorRef.current?.(err);
+    } finally {
+      isSubmittingWeightRef.current = false;
+      setIsSubmittingWeight(false);
     }
   };
 
   const handleApproveReview = async (
     review: ProposedPlanReview
   ): Promise<void> => {
-    const { nextCycle, completedPreviousCycle } = applyApprovedPlanReview(
-      effectiveCycle,
-      review,
-      Date.now()
-    );
-    setLocalCycle(nextCycle);
-    setIsReviewModalOpen(false);
-    setReviewActionNotice(
-      `Approved Cycle #${nextCycle.cycleNumber}: ${nextCycle.targetDailyCalories} kcal/day (${nextCycle.targetDailyProteinGrams}g P / ${nextCycle.targetDailyCarbsGrams}g C / ${nextCycle.targetDailyFatGrams}g F)`
-    );
-
-    try {
-      await saveActivePlanCycle(nextCycle);
-    } catch {
-      // Non-fatal
+    if (!reviewDue || isSubmittingReviewRef.current || isSubmittingReview) {
+      return;
     }
-
-    if (onUpdatePlanCycle) {
-      await onUpdatePlanCycle(nextCycle, completedPreviousCycle);
+    isSubmittingReviewRef.current = true;
+    setIsSubmittingReview(true);
+    try {
+      const { nextCycle, completedPreviousCycle } = applyApprovedPlanReview(
+        effectiveCycle,
+        review,
+        nowMs
+      );
+      if (onUpdatePlanCycle) {
+        await Promise.resolve(onUpdatePlanCycle(nextCycle, completedPreviousCycle));
+      }
+      try {
+        await saveActivePlanCycle(nextCycle);
+      } catch {
+        // Non-fatal in preview environments without initialized vault storage
+      }
+      setLocalCycle(nextCycle);
+      setIsReviewModalOpen(false);
+      setReviewActionNotice(
+        `Approved Cycle #${nextCycle.cycleNumber}: ${nextCycle.targetDailyCalories} kcal/day (${nextCycle.targetDailyProteinGrams}g P / ${nextCycle.targetDailyCarbsGrams}g C / ${nextCycle.targetDailyFatGrams}g F)`
+      );
+    } catch (err: unknown) {
+      onErrorRef.current?.(err);
+    } finally {
+      isSubmittingReviewRef.current = false;
+      setIsSubmittingReview(false);
     }
   };
 
   const handleKeepCurrentPlan = async (review: ProposedPlanReview): Promise<void> => {
-    const { preservedCycle, completedPreviousCycle } = keepCurrentPlanOnReview(
-      effectiveCycle,
-      review,
-      Date.now()
-    );
-    setLocalCycle(preservedCycle);
-    setIsReviewModalOpen(false);
-    setReviewActionNotice(
-      `Kept current targets (${preservedCycle.targetDailyCalories} kcal/day). Started Cycle #${preservedCycle.cycleNumber}.`
-    );
-
-    try {
-      await saveActivePlanCycle(preservedCycle);
-    } catch {
-      // Non-fatal
+    if (!reviewDue || isSubmittingReviewRef.current || isSubmittingReview) {
+      return;
     }
-
-    if (onUpdatePlanCycle) {
-      await onUpdatePlanCycle(preservedCycle, completedPreviousCycle);
+    isSubmittingReviewRef.current = true;
+    setIsSubmittingReview(true);
+    try {
+      const { preservedCycle, completedPreviousCycle } = keepCurrentPlanOnReview(
+        effectiveCycle,
+        review,
+        nowMs
+      );
+      if (onUpdatePlanCycle) {
+        await Promise.resolve(
+          onUpdatePlanCycle(preservedCycle, completedPreviousCycle)
+        );
+      }
+      try {
+        await saveActivePlanCycle(preservedCycle);
+      } catch {
+        // Non-fatal in preview environments without initialized vault storage
+      }
+      setLocalCycle(preservedCycle);
+      setIsReviewModalOpen(false);
+      setReviewActionNotice(
+        `Kept current targets (${preservedCycle.targetDailyCalories} kcal/day). Started Cycle #${preservedCycle.cycleNumber}.`
+      );
+    } catch (err: unknown) {
+      onErrorRef.current?.(err);
+    } finally {
+      isSubmittingReviewRef.current = false;
+      setIsSubmittingReview(false);
     }
   };
-
-  const latestWeightKg =
-    effectiveWeightLogs[effectiveWeightLogs.length - 1]?.weightKg ??
-    effectiveCycle.baselineBiometrics.weightKg;
 
   return (
     <ScrollView
@@ -561,17 +648,34 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </View>
         </View>
 
+        <View style={styles.adaptationGuardBox}>
+          <Text style={styles.adaptationGuardTag}>
+            {!reviewDue
+              ? "🛡️ 7-Day Rolling Adaptation • Mid-Cycle Guard"
+              : "📊 7-Day Rolling Adaptation • Review Ready"}
+          </Text>
+          <Text style={styles.adaptationGuardMetric}>
+            Rolling Delta:{" "}
+            {adaptationProjection.rollingWeightDeltaKg > 0 ? "+" : ""}
+            {adaptationProjection.rollingWeightDeltaKg.toFixed(2)} kg • Projected:{" "}
+            {adaptationProjection.projectedDailyCalories} kcal/day (TDEE{" "}
+            {adaptationProjection.baselineTdee} kcal, bounded [-500, +400], floor 1200 kcal)
+          </Text>
+          <Text style={styles.adaptationGuardText}>
+            {adaptationProjection.summaryMessage}
+          </Text>
+        </View>
+
         {weightFeedback ? (
           <Text style={styles.weightSavedNotice}>🔒 {weightFeedback}</Text>
         ) : null}
 
         <View style={styles.weightActionsRow}>
           <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Log Weight / Biometrics"
             style={styles.logWeightPrimaryBtn}
-            onPress={() => {
-              setWeightError(null);
-              setIsWeightModalOpen(true);
-            }}
+            onPress={handleOpenWeightModal}
           >
             <Text style={styles.logWeightPrimaryBtnText}>
               ⚖️ Log Weight / Biometrics
@@ -579,12 +683,26 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </Pressable>
 
           <Pressable
-            style={styles.openReviewSecondaryBtn}
+            accessibilityRole="button"
+            accessibilityLabel="14-Day Plan Review"
+            accessibilityState={{ disabled: !reviewDue }}
+            disabled={!reviewDue}
+            style={[
+              styles.openReviewSecondaryBtn,
+              !reviewDue ? styles.openReviewSecondaryBtnDisabled : null
+            ]}
             onPress={() => {
-              setIsReviewModalOpen(true);
+              if (reviewDue) {
+                setIsReviewModalOpen(true);
+              }
             }}
           >
-            <Text style={styles.openReviewSecondaryBtnText}>
+            <Text
+              style={[
+                styles.openReviewSecondaryBtnText,
+                !reviewDue ? styles.openReviewSecondaryBtnTextDisabled : null
+              ]}
+            >
               📊 14-Day Plan Review
             </Text>
           </Pressable>
@@ -599,27 +717,30 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         </View>
 
         <View style={styles.consistencyRow}>
-          {WEEK_DAYS.map((d, index) => {
-            const isCompleted = d.completed || index < Math.min(streakCount, 7);
+          {cadenceDays.map((d) => {
             return (
-              <View key={d.day} style={styles.dayColumn}>
+              <View
+                key={d.date}
+                accessibilityLabel={`Cadence ${d.weekdayLabel} ${d.date}${d.isToday ? " Today" : ""}${d.isCompleted ? " Completed" : ""}`}
+                style={styles.dayColumn}
+              >
                 <Text
                   style={[
                     styles.dayLabel,
                     d.isToday ? styles.todayLabel : null
                   ]}
                 >
-                  {d.day}
+                  {d.weekdayLabel}
                 </Text>
                 <View
                   style={[
                     styles.dayDot,
-                    isCompleted ? styles.dayDotCompleted : styles.dayDotMissed,
+                    d.isCompleted ? styles.dayDotCompleted : styles.dayDotMissed,
                     d.isToday ? styles.todayDotBorder : null
                   ]}
                 >
                   <Text style={styles.dayDotIcon}>
-                    {isCompleted ? "🔥" : "·"}
+                    {d.isCompleted ? "🔥" : "·"}
                   </Text>
                 </View>
               </View>
@@ -953,6 +1074,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
             <Text style={styles.inputLabel}>Body Weight (kg) *</Text>
             <TextInput
+              accessibilityLabel="Body Weight Input"
               style={styles.textInput}
               value={weightInputStr}
               onChangeText={setWeightInputStr}
@@ -963,6 +1085,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
             <Text style={styles.inputLabel}>Body Fat % (Optional)</Text>
             <TextInput
+              accessibilityLabel="Body Fat Input"
               style={styles.textInput}
               value={bodyFatInputStr}
               onChangeText={setBodyFatInputStr}
@@ -973,6 +1096,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
             <Text style={styles.inputLabel}>Note (Optional)</Text>
             <TextInput
+              accessibilityLabel="Weight Note Input"
               style={styles.textInput}
               value={weightNoteStr}
               onChangeText={setWeightNoteStr}
@@ -986,18 +1110,32 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
             <View style={styles.modalBtnRow}>
               <Pressable
-                style={styles.saveWeightBtn}
+                accessibilityRole="button"
+                accessibilityLabel="Save Weigh-In"
+                accessibilityState={{ disabled: isSubmittingWeight }}
+                disabled={isSubmittingWeight}
+                style={[
+                  styles.saveWeightBtn,
+                  isSubmittingWeight ? styles.saveWeightBtnDisabled : null
+                ]}
                 onPress={() => {
                   void handleSaveWeightLog();
                 }}
               >
-                <Text style={styles.saveWeightBtnText}>Save Weigh-In</Text>
+                <Text style={styles.saveWeightBtnText}>
+                  {isSubmittingWeight ? "Saving..." : "Save Weigh-In"}
+                </Text>
               </Pressable>
 
               <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Cancel Weigh-In"
+                disabled={isSubmittingWeight}
                 style={styles.cancelWeightBtn}
                 onPress={() => {
-                  setIsWeightModalOpen(false);
+                  if (!isSubmittingWeight) {
+                    setIsWeightModalOpen(false);
+                  }
                 }}
               >
                 <Text style={styles.cancelWeightBtnText}>Cancel</Text>
@@ -1009,12 +1147,14 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
       {/* Bi-Weekly Plan Review Modal */}
       <PlanReviewModal
-        visible={isReviewModalOpen}
+        visible={isReviewModalOpen && reviewDue}
         review={proposedReview}
         onApproveNewPlan={(rev) => {
           void handleApproveReview(rev);
         }}
-        onKeepCurrentPlan={handleKeepCurrentPlan}
+        onKeepCurrentPlan={(rev) => {
+          void handleKeepCurrentPlan(rev);
+        }}
         onClose={() => {
           setIsReviewModalOpen(false);
         }}
@@ -1247,6 +1387,31 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     marginBottom: 10
   },
+  adaptationGuardBox: {
+    backgroundColor: "#0F172A",
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#1E293B",
+    marginBottom: 10
+  },
+  adaptationGuardTag: {
+    fontSize: 11,
+    fontWeight: "800",
+    color: "#38BDF8",
+    marginBottom: 3
+  },
+  adaptationGuardMetric: {
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#E2E8F0",
+    marginBottom: 3
+  },
+  adaptationGuardText: {
+    fontSize: 11,
+    color: "#94A3B8",
+    lineHeight: 16
+  },
   weightActionsRow: {
     flexDirection: "row",
     gap: 8
@@ -1272,10 +1437,17 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#38BDF8"
   },
+  openReviewSecondaryBtnDisabled: {
+    borderColor: "#334155",
+    opacity: 0.55
+  },
   openReviewSecondaryBtnText: {
     fontSize: 12,
     fontWeight: "700",
     color: "#38BDF8"
+  },
+  openReviewSecondaryBtnTextDisabled: {
+    color: "#64748B"
   },
   streakIndicator: {
     fontSize: 12,
@@ -1550,6 +1722,9 @@ const styles = StyleSheet.create({
     paddingVertical: 12,
     borderRadius: 10,
     alignItems: "center"
+  },
+  saveWeightBtnDisabled: {
+    opacity: 0.6
   },
   saveWeightBtnText: {
     fontSize: 13,

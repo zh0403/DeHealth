@@ -21,6 +21,7 @@ import {
   FATIGUE_SCALING_MULTIPLIER,
   FatigueScalingOptions
 } from "./profileEngine";
+import { makeDailyProofSignedKey } from "../storage/adaptiveStorage";
 
 export { FATIGUE_GAP_THRESHOLD_MS, FATIGUE_SCALING_MULTIPLIER, FatigueScalingOptions };
 
@@ -602,4 +603,294 @@ export function scaleFoodPresetPortion(
     carbsGrams: Number((preset.carbsGrams * factor).toFixed(1)),
     fatGrams: Number((preset.fatGrams * factor).toFixed(1))
   };
+}
+
+export const ADAPTIVE_MAX_DEFICIT_KCAL = 500;
+export const ADAPTIVE_MAX_SURPLUS_KCAL = 400;
+
+/**
+ * Computes the time-windowed rolling average weight (kg) across entries inside
+ * `[refMs - windowDays * MS_PER_DAY, refMs]` (inclusive), rounded to 2 decimals.
+ * Defaults `referenceTimestampMs` to the latest chronological entry when omitted.
+ * Returns null if `weightLogs` is empty or no entries fall inside the window.
+ */
+export function computeRollingWeightAverage(
+  weightLogs: readonly WeightLogEntry[],
+  referenceTimestampMs?: number,
+  windowDays: number = 7
+): number | null {
+  if (!weightLogs || weightLogs.length === 0) {
+    return null;
+  }
+  const sorted = [...weightLogs].sort((a, b) => a.timestampMs - b.timestampMs);
+  const latestEntry = sorted[sorted.length - 1];
+  if (!latestEntry) {
+    return null;
+  }
+  const refMs =
+    typeof referenceTimestampMs === "number" && Number.isFinite(referenceTimestampMs)
+      ? referenceTimestampMs
+      : latestEntry.timestampMs;
+  const safeWindowDays =
+    Number.isFinite(windowDays) && windowDays >= 0 ? windowDays : 7;
+  const windowStartMs = refMs - safeWindowDays * MS_PER_DAY;
+  const inWindow = sorted.filter(
+    (entry) => entry.timestampMs >= windowStartMs && entry.timestampMs <= refMs
+  );
+  if (inWindow.length === 0) {
+    return null;
+  }
+  const sum = inWindow.reduce((acc, entry) => acc + entry.weightKg, 0);
+  return Number((sum / inWindow.length).toFixed(2));
+}
+
+/**
+ * Calculates baseline TDEE from user biometrics using BMR + activity frequency.
+ */
+export function calculateBaselineTdee(biometrics: UserBiometrics): number {
+  const bmr = calculateBmr(biometrics);
+  return calculateTdee(
+    bmr,
+    biometrics.weeklyWorkoutFrequency,
+    biometrics.activityLevel
+  );
+}
+
+/**
+ * Clamps an adaptive daily calorie candidate strictly to realistic weekly rate bounds
+ * `[-500, +400]` kcal relative to `baselineTdee` and never below `1200 kcal`.
+ */
+export function clampAdaptiveCalories(
+  candidateCalories: number,
+  baselineTdee: number
+): number {
+  const safeTdee = Number.isFinite(baselineTdee)
+    ? baselineTdee
+    : SAFE_CALORIE_FLOOR_KCAL;
+  const lowerBound = Math.max(
+    SAFE_CALORIE_FLOOR_KCAL,
+    Math.round(safeTdee - ADAPTIVE_MAX_DEFICIT_KCAL)
+  );
+  const upperBound = Math.max(
+    SAFE_CALORIE_FLOOR_KCAL,
+    Math.round(safeTdee + ADAPTIVE_MAX_SURPLUS_KCAL)
+  );
+  const roundedCandidate = Number.isFinite(candidateCalories)
+    ? Math.round(candidateCalories)
+    : lowerBound;
+  return Math.min(upperBound, Math.max(lowerBound, roundedCandidate));
+}
+
+/**
+ * Pure cycle-level check determining whether at least 14 days have elapsed
+ * since `cycle.startDateMs`.
+ */
+export function isCycleBiWeeklyReviewDue(
+  cycle: AdaptivePlanCycle,
+  nowMs: number
+): boolean {
+  return nowMs - cycle.startDateMs >= CYCLE_LENGTH_DAYS * MS_PER_DAY;
+}
+
+export interface WeighInAdaptationProjection {
+  readonly baselineWeightKg: number;
+  readonly baselineTdee: number;
+  readonly latestWeightKg: number | null;
+  readonly rollingAverageWeightKg: number | null;
+  readonly rollingWeightDeltaKg: number;
+  readonly windowLogCount: number;
+  readonly currentDailyCalories: number;
+  readonly projectedDailyCalories: number;
+  readonly calorieDeltaFromCurrent: number;
+  readonly projectedMacroSplit: MacroSplit;
+  readonly isMidCycleHold: boolean;
+  readonly summaryMessage: string;
+}
+
+/**
+ * Pure, non-mutating weigh-in adaptation projection driven strictly by the 7-day
+ * rolling weight delta relative to `cycle.baselineBiometrics.weightKg`, clamped
+ * to `[-500, +400]` kcal of `baselineTdee` and `>= 1200 kcal`.
+ * Never mutates `cycle` or active day targets/logged progress.
+ */
+export function evaluateWeighInAdaptation(
+  cycle: AdaptivePlanCycle,
+  weightLogs: readonly WeightLogEntry[],
+  nowMs: number
+): WeighInAdaptationProjection {
+  const sortedLogs = [...weightLogs].sort((a, b) => a.timestampMs - b.timestampMs);
+  const logsUpToNow = sortedLogs.filter((entry) => entry.timestampMs <= nowMs);
+  const latestEntry =
+    logsUpToNow.length > 0 ? logsUpToNow[logsUpToNow.length - 1] : undefined;
+  const latestWeightKg = latestEntry ? latestEntry.weightKg : null;
+
+  const windowStartMs = nowMs - 7 * MS_PER_DAY;
+  const windowLogs = logsUpToNow.filter((entry) => entry.timestampMs >= windowStartMs);
+  const windowLogCount = windowLogs.length;
+  const rollingAverageWeightKg = computeRollingWeightAverage(logsUpToNow, nowMs, 7);
+
+  const baselineWeightKg = cycle.baselineBiometrics.weightKg;
+  const baselineTdee = calculateBaselineTdee(cycle.baselineBiometrics);
+  const rollingWeightDeltaKg =
+    rollingAverageWeightKg !== null
+      ? Number((rollingAverageWeightKg - baselineWeightKg).toFixed(2))
+      : 0;
+
+  let nominalAdjustment = 0;
+  if (
+    rollingAverageWeightKg !== null &&
+    !(windowLogCount === 1 && rollingWeightDeltaKg === 0)
+  ) {
+    const track = resolveGoalTrack(cycle.goal);
+    if (track === "deficit") {
+      if (rollingWeightDeltaKg >= -0.2) {
+        nominalAdjustment = -100;
+      } else if (rollingWeightDeltaKg >= -1.5) {
+        nominalAdjustment = 0;
+      } else {
+        nominalAdjustment = 150;
+      }
+    } else if (track === "surplus") {
+      if (rollingWeightDeltaKg <= 0.2) {
+        nominalAdjustment = 150;
+      } else if (rollingWeightDeltaKg <= 1.0) {
+        nominalAdjustment = 0;
+      } else {
+        nominalAdjustment = -100;
+      }
+    } else {
+      if (Math.abs(rollingWeightDeltaKg) <= 0.5) {
+        nominalAdjustment = 0;
+      } else if (rollingWeightDeltaKg > 0.5) {
+        nominalAdjustment = -100;
+      } else {
+        nominalAdjustment = 100;
+      }
+    }
+  }
+
+  const candidateCalories = cycle.targetDailyCalories + nominalAdjustment;
+  const projectedDailyCalories = clampAdaptiveCalories(candidateCalories, baselineTdee);
+  const calorieDeltaFromCurrent = projectedDailyCalories - cycle.targetDailyCalories;
+  const projectedMacroSplit = calculateMacroSplit(projectedDailyCalories, cycle.goal);
+  const isMidCycleHold = !isCycleBiWeeklyReviewDue(cycle, nowMs);
+
+  const deltaSign = rollingWeightDeltaKg > 0 ? "+" : "";
+  const calDeltaSign = calorieDeltaFromCurrent > 0 ? "+" : "";
+
+  let summaryMessage: string;
+  if (rollingAverageWeightKg === null) {
+    summaryMessage = `No weigh-ins in the 7-day rolling window. Daily targets (${cycle.targetDailyCalories} kcal/day) and active day progress remain unchanged.`;
+  } else if (isMidCycleHold) {
+    summaryMessage = `Mid-cycle guard active: 7-day rolling avg ${rollingAverageWeightKg.toFixed(2)} kg (${deltaSign}${rollingWeightDeltaKg.toFixed(2)} kg vs baseline). Active targets (${cycle.targetDailyCalories} kcal/day) and logged progress remain locked; next 14-day review projection: ${projectedDailyCalories} kcal/day.`;
+  } else {
+    summaryMessage = `14-day review ready: 7-day rolling avg ${rollingAverageWeightKg.toFixed(2)} kg (${deltaSign}${rollingWeightDeltaKg.toFixed(2)} kg vs baseline). Bounded projection: ${projectedDailyCalories} kcal/day (${calDeltaSign}${calorieDeltaFromCurrent} kcal vs current).`;
+  }
+
+  return {
+    baselineWeightKg,
+    baselineTdee,
+    latestWeightKg,
+    rollingAverageWeightKg,
+    rollingWeightDeltaKg,
+    windowLogCount,
+    currentDailyCalories: cycle.targetDailyCalories,
+    projectedDailyCalories,
+    calorieDeltaFromCurrent,
+    projectedMacroSplit,
+    isMidCycleHold,
+    summaryMessage
+  };
+}
+
+export const CADENCE_WEEKDAY_LABELS = [
+  "Sun",
+  "Mon",
+  "Tue",
+  "Wed",
+  "Thu",
+  "Fri",
+  "Sat"
+] as const;
+
+export interface CadenceDayPill {
+  readonly date: string;
+  readonly dayNumber: number;
+  readonly weekdayLabel: string;
+  readonly isToday: boolean;
+  readonly isCompleted: boolean;
+}
+
+/**
+ * Builds the active 7-day cadence slice (Week 1: days 0..6 or Week 2: days 7..13)
+ * with exact calendar weekday labels (`new Date(plan.date + "T00:00:00").getDay()`),
+ * today highlight, and completion state from `plan.completed` or `proofSignedMap`.
+ */
+export function buildSevenDayCadence(
+  cycle: AdaptivePlanCycle,
+  nowMs: number,
+  proofSignedMap?: Readonly<Record<string, boolean>>
+): readonly CadenceDayPill[] {
+  const activeDayIndex = getActiveDayIndex(cycle.startDateMs, nowMs);
+  const weekStartIndex = activeDayIndex < 7 ? 0 : 7;
+  const weekPlans = cycle.dailyPlans.slice(weekStartIndex, weekStartIndex + 7);
+
+  return weekPlans.map((plan) => {
+    const parsed = new Date(`${plan.date}T00:00:00`);
+    const weekdayLabel = Number.isNaN(parsed.getTime())
+      ? "Mon"
+      : (CADENCE_WEEKDAY_LABELS[parsed.getDay()] ?? "Mon");
+    const dayIndex = plan.dayNumber - 1;
+    const isToday = plan.dayNumber === activeDayIndex + 1;
+    const proofKey =
+      dayIndex >= 0 && cycle.id.trim().length > 0
+        ? makeDailyProofSignedKey(cycle.id, dayIndex)
+        : "";
+    const isCompleted =
+      plan.completed ||
+      (proofKey.length > 0 && proofSignedMap?.[proofKey] === true);
+
+    return {
+      date: plan.date,
+      dayNumber: plan.dayNumber,
+      weekdayLabel,
+      isToday,
+      isCompleted
+    };
+  });
+}
+
+/**
+ * Computes live consecutive completed/signed days ending at today (or yesterday if
+ * today is not yet signed). Returns 0 when `cycle` is null or `nowMs < cycle.startDateMs`.
+ */
+export function calculateLiveStreak(
+  cycle: AdaptivePlanCycle | null,
+  proofSignedMap: Readonly<Record<string, boolean>>,
+  nowMs: number
+): number {
+  if (!cycle || cycle.dailyPlans.length === 0 || nowMs < cycle.startDateMs) {
+    return 0;
+  }
+  const activeDayIndex = Math.min(
+    cycle.dailyPlans.length - 1,
+    getActiveDayIndex(cycle.startDateMs, nowMs)
+  );
+  const isDayDone = (idx: number): boolean => {
+    const plan = cycle.dailyPlans[idx];
+    if (!plan) {
+      return false;
+    }
+    const key =
+      cycle.id.trim().length > 0 ? makeDailyProofSignedKey(cycle.id, idx) : "";
+    return plan.completed || (key.length > 0 && proofSignedMap[key] === true);
+  };
+
+  let cursor = isDayDone(activeDayIndex) ? activeDayIndex : activeDayIndex - 1;
+  let streak = 0;
+  while (cursor >= 0 && isDayDone(cursor)) {
+    streak += 1;
+    cursor -= 1;
+  }
+  return streak;
 }

@@ -21,6 +21,11 @@ import {
   Text,
   View
 } from "react-native";
+import {
+  ErrorNoticeModal,
+  ErrorNoticePayload,
+  toErrorNoticePayload
+} from "./src/components/ErrorNoticeModal";
 import { RewardPerksDrawer } from "./src/components/RewardPerksDrawer";
 import { StreakFlameHeader } from "./src/components/StreakFlameHeader";
 import { AnonymizedFeedScreen } from "./src/screens/AnonymizedFeedScreen";
@@ -30,6 +35,8 @@ import { OnboardingWizardScreen } from "./src/screens/OnboardingWizardScreen";
 import {
   appendCycleToHistory,
   calculateAdherencePct,
+  calculateLiveStreak,
+  computeRollingWeightAverage,
   generate14DayPlan,
   getActiveDayIndex
 } from "./src/services/adaptivePlanEngine";
@@ -57,7 +64,8 @@ import {
   purgeAdaptiveStorageKeys,
   saveActivePlanCycle,
   saveDailyProofSigned,
-  savePlanHistory
+  savePlanHistory,
+  saveWeightLog
 } from "./src/storage/adaptiveStorage";
 import {
   DEFAULT_GOVERNANCE_CONFIG,
@@ -118,6 +126,58 @@ function biometricsToUserProfile(bio: UserBiometrics): UserProfile {
     gender: bio.gender,
     bodyFatPct,
     muscleMassKg: Math.min(150, Math.max(10, estimatedLbm))
+  };
+}
+
+export interface DerivedVaultMetrics {
+  readonly streakCount: number;
+  readonly fallbackBalanceDht: string;
+  readonly lastLogTimestampMs: number | null;
+}
+
+export function deriveLiveMetricsFromVault(
+  cycle: AdaptivePlanCycle,
+  proofSignedMap: Readonly<Record<string, boolean>>,
+  nowMs: number = Date.now()
+): DerivedVaultMetrics {
+  const streakCount = calculateLiveStreak(cycle, proofSignedMap, nowMs);
+  const signedDaysCount = cycle.dailyPlans.reduce((count, plan, idx) => {
+    const key =
+      cycle.id.trim().length > 0
+        ? makeDailyProofSignedKey(cycle.id, idx)
+        : "";
+    const isSigned =
+      plan.completed || (key.length > 0 && proofSignedMap[key] === true);
+    return isSigned ? count + 1 : count;
+  }, 0);
+  const fallbackBalanceDht = (
+    Math.max(streakCount, signedDaysCount) * 10
+  ).toFixed(1);
+
+  let latestLogMs: number | null = null;
+  for (let idx = 0; idx < cycle.dailyPlans.length; idx += 1) {
+    const plan = cycle.dailyPlans[idx];
+    if (!plan) continue;
+    const key =
+      cycle.id.trim().length > 0
+        ? makeDailyProofSignedKey(cycle.id, idx)
+        : "";
+    const isSigned =
+      plan.completed || (key.length > 0 && proofSignedMap[key] === true);
+    if (!isSigned) continue;
+    const parsedMs = Date.parse(`${plan.date}T00:00:00.000Z`);
+    const dayMs = Number.isFinite(parsedMs)
+      ? parsedMs
+      : cycle.startDateMs + idx * 24 * 60 * 60 * 1000;
+    if (latestLogMs === null || dayMs > latestLogMs) {
+      latestLogMs = dayMs;
+    }
+  }
+
+  return {
+    streakCount,
+    fallbackBalanceDht,
+    lastLogTimestampMs: latestLogMs
   };
 }
 
@@ -348,23 +408,12 @@ export default function App(): React.ReactElement {
     DEFAULT_BASELINE_BIOMETRICS
   );
   const [activeCycle, setActiveCycle] = useState<AdaptivePlanCycle>(() =>
-    generate14DayPlan(
-      DEFAULT_BASELINE_BIOMETRICS,
-      Date.now() - 15 * 24 * 60 * 60 * 1000
-    )
+    generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now())
   );
-  const [weightLogs, setWeightLogs] = useState<readonly WeightLogEntry[]>([
-    {
-      id: "wlog_baseline",
-      timestampMs: Date.now() - 14 * 24 * 60 * 60 * 1000,
-      weightKg: 70.0,
-      bodyFatPct: 18.5,
-      note: "Initial onboarding weight"
-    }
-  ]);
+  const [weightLogs, setWeightLogs] = useState<readonly WeightLogEntry[]>([]);
 
-  const [streakCount, setStreakCount] = useState<number>(3);
-  const [tokenBalanceDht, setTokenBalanceDht] = useState<string>("30.0");
+  const [streakCount, setStreakCount] = useState<number>(0);
+  const [tokenBalanceDht, setTokenBalanceDht] = useState<string>("0.0");
   const [currentNonce, setCurrentNonce] = useState<bigint>(0n);
   const [lastProofHash, setLastProofHash] = useState<Bytes32 | null>(null);
   const [lastTxHash, setLastTxHash] = useState<string | null>(null);
@@ -373,14 +422,17 @@ export default function App(): React.ReactElement {
   const [proofSignedMap, setProofSignedMap] = useState<
     Readonly<Record<string, boolean>>
   >({});
-  const [lastLogTimestampMs, setLastLogTimestampMs] = useState<number>(
-    () => Date.now() - 50 * 60 * 60 * 1000
+  const [lastLogTimestampMs, setLastLogTimestampMs] = useState<number | null>(
+    null
   );
   const [feedItems, setFeedItems] =
     useState<readonly AnonymizedFeedRecord[]>(INITIAL_FEED_ITEMS);
   const [cheerCounts, setCheerCounts] =
     useState<Readonly<Record<string, number>>>(INITIAL_CHEERS);
   const [isPerksDrawerOpen, setIsPerksDrawerOpen] = useState<boolean>(false);
+  const [errorNotice, setErrorNotice] = useState<ErrorNoticePayload | null>(
+    null
+  );
   // Wall clock for day-index and adherence; ticks each minute so the active day
   // rolls over at midnight even if the app stays open.
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
@@ -427,10 +479,28 @@ export default function App(): React.ReactElement {
       proofSignedMap: hydratedProofMap,
       governanceConfig: hydratedGovernance
     } = hydrated;
+    const currentNowMs = Date.now();
+    const effectiveHydratedCycle =
+      storedCycle ??
+      generate14DayPlan(
+        storedBio ?? DEFAULT_BASELINE_BIOMETRICS,
+        currentNowMs
+      );
+    const derived = deriveLiveMetricsFromVault(
+      effectiveHydratedCycle,
+      hydratedProofMap,
+      currentNowMs
+    );
+
     setInitError(null);
     setWallet(persistentWallet);
     setProofSignedMap(hydratedProofMap);
     setGovernanceConfig(hydratedGovernance);
+    setActiveCycle(effectiveHydratedCycle);
+    setWeightLogs(storedLogs);
+    setStreakCount(derived.streakCount);
+    setTokenBalanceDht(derived.fallbackBalanceDht);
+    setLastLogTimestampMs(derived.lastLogTimestampMs);
 
     const addr = persistentWallet.address as Address;
     void fetchOnChainNonce(addr, 0n)
@@ -438,7 +508,7 @@ export default function App(): React.ReactElement {
         if (isMounted()) setCurrentNonce(nonce);
       })
       .catch(() => undefined);
-    void fetchTokenBalance(addr, "30.0")
+    void fetchTokenBalance(addr, derived.fallbackBalanceDht)
       .then((bal) => {
         if (isMounted()) setTokenBalanceDht(bal);
       })
@@ -450,12 +520,6 @@ export default function App(): React.ReactElement {
     } else {
       setUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
       setHasCompletedOnboarding(false);
-    }
-    if (storedCycle) {
-      setActiveCycle(storedCycle);
-    }
-    if (storedLogs.length > 0) {
-      setWeightLogs(storedLogs);
     }
   };
 
@@ -506,21 +570,8 @@ export default function App(): React.ReactElement {
       setLastTxHash(null);
       setLastExplorerUrl(null);
       setLastClaimMode(null);
-      setActiveCycle(
-        generate14DayPlan(
-          DEFAULT_BASELINE_BIOMETRICS,
-          Date.now() - 15 * 24 * 60 * 60 * 1000
-        )
-      );
-      setWeightLogs([
-        {
-          id: "wlog_baseline",
-          timestampMs: Date.now() - 14 * 24 * 60 * 60 * 1000,
-          weightKg: 70.0,
-          bodyFatPct: 18.5,
-          note: "Initial onboarding weight"
-        }
-      ]);
+      setErrorNotice(null);
+      setCurrentNonce(0n);
       applyHydratedState(recovered, () => true);
     } catch (err: unknown) {
       const message =
@@ -534,6 +585,14 @@ export default function App(): React.ReactElement {
   };
 
   const userAddress = (wallet ? wallet.address : "0x0000000000000000000000000000000000000000") as Address;
+
+  const showErrorNotice = (err: unknown, fallbackTitle: string): void => {
+    setErrorNotice(toErrorNoticePayload(err, fallbackTitle, userAddress));
+  };
+
+  const clearErrorNotice = (): void => {
+    setErrorNotice(null);
+  };
 
   const userProfile = useMemo(
     () => biometricsToUserProfile(userBiometrics),
@@ -574,19 +633,33 @@ export default function App(): React.ReactElement {
     bio: UserBiometrics,
     plan: AdaptivePlanCycle
   ): void => {
+    const onboardingNowMs = Date.now();
+    const initialWeightLog: WeightLogEntry = {
+      id: `wlog_${onboardingNowMs}`,
+      timestampMs: onboardingNowMs,
+      weightKg: bio.weightKg,
+      ...(bio.bodyFatPct !== undefined ? { bodyFatPct: bio.bodyFatPct } : {}),
+      note: "Onboarding baseline"
+    };
     setUserBiometrics(bio);
     setActiveCycle(plan);
-    setWeightLogs([
-      {
-        id: `wlog_${Date.now()}`,
-        timestampMs: Date.now(),
-        weightKg: bio.weightKg,
-        ...(bio.bodyFatPct !== undefined ? { bodyFatPct: bio.bodyFatPct } : {}),
-        note: "Onboarding baseline"
-      }
-    ]);
+    setWeightLogs([initialWeightLog]);
+    void saveWeightLog(initialWeightLog).catch(() => undefined);
+    setStreakCount(calculateLiveStreak(plan, proofSignedMap, onboardingNowMs));
+    setLastLogTimestampMs(null);
     setHasCompletedOnboarding(true);
     setActiveTab("checkin");
+  };
+
+  const handleLogWeightEntry = (entry: WeightLogEntry): void => {
+    setWeightLogs((prev) => {
+      const next = [
+        ...prev.filter((item) => item.id !== entry.id),
+        entry
+      ].sort((a, b) => a.timestampMs - b.timestampMs);
+      computeRollingWeightAverage(next, nowMs);
+      return next;
+    });
   };
 
   const handleUpdateDailyPlan = (updatedPlan: DailyPlan): void => {
@@ -598,89 +671,120 @@ export default function App(): React.ReactElement {
       dailyPlans: nextPlans
     };
     setActiveCycle(nextCycle);
-    void saveActivePlanCycle(nextCycle).catch(() => undefined);
+    void saveActivePlanCycle(nextCycle).catch((err: unknown) => {
+      showErrorNotice(err, "Plan Persistence Failed");
+    });
   };
 
   const handleApprovePlan = async (
     nextCycle: AdaptivePlanCycle,
     completedPreviousCycle?: AdaptivePlanCycle
   ): Promise<void> => {
-    setActiveCycle(nextCycle);
-    if (!completedPreviousCycle) {
-      return;
-    }
-    // Archive the finished 14-day cycle so plan history survives approval.
     try {
+      setActiveCycle(nextCycle);
+      if (!completedPreviousCycle) {
+        return;
+      }
+      // Archive the finished 14-day cycle so plan history survives approval.
       const history = await getPlanHistory();
-      await savePlanHistory(appendCycleToHistory(history, completedPreviousCycle));
-    } catch {
-      // Non-fatal: the new cycle is already active and persisted by the dashboard.
+      await savePlanHistory(
+        appendCycleToHistory(history, completedPreviousCycle)
+      );
+    } catch (err: unknown) {
+      showErrorNotice(err, "Plan Approval Failed");
     }
   };
 
   const handleDispatchSignedClaim = async (
     payload: SignedWorkoutClaimPayload
   ): Promise<void> => {
-    // 1. Submit on-chain claim or fallback receipt
-    const claimResult = await claimStreakReward(payload, wallet ?? undefined);
-    setLastTxHash(claimResult.txHash);
-    setLastExplorerUrl(claimResult.mode === "live" ? claimResult.explorerUrl : null);
-    setLastClaimMode(claimResult.mode);
+    try {
+      // 1. Submit on-chain claim or fallback receipt (runs L2 gas pre-check first)
+      const claimResult = await claimStreakReward(payload, wallet ?? undefined);
+      setLastTxHash(claimResult.txHash);
+      setLastExplorerUrl(
+        claimResult.mode === "live" ? claimResult.explorerUrl : null
+      );
+      setLastClaimMode(claimResult.mode);
 
-    const proofSignedKey = makeDailyProofSignedKey(activeCycle.id, activeDayIndex);
-    setProofSignedMap((prev) => ({
-      ...prev,
-      [proofSignedKey]: true
-    }));
-    void saveDailyProofSigned(activeCycle.id, activeDayIndex, true).catch(
-      () => undefined
-    );
+      const proofSignedKey = makeDailyProofSignedKey(
+        activeCycle.id,
+        activeDayIndex
+      );
+      setProofSignedMap((prev) => ({
+        ...prev,
+        [proofSignedKey]: true
+      }));
+      void saveDailyProofSigned(activeCycle.id, activeDayIndex, true).catch(
+        () => undefined
+      );
 
-    const nextStreak = Number(payload.proof.streakCount);
-    const expectedBalance = (Number.parseFloat(tokenBalanceDht) + 10).toFixed(1);
+      const nextStreak = Number(payload.proof.streakCount);
+      const expectedBalance = (Number.parseFloat(tokenBalanceDht) + 10).toFixed(
+        1
+      );
 
-    // 2. Publish milestone to Supabase (strict data sovereignty + EIP-712 proof gate)
-    const userPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
-    const verifyingContract = getRewardGateAddress() || DEMO_VERIFYING_CONTRACT;
-    const milestoneResult = await publishProofMilestone(
-      {
-        user_pseudonym: userPseudonym,
-        proof_hash: payload.proof.telemetryHash,
-        streak_count: nextStreak
-      },
-      payload,
-      verifyingContract
-    );
+      // 2. Publish milestone to Supabase (strict data sovereignty + EIP-712 proof gate)
+      const userPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
+      const verifyingContract = getRewardGateAddress() || DEMO_VERIFYING_CONTRACT;
+      const milestoneResult = await publishProofMilestone(
+        {
+          user_pseudonym: userPseudonym,
+          proof_hash: payload.proof.telemetryHash,
+          streak_count: nextStreak
+        },
+        payload,
+        verifyingContract
+      );
 
-    setStreakCount(nextStreak);
-    setLastProofHash(payload.proof.telemetryHash);
-    setLastLogTimestampMs(Date.now());
+      setStreakCount(nextStreak);
+      setLastProofHash(payload.proof.telemetryHash);
+      setLastLogTimestampMs(Date.now());
 
-    // Update feed items and cheer counts
-    setFeedItems((prev) => [
-      milestoneResult.data,
-      ...prev.filter((i) => i.id !== milestoneResult.data.id)
-    ]);
-    setCheerCounts((prev) => ({
-      ...prev,
-      [milestoneResult.data.id]: 0
-    }));
+      // Update feed items and cheer counts
+      setFeedItems((prev) => [
+        milestoneResult.data,
+        ...prev.filter((i) => i.id !== milestoneResult.data.id)
+      ]);
+      setCheerCounts((prev) => ({
+        ...prev,
+        [milestoneResult.data.id]: 0
+      }));
 
-    // 3. Update nonce and DHT token balance from L2 service
-    const updatedNonce = await fetchOnChainNonce(userAddress, currentNonce + 1n);
-    setCurrentNonce(updatedNonce);
+      // 3. Update nonce and DHT token balance from L2 service
+      const updatedNonce = await fetchOnChainNonce(
+        userAddress,
+        currentNonce + 1n
+      );
+      setCurrentNonce(updatedNonce);
 
-    const updatedBalance = await fetchTokenBalance(userAddress, expectedBalance);
-    setTokenBalanceDht(updatedBalance);
+      const updatedBalance = await fetchTokenBalance(
+        userAddress,
+        expectedBalance
+      );
+      setTokenBalanceDht(updatedBalance);
+    } catch (err: unknown) {
+      showErrorNotice(err, "Check-In Proof Failed");
+      throw err;
+    }
   };
 
-  const handleCheer = (feedId: string): void => {
+  const handleCheer = async (feedId: string): Promise<void> => {
     setCheerCounts((prev) => ({
       ...prev,
       [feedId]: (prev[feedId] ?? 0) + 1
     }));
     const senderPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
-    void sendPeerCheer(feedId, senderPseudonym).catch(() => undefined);
+    try {
+      await sendPeerCheer(feedId, senderPseudonym);
+    } catch (err: unknown) {
+      setCheerCounts((prev) => ({
+        ...prev,
+        [feedId]: Math.max(0, (prev[feedId] ?? 1) - 1)
+      }));
+      showErrorNotice(err, "Peer Cheer Failed");
+      throw err;
+    }
   };
 
   const handleRedeemPerk = (costDht: number, _perkTitle: string): boolean => {
@@ -750,6 +854,9 @@ export default function App(): React.ReactElement {
                   fatigueScalingMultiplier={governanceConfig.fatigueScalingMultiplier}
                   onUpdateDailyPlan={handleUpdateDailyPlan}
                   onDispatchSignedClaim={handleDispatchSignedClaim}
+                  onError={(err) => {
+                    showErrorNotice(err, "Check-In Proof Failed");
+                  }}
                   lastTxHash={lastTxHash}
                   lastExplorerUrl={lastExplorerUrl}
                   lastClaimMode={lastClaimMode}
@@ -772,13 +879,15 @@ export default function App(): React.ReactElement {
                   weightLogs={weightLogs}
                   adherencePct={adherencePct}
                   currentTimestampMs={nowMs}
+                  proofSignedMap={proofSignedMap}
                   governanceConfig={governanceConfig}
                   onUpdateGovernanceConfig={setGovernanceConfig}
-                  onLogWeightEntry={(entry) => {
-                    setWeightLogs((prev) => [...prev, entry]);
-                  }}
+                  onLogWeightEntry={handleLogWeightEntry}
                   onUpdatePlanCycle={handleApprovePlan}
                   onOpenPerksDrawer={() => setIsPerksDrawerOpen(true)}
+                  onError={(err) => {
+                    showErrorNotice(err, "Dashboard Action Failed");
+                  }}
                 />
               ) : null}
 
@@ -787,6 +896,9 @@ export default function App(): React.ReactElement {
                   items={feedItems}
                   cheerCountsByFeedId={cheerCounts}
                   onCheer={handleCheer}
+                  onError={(err) => {
+                    showErrorNotice(err, "Peer Cheer Failed");
+                  }}
                 />
               ) : null}
             </View>
@@ -830,6 +942,13 @@ export default function App(): React.ReactElement {
               tokenBalanceDht={tokenBalanceDht}
               onClose={() => setIsPerksDrawerOpen(false)}
               onRedeemPerk={handleRedeemPerk}
+            />
+
+            {/* Global Error Pop-Up Modal */}
+            <ErrorNoticeModal
+              visible={errorNotice !== null}
+              notice={errorNotice}
+              onDismiss={clearErrorNotice}
             />
           </>
         )}
