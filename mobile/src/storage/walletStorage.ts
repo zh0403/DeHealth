@@ -23,17 +23,38 @@ export function isValidPrivateKey(value: unknown): value is string {
   return typeof value === "string" && PRIVATE_KEY_PATTERN.test(value);
 }
 
+interface StoreQueueState {
+  tail: Promise<void>;
+  activeBatch: Promise<Wallet> | null;
+}
+
+function createQueueState(): StoreQueueState {
+  return {
+    tail: Promise.resolve(),
+    activeBatch: null
+  };
+}
+
 let cachedWallet: Wallet | null = null;
-const pendingWalletByStore = new WeakMap<SecureKeyStore, Promise<Wallet>>();
-let pendingDefaultWalletPromise: Promise<Wallet> | null = null;
+const queueByStore = new WeakMap<SecureKeyStore, StoreQueueState>();
+let defaultQueueState: StoreQueueState = createQueueState();
+
+function getStoreQueueState(store: SecureKeyStore): StoreQueueState {
+  let state = queueByStore.get(store);
+  if (!state) {
+    state = createQueueState();
+    queueByStore.set(store, state);
+  }
+  return state;
+}
 
 /**
- * Resets in-memory cached wallet reference and default in-flight lock.
+ * Resets in-memory cached wallet reference and default in-flight queue state.
  * Used primarily across isolated test runs.
  */
 export function resetWalletStorageForTesting(): void {
   cachedWallet = null;
-  pendingDefaultWalletPromise = null;
+  defaultQueueState = createQueueState();
 }
 
 async function resolveWalletFromStore(store: SecureKeyStore): Promise<Wallet> {
@@ -81,52 +102,75 @@ export async function getOrCreatePersistentWallet(
   keyStore?: SecureKeyStore
 ): Promise<Wallet> {
   if (keyStore) {
-    const inflight = pendingWalletByStore.get(keyStore);
-    if (inflight) {
-      return inflight;
+    const state = getStoreQueueState(keyStore);
+    if (state.activeBatch) {
+      return state.activeBatch;
     }
 
-    const work = resolveWalletFromStore(keyStore);
-    pendingWalletByStore.set(keyStore, work);
-    try {
-      return await work;
-    } finally {
-      pendingWalletByStore.delete(keyStore);
-    }
+    const previousTail = state.tail;
+    let batch!: Promise<Wallet>;
+    batch = (async (): Promise<Wallet> => {
+      try {
+        await previousTail;
+        return await resolveWalletFromStore(keyStore);
+      } finally {
+        if (state.activeBatch === batch) {
+          state.activeBatch = null;
+        }
+      }
+    })();
+
+    state.activeBatch = batch;
+    state.tail = batch.then(
+      () => undefined,
+      () => undefined
+    );
+    return batch;
   }
 
   if (cachedWallet) {
     return cachedWallet;
   }
 
-  if (pendingDefaultWalletPromise) {
-    return pendingDefaultWalletPromise;
+  const state = defaultQueueState;
+  if (state.activeBatch) {
+    return state.activeBatch;
   }
 
-  const work = (async (): Promise<Wallet> => {
-    let store: SecureKeyStore;
+  const previousTail = state.tail;
+  let batch!: Promise<Wallet>;
+  batch = (async (): Promise<Wallet> => {
     try {
-      store = await createPlatformKeyStore();
-    } catch (err) {
-      if (err instanceof VaultKeyUnavailableError) {
-        throw new WalletStorageError(err.message);
-      }
-      throw err;
-    }
+      await previousTail;
 
-    const wallet = await resolveWalletFromStore(store);
-    cachedWallet = wallet;
-    return wallet;
+      let store: SecureKeyStore;
+      try {
+        store = await createPlatformKeyStore();
+      } catch (err) {
+        if (err instanceof VaultKeyUnavailableError) {
+          throw new WalletStorageError(err.message);
+        }
+        throw err;
+      }
+
+      const wallet = await resolveWalletFromStore(store);
+      if (state === defaultQueueState && state.activeBatch === batch) {
+        cachedWallet = wallet;
+      }
+      return wallet;
+    } finally {
+      if (state.activeBatch === batch) {
+        state.activeBatch = null;
+      }
+    }
   })();
 
-  pendingDefaultWalletPromise = work;
-  try {
-    return await work;
-  } finally {
-    if (pendingDefaultWalletPromise === work) {
-      pendingDefaultWalletPromise = null;
-    }
-  }
+  state.activeBatch = batch;
+  state.tail = batch.then(
+    () => undefined,
+    () => undefined
+  );
+  return batch;
 }
 
 /**
@@ -173,17 +217,54 @@ export async function exportWalletPrivateKey(
 
 /**
  * Removes the stored private key from the backing store and clears the cache.
+ * Serialized against any active in-flight wallet creation for the same store so
+ * a concurrent create/clear race cannot leave a stale cache or delete a newly
+ * returned wallet's key out from under it.
  */
 export async function clearStoredWallet(
   keyStore?: SecureKeyStore
 ): Promise<void> {
-  cachedWallet = null;
-  try {
-    const store = keyStore ?? (await createPlatformKeyStore());
-    if (typeof store.deleteItem === "function") {
-      await store.deleteItem(WALLET_PRIVATE_KEY_STORAGE_KEY);
-    }
-  } catch {
-    // Non-fatal if keystore unavailable during teardown
+  if (keyStore) {
+    const state = getStoreQueueState(keyStore);
+    state.activeBatch = null;
+
+    const previousTail = state.tail;
+    const clearWork = (async (): Promise<void> => {
+      await previousTail;
+      try {
+        if (typeof keyStore.deleteItem === "function") {
+          await keyStore.deleteItem(WALLET_PRIVATE_KEY_STORAGE_KEY);
+        }
+      } catch {
+        // Non-fatal if keystore unavailable during teardown
+      }
+    })();
+
+    state.tail = clearWork;
+    await clearWork;
+    return;
   }
+
+  const state = defaultQueueState;
+  cachedWallet = null;
+  state.activeBatch = null;
+
+  const previousTail = state.tail;
+  const clearWork = (async (): Promise<void> => {
+    await previousTail;
+    if (state === defaultQueueState) {
+      cachedWallet = null;
+    }
+    try {
+      const store = await createPlatformKeyStore();
+      if (typeof store.deleteItem === "function") {
+        await store.deleteItem(WALLET_PRIVATE_KEY_STORAGE_KEY);
+      }
+    } catch {
+      // Non-fatal if keystore unavailable during teardown
+    }
+  })();
+
+  state.tail = clearWork;
+  await clearWork;
 }
