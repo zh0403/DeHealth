@@ -2,6 +2,7 @@ import {
   AdaptivePlanCycle,
   Address,
   AnonymizedFeedRecord,
+  AuthSessionMetadata,
   Bytes32,
   DailyPlan,
   DEFAULT_BASELINE_BIOMETRICS,
@@ -30,16 +31,24 @@ import { RewardPerksDrawer } from "./src/components/RewardPerksDrawer";
 import { StreakFlameHeader } from "./src/components/StreakFlameHeader";
 import { AnonymizedFeedScreen } from "./src/screens/AnonymizedFeedScreen";
 import { DashboardScreen } from "./src/screens/DashboardScreen";
+import { LoginScreen } from "./src/screens/LoginScreen";
 import { MicroCheckInScreen } from "./src/screens/MicroCheckInScreen";
 import { OnboardingWizardScreen } from "./src/screens/OnboardingWizardScreen";
 import {
   appendCycleToHistory,
   calculateAdherencePct,
   calculateLiveStreak,
-  computeRollingWeightAverage,
   generate14DayPlan,
   getActiveDayIndex
 } from "./src/services/adaptivePlanEngine";
+import {
+  AuthSignInResult,
+  continueWithWallet,
+  getPersistedAuthSession,
+  purgeAuthSessionStorageKey,
+  signInWithGoogle,
+  signOutSession
+} from "./src/services/authService";
 import {
   claimStreakReward,
   DEMO_VERIFYING_CONTRACT,
@@ -50,6 +59,9 @@ import {
 } from "./src/services/l2ContractService";
 import {
   fetchAnonymizedFeed,
+  fetchCheeredFeedIdsForUser,
+  isDuplicateCheerError,
+  isSupabaseConfigured,
   publishProofMilestone,
   sendPeerCheer
 } from "./src/services/supabaseService";
@@ -188,6 +200,7 @@ export interface HydratedVaultState {
   readonly persistentWallet: Wallet;
   readonly proofSignedMap: Readonly<Record<string, boolean>>;
   readonly governanceConfig: GovernanceConfig;
+  readonly storedAuthSession: AuthSessionMetadata | null;
 }
 
 export interface VaultHydrationDeps {
@@ -197,10 +210,12 @@ export interface VaultHydrationDeps {
   readonly getOrCreatePersistentWallet: () => Promise<Wallet>;
   readonly getDailyProofSignedMap: () => Promise<Record<string, boolean>>;
   readonly getGovernanceConfig?: () => Promise<GovernanceConfig>;
+  readonly getPersistedAuthSession?: () => Promise<AuthSessionMetadata | null>;
   readonly clearStoredWallet: () => Promise<void>;
   readonly clearVaultSecret: () => Promise<void>;
   readonly purgeAdaptiveStorageKeys: () => Promise<void>;
   readonly purgeGovernanceStorageKey?: () => Promise<void>;
+  readonly purgeAuthSessionStorageKey?: () => Promise<void>;
 }
 
 const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
@@ -210,16 +225,19 @@ const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
   getOrCreatePersistentWallet,
   getDailyProofSignedMap,
   getGovernanceConfig,
+  getPersistedAuthSession,
   clearStoredWallet,
   clearVaultSecret,
   purgeAdaptiveStorageKeys,
-  purgeGovernanceStorageKey
+  purgeGovernanceStorageKey,
+  purgeAuthSessionStorageKey
 };
 
 export async function hydrateVaultData(
   deps: VaultHydrationDeps = DEFAULT_VAULT_HYDRATION_DEPS
 ): Promise<HydratedVaultState> {
   const resolveGov = deps.getGovernanceConfig ?? getGovernanceConfig;
+  const resolveAuth = deps.getPersistedAuthSession ?? getPersistedAuthSession;
   const [
     storedBio,
     storedCycle,
@@ -234,9 +252,10 @@ export async function hydrateVaultData(
     deps.getDailyProofSignedMap()
   ]);
 
-  // Hydrate governance after primary vault secret provisioning completes
-  // so two independent platform keystore handles never race on first boot.
+  // Hydrate governance and auth session after primary vault secret provisioning
+  // completes so independent platform keystore handles never race on first boot.
   const governanceConfig = await resolveGov();
+  const storedAuthSession = await resolveAuth();
 
   return {
     storedBio,
@@ -244,7 +263,8 @@ export async function hydrateVaultData(
     storedLogs,
     persistentWallet,
     proofSignedMap,
-    governanceConfig
+    governanceConfig,
+    storedAuthSession
   };
 }
 
@@ -256,6 +276,8 @@ export async function resetVaultAndRecover(
   await deps.purgeAdaptiveStorageKeys();
   const purgeGov = deps.purgeGovernanceStorageKey ?? purgeGovernanceStorageKey;
   await purgeGov();
+  const purgeAuth = deps.purgeAuthSessionStorageKey ?? purgeAuthSessionStorageKey;
+  await purgeAuth();
   return hydrateVaultData(deps);
 }
 
@@ -459,12 +481,36 @@ export default function App(): React.ReactElement {
   }, []);
 
   const [wallet, setWallet] = useState<Wallet | null>(null);
+  const [authSession, setAuthSession] = useState<AuthSessionMetadata | null>(
+    null
+  );
+  const [cheeredFeedIds, setCheeredFeedIds] = useState<
+    Readonly<Record<string, boolean>>
+  >({});
   const [initError, setInitError] = useState<string | null>(null);
   const [isRetryingVault, setIsRetryingVault] = useState<boolean>(false);
   const [isResettingVault, setIsResettingVault] = useState<boolean>(false);
   const [governanceConfig, setGovernanceConfig] = useState<GovernanceConfig>(
     DEFAULT_GOVERNANCE_CONFIG
   );
+
+  useEffect(() => {
+    if (!wallet) {
+      return;
+    }
+    let mounted = true;
+    const senderPseudonym = `athlete_${wallet.address.slice(2, 8).toLowerCase()}`;
+    void fetchCheeredFeedIdsForUser(senderPseudonym)
+      .then((cheeredMap) => {
+        if (mounted) {
+          setCheeredFeedIds(cheeredMap);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      mounted = false;
+    };
+  }, [wallet, authSession]);
 
   const applyHydratedState = (
     hydrated: HydratedVaultState,
@@ -477,7 +523,8 @@ export default function App(): React.ReactElement {
       storedLogs,
       persistentWallet,
       proofSignedMap: hydratedProofMap,
-      governanceConfig: hydratedGovernance
+      governanceConfig: hydratedGovernance,
+      storedAuthSession
     } = hydrated;
     const currentNowMs = Date.now();
     const effectiveHydratedCycle =
@@ -494,6 +541,7 @@ export default function App(): React.ReactElement {
 
     setInitError(null);
     setWallet(persistentWallet);
+    setAuthSession(storedAuthSession);
     setProofSignedMap(hydratedProofMap);
     setGovernanceConfig(hydratedGovernance);
     setActiveCycle(effectiveHydratedCycle);
@@ -566,6 +614,8 @@ export default function App(): React.ReactElement {
     setIsResettingVault(true);
     try {
       const recovered = await resetVaultAndRecover();
+      setAuthSession(null);
+      setCheeredFeedIds({});
       setLastProofHash(null);
       setLastTxHash(null);
       setLastExplorerUrl(null);
@@ -648,18 +698,59 @@ export default function App(): React.ReactElement {
     setStreakCount(calculateLiveStreak(plan, proofSignedMap, onboardingNowMs));
     setLastLogTimestampMs(null);
     setHasCompletedOnboarding(true);
-    setActiveTab("checkin");
+    setActiveTab("dashboard");
+  };
+
+  const applyAuthenticatedResult = (authResult: AuthSignInResult): void => {
+    const previousAddress = wallet?.address.toLowerCase() ?? null;
+    const nextAddress = authResult.wallet.address.toLowerCase();
+    setWallet(authResult.wallet);
+    setAuthSession(authResult.session);
+
+    if (previousAddress !== nextAddress) {
+      const nextAddr = authResult.wallet.address as Address;
+      const derived = deriveLiveMetricsFromVault(
+        activeCycle,
+        proofSignedMap,
+        Date.now()
+      );
+      setStreakCount(derived.streakCount);
+      setTokenBalanceDht(derived.fallbackBalanceDht);
+      setLastLogTimestampMs(derived.lastLogTimestampMs);
+      void fetchOnChainNonce(nextAddr, 0n)
+        .then((nonce) => setCurrentNonce(nonce))
+        .catch(() => undefined);
+      void fetchTokenBalance(nextAddr, derived.fallbackBalanceDht)
+        .then((bal) => setTokenBalanceDht(bal))
+        .catch(() => undefined);
+    }
+  };
+
+  const handleSignInWithGoogle = async (): Promise<void> => {
+    const authResult = await signInWithGoogle();
+    applyAuthenticatedResult(authResult);
+  };
+
+  const handleContinueWithWallet = async (
+    privateKey?: string
+  ): Promise<void> => {
+    const authResult = await continueWithWallet(
+      privateKey ? { privateKey } : undefined
+    );
+    applyAuthenticatedResult(authResult);
+  };
+
+  const handleSignOut = async (): Promise<void> => {
+    await signOutSession();
+    setAuthSession(null);
   };
 
   const handleLogWeightEntry = (entry: WeightLogEntry): void => {
-    setWeightLogs((prev) => {
-      const next = [
-        ...prev.filter((item) => item.id !== entry.id),
-        entry
-      ].sort((a, b) => a.timestampMs - b.timestampMs);
-      computeRollingWeightAverage(next, nowMs);
-      return next;
-    });
+    setWeightLogs((prev) =>
+      [...prev.filter((item) => item.id !== entry.id), entry].sort(
+        (a, b) => a.timestampMs - b.timestampMs
+      )
+    );
   };
 
   const handleUpdateDailyPlan = (updatedPlan: DailyPlan): void => {
@@ -770,6 +861,9 @@ export default function App(): React.ReactElement {
   };
 
   const handleCheer = async (feedId: string): Promise<void> => {
+    if (cheeredFeedIds[feedId]) {
+      return;
+    }
     setCheerCounts((prev) => ({
       ...prev,
       [feedId]: (prev[feedId] ?? 0) + 1
@@ -777,12 +871,24 @@ export default function App(): React.ReactElement {
     const senderPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
     try {
       await sendPeerCheer(feedId, senderPseudonym);
+      setCheeredFeedIds((prev) => ({
+        ...prev,
+        [feedId]: true
+      }));
     } catch (err: unknown) {
       setCheerCounts((prev) => ({
         ...prev,
         [feedId]: Math.max(0, (prev[feedId] ?? 1) - 1)
       }));
-      showErrorNotice(err, "Peer Cheer Failed");
+      if (isDuplicateCheerError(err)) {
+        setCheeredFeedIds((prev) => ({
+          ...prev,
+          [feedId]: true
+        }));
+        showErrorNotice(err, "Already Cheered");
+      } else {
+        showErrorNotice(err, "Peer Cheer Failed");
+      }
       throw err;
     }
   };
@@ -818,10 +924,23 @@ export default function App(): React.ReactElement {
   return (
     <SafeAreaView style={styles.viewport}>
       <View style={styles.phoneFrame}>
-        {!hasCompletedOnboarding ? (
+        {!authSession ? (
+          <LoginScreen
+            onSignInWithGoogle={handleSignInWithGoogle}
+            onContinueWithWallet={handleContinueWithWallet}
+            isSupabaseConfigured={isSupabaseConfigured()}
+            existingWalletAddress={userAddress}
+            onError={(err) => {
+              showErrorNotice(err, "Authentication Failed");
+            }}
+          />
+        ) : !hasCompletedOnboarding ? (
           <OnboardingWizardScreen
             initialBiometrics={userBiometrics}
             onOnboardingComplete={handleOnboardingComplete}
+            onError={(err) => {
+              showErrorNotice(err, "Onboarding Failed");
+            }}
           />
         ) : (
           <>
@@ -881,6 +1000,8 @@ export default function App(): React.ReactElement {
                   currentTimestampMs={nowMs}
                   proofSignedMap={proofSignedMap}
                   governanceConfig={governanceConfig}
+                  authSession={authSession}
+                  onSignOut={handleSignOut}
                   onUpdateGovernanceConfig={setGovernanceConfig}
                   onLogWeightEntry={handleLogWeightEntry}
                   onUpdatePlanCycle={handleApprovePlan}
@@ -895,6 +1016,7 @@ export default function App(): React.ReactElement {
                 <AnonymizedFeedScreen
                   items={feedItems}
                   cheerCountsByFeedId={cheerCounts}
+                  cheeredFeedIds={cheeredFeedIds}
                   onCheer={handleCheer}
                   onError={(err) => {
                     showErrorNotice(err, "Peer Cheer Failed");
@@ -943,15 +1065,15 @@ export default function App(): React.ReactElement {
               onClose={() => setIsPerksDrawerOpen(false)}
               onRedeemPerk={handleRedeemPerk}
             />
-
-            {/* Global Error Pop-Up Modal */}
-            <ErrorNoticeModal
-              visible={errorNotice !== null}
-              notice={errorNotice}
-              onDismiss={clearErrorNotice}
-            />
           </>
         )}
+
+        {/* Global Error Pop-Up Modal */}
+        <ErrorNoticeModal
+          visible={errorNotice !== null}
+          notice={errorNotice}
+          onDismiss={clearErrorNotice}
+        />
       </View>
     </SafeAreaView>
   );

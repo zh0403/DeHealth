@@ -28,6 +28,7 @@ import {
   generate14DayPlan,
   scaleFoodPresetPortion
 } from "../services/adaptivePlanEngine";
+import { copyTextToClipboard } from "../services/clipboardService";
 import {
   buildDailyCheckInCommitment,
   deriveDeterministicDailySalt,
@@ -303,6 +304,17 @@ export function buildDailyPlanTelemetry(
   };
 }
 
+/**
+ * Formats an EVM wallet address into a compact `0x1234…abcd` display pill.
+ */
+export function formatShortWalletAddress(address: string): string {
+  const trimmed = address.trim();
+  if (trimmed.length >= 10) {
+    return `${trimmed.slice(0, 6)}…${trimmed.slice(-4)}`;
+  }
+  return trimmed;
+}
+
 export interface MicroCheckInScreenProps {
   readonly userAddress: Address;
   readonly verifyingContract: Address;
@@ -325,6 +337,7 @@ export interface MicroCheckInScreenProps {
   readonly initialPedometerAvailable?: boolean;
   readonly onUpdateDailyPlan?: (updatedPlan: DailyPlan) => void;
   readonly onDispatchSignedClaim: (payload: SignedWorkoutClaimPayload) => Promise<void>;
+  readonly onCopyWalletAddress?: (address: string) => Promise<void> | void;
   readonly onError?: (error: unknown) => void;
   readonly lastTxHash?: string | null;
   readonly lastExplorerUrl?: string | null;
@@ -354,6 +367,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   initialPedometerAvailable,
   onUpdateDailyPlan,
   onDispatchSignedClaim,
+  onCopyWalletAddress,
   onError,
   lastTxHash,
   lastExplorerUrl,
@@ -481,6 +495,20 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     readonly blockNumber: number;
     readonly status: string;
   } | null>(null);
+  const [isAddressCopied, setIsAddressCopied] = useState<boolean>(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
 
   const selectedPreset = useMemo<FoodPresetItem>(() => {
     return (
@@ -802,12 +830,71 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     });
   };
 
+  const handleCopyWalletAddress = async (): Promise<void> => {
+    const copied = await copyTextToClipboard(userAddress);
+    let customCopied = false;
+    if (onCopyWalletAddress) {
+      try {
+        await Promise.resolve(onCopyWalletAddress(userAddress));
+        customCopied = true;
+      } catch {
+        customCopied = false;
+      }
+    }
+
+    if (!isMountedRef.current) {
+      return;
+    }
+
+    if (copied || customCopied) {
+      setIsAddressCopied(true);
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = setTimeout(() => {
+        if (isMountedRef.current) {
+          setIsAddressCopied(false);
+        }
+        copyTimerRef.current = null;
+      }, 2500);
+    } else {
+      setIsAddressCopied(false);
+      setStatusStep("Clipboard unavailable; copy wallet address from Dashboard.");
+    }
+  };
+
   return (
     <ScrollView
       style={styles.container}
       contentContainerStyle={styles.scrollContent}
     >
       <View style={styles.heroHeader}>
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel="Copy Wallet Address"
+          testID="checkin-wallet-copy-pill"
+          style={({ pressed }) => [
+            styles.walletCopyPill,
+            isAddressCopied ? styles.walletCopyPillCopied : null,
+            pressed ? styles.walletCopyPillPressed : null
+          ]}
+          onPress={() => {
+            void handleCopyWalletAddress();
+          }}
+        >
+          <Text style={styles.walletCopyAddressText}>
+            {formatShortWalletAddress(userAddress)}
+          </Text>
+          <Text
+            style={[
+              styles.walletCopyBadgeText,
+              isAddressCopied ? styles.walletCopyBadgeCopiedText : null
+            ]}
+          >
+            {isAddressCopied ? "Copied ✓" : "Copy"}
+          </Text>
+        </Pressable>
+
         <View style={styles.heroBadgeRow}>
           <Text style={styles.dayBadge}>DAY {localPlan.dayNumber} OF 14</Text>
           {localPlan.isFatigueScaled ? (
@@ -1381,6 +1468,40 @@ const styles = StyleSheet.create({
   },
   heroHeader: {
     marginBottom: 16
+  },
+  walletCopyPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    alignSelf: "flex-start",
+    gap: 8,
+    backgroundColor: "#0F172A",
+    borderWidth: 1,
+    borderColor: "#1E293B",
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    marginBottom: 10
+  },
+  walletCopyPillCopied: {
+    borderColor: "#10B981",
+    backgroundColor: "#052E16"
+  },
+  walletCopyPillPressed: {
+    opacity: 0.78
+  },
+  walletCopyAddressText: {
+    fontSize: 11,
+    fontFamily: "monospace",
+    fontWeight: "700",
+    color: "#38BDF8"
+  },
+  walletCopyBadgeText: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#94A3B8"
+  },
+  walletCopyBadgeCopiedText: {
+    color: "#34D399"
   },
   heroBadgeRow: {
     flexDirection: "row",

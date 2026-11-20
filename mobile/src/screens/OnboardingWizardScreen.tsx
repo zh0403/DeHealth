@@ -7,7 +7,7 @@ import {
   UserBiometrics,
   UserBiometricsSchema
 } from "@dehealth/shared";
-import React, { useMemo, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import {
   Pressable,
   ScrollView,
@@ -16,6 +16,7 @@ import {
   TextInput,
   View
 } from "react-native";
+import { PlanPreviewModal } from "../components/PlanPreviewModal";
 import {
   calculateBmr,
   calculateMacroSplit,
@@ -180,6 +181,7 @@ export interface OnboardingWizardScreenProps {
     plan: AdaptivePlanCycle
   ) => void | Promise<void>;
   readonly initialBiometrics?: UserBiometrics | null;
+  readonly onError?: (error: unknown) => void;
   /** Optional storage injection for testing and isolation */
   readonly storage?: {
     readonly saveUserBiometrics: (biometrics: UserBiometrics) => Promise<void>;
@@ -187,9 +189,15 @@ export interface OnboardingWizardScreenProps {
   };
 }
 
+interface PendingPlanPreview {
+  readonly biometrics: UserBiometrics;
+  readonly plan: AdaptivePlanCycle;
+}
+
 export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
   onOnboardingComplete,
   initialBiometrics,
+  onError,
   storage
 }) => {
   const [currentStep, setCurrentStep] = useState<WizardStep>(1);
@@ -219,6 +227,10 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
 
   const [validationError, setValidationError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+  const isSubmittingRef = useRef<boolean>(false);
+  const [pendingPreview, setPendingPreview] = useState<PendingPlanPreview | null>(
+    null
+  );
 
   // Live physiology preview on Step 3
   const previewValues = useMemo(() => {
@@ -240,35 +252,14 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
   }, [goal, gender, ageStr, weightStr, heightStr, bodyFatStr, weeklyWorkoutFrequency]);
 
   /**
-   * "Skip for Now" bypass action handler: initializes baseline metrics,
-   * generates 14-day cycle, saves to encrypted storage, and calls onOnboardingComplete.
+   * Validates inputs and builds an in-memory 14-day plan preview without
+   * persisting to encrypted storage until the user explicitly approves.
    */
-  const handleSkip = async (): Promise<void> => {
-    setIsSubmitting(true);
-    setValidationError(null);
-    try {
-      const bio = DEFAULT_BASELINE_BIOMETRICS;
-      const plan = generate14DayPlan(bio, Date.now(), null);
-      const storageService = storage ?? {
-        saveUserBiometrics,
-        saveActivePlanCycle
-      };
-      await storageService.saveUserBiometrics(bio);
-      await storageService.saveActivePlanCycle(plan);
-      await onOnboardingComplete(bio, plan);
-    } catch (err) {
-      setValidationError(
-        err instanceof Error ? err.message : "Failed to save baseline biometrics"
-      );
-    } finally {
-      setIsSubmitting(false);
+  const handleComplete = (): void => {
+    if (isSubmittingRef.current || isSubmitting) {
+      return;
     }
-  };
 
-  /**
-   * Completes the onboarding flow with the user-provided inputs.
-   */
-  const handleComplete = async (): Promise<void> => {
     const result = validateOnboardingInputs({
       goal,
       gender,
@@ -284,11 +275,34 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
       return;
     }
 
-    setIsSubmitting(true);
     setValidationError(null);
     try {
       const bio = result.biometrics;
       const plan = generate14DayPlan(bio, Date.now(), null);
+      setPendingPreview({ biometrics: bio, plan });
+    } catch (err: unknown) {
+      setValidationError(
+        err instanceof Error ? err.message : "Failed to generate adaptive plan"
+      );
+      onError?.(err);
+    }
+  };
+
+  /**
+   * Persists the approved biometrics and Cycle 1 plan and completes onboarding.
+   */
+  const handleApproveAndStart = async (
+    bio: UserBiometrics,
+    plan: AdaptivePlanCycle
+  ): Promise<void> => {
+    if (isSubmittingRef.current || isSubmitting) {
+      return;
+    }
+
+    isSubmittingRef.current = true;
+    setIsSubmitting(true);
+    setValidationError(null);
+    try {
       const storageService = storage ?? {
         saveUserBiometrics,
         saveActivePlanCycle
@@ -296,19 +310,34 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
       await storageService.saveUserBiometrics(bio);
       await storageService.saveActivePlanCycle(plan);
       await onOnboardingComplete(bio, plan);
-    } catch (err) {
+      setPendingPreview(null);
+    } catch (err: unknown) {
       setValidationError(
-        err instanceof Error ? err.message : "Failed to generate adaptive plan"
+        err instanceof Error ? err.message : "Failed to save adaptive plan"
       );
+      onError?.(err);
     } finally {
+      isSubmittingRef.current = false;
       setIsSubmitting(false);
     }
   };
 
   /**
+   * Closes the plan preview modal and returns to Step 1 with all inputs intact.
+   */
+  const handleAdjustGoals = (): void => {
+    if (isSubmittingRef.current || isSubmitting) {
+      return;
+    }
+    setPendingPreview(null);
+    setValidationError(null);
+    setCurrentStep(1);
+  };
+
+  /**
    * Next step action handler with per-step validation.
    */
-  const handleNext = async (): Promise<void> => {
+  const handleNext = (): void => {
     if (currentStep === 1) {
       setValidationError(null);
       setCurrentStep(2);
@@ -335,7 +364,7 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
     }
 
     if (currentStep === 3) {
-      await handleComplete();
+      handleComplete();
     }
   };
 
@@ -351,7 +380,7 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
       contentContainerStyle={styles.scrollContent}
       keyboardShouldPersistTaps="handled"
     >
-      {/* Header with Title and Prominent Skip for Now button */}
+      {/* Header with Title */}
       <View style={styles.header}>
         <View style={styles.headerTextGroup}>
           <Text testID="wizard-step-title" style={styles.title}>
@@ -363,18 +392,6 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
             Step {currentStep} of 3
           </Text>
         </View>
-
-        <Pressable
-          testID="skip-button"
-          onPress={handleSkip}
-          disabled={isSubmitting}
-          style={({ pressed }) => [
-            styles.skipButton,
-            pressed ? styles.buttonPressed : null
-          ]}
-        >
-          <Text style={styles.skipButtonText}>Skip for Now</Text>
-        </Pressable>
       </View>
 
       {/* Progress Dots */}
@@ -643,6 +660,9 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
       <View style={styles.footer}>
         {currentStep > 1 ? (
           <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Back"
+            accessibilityState={{ disabled: isSubmitting }}
             testID="back-button"
             onPress={handleBack}
             disabled={isSubmitting}
@@ -656,6 +676,11 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
         ) : null}
 
         <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={
+            currentStep === 3 ? "Complete & Generate Plan" : "Continue"
+          }
+          accessibilityState={{ disabled: isSubmitting }}
           testID="next-button"
           onPress={handleNext}
           disabled={isSubmitting}
@@ -667,13 +692,23 @@ export const OnboardingWizardScreen: React.FC<OnboardingWizardScreenProps> = ({
         >
           <Text style={styles.nextButtonText}>
             {isSubmitting
-              ? "Generating Plan..."
+              ? "Saving Plan..."
               : currentStep === 3
                 ? "Complete & Generate Plan"
                 : "Continue"}
           </Text>
         </Pressable>
       </View>
+
+      <PlanPreviewModal
+        visible={pendingPreview !== null}
+        biometrics={pendingPreview?.biometrics ?? null}
+        plan={pendingPreview?.plan ?? null}
+        isApproving={isSubmitting}
+        errorMessage={validationError}
+        onApproveAndStart={handleApproveAndStart}
+        onAdjustGoals={handleAdjustGoals}
+      />
     </ScrollView>
   );
 };
@@ -706,19 +741,6 @@ const styles = StyleSheet.create({
   stepSubtitle: {
     fontSize: 13,
     color: "#94A3B8"
-  },
-  skipButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 12,
-    borderRadius: 8,
-    backgroundColor: "rgba(56, 189, 248, 0.12)",
-    borderWidth: 1,
-    borderColor: "rgba(56, 189, 248, 0.3)"
-  },
-  skipButtonText: {
-    color: "#38BDF8",
-    fontSize: 13,
-    fontWeight: "600"
   },
   progressBar: {
     flexDirection: "row",

@@ -1,6 +1,7 @@
 import {
   AdaptivePlanCycle,
   Address,
+  AuthSessionMetadata,
   Bytes32,
   DailyPlan,
   DEFAULT_BASELINE_BIOMETRICS,
@@ -39,6 +40,7 @@ import {
   isCycleBiWeeklyReviewDue,
   WeighInAdaptationProjection
 } from "../services/adaptivePlanEngine";
+import { copyTextToClipboard } from "../services/clipboardService";
 import {
   L2InspectorStatus,
   L2ServiceMode
@@ -164,6 +166,8 @@ export interface DashboardScreenProps {
   readonly initialInspectorStatus?: L2InspectorStatus | null;
   readonly loadInspectorStatus?: (userAddress: Address) => Promise<L2InspectorStatus>;
   readonly proofSignedMap?: Readonly<Record<string, boolean>>;
+  readonly authSession?: AuthSessionMetadata | null;
+  readonly onSignOut?: () => Promise<void> | void;
   readonly onError?: (error: unknown) => void;
 }
 
@@ -191,6 +195,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   initialInspectorStatus = null,
   loadInspectorStatus,
   proofSignedMap = {},
+  authSession = null,
+  onSignOut,
   onError
 }) => {
   const onErrorRef = useRef(onError);
@@ -294,6 +300,8 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const [exportedPrivateKey, setExportedPrivateKey] = useState<string | null>(null);
   const [isExportingKey, setIsExportingKey] = useState<boolean>(false);
   const [walletFeedback, setWalletFeedback] = useState<string | null>(null);
+  const [isSigningOut, setIsSigningOut] = useState<boolean>(false);
+  const isSigningOutRef = useRef<boolean>(false);
 
   const effectiveUserAddress = (userAddress ??
     "0x0000000000000000000000000000000000000000") as Address;
@@ -327,16 +335,28 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   const handleCopy = async (text: string, label: string): Promise<void> => {
-    try {
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(text);
-        setWalletFeedback(`${label} copied to clipboard!`);
-        return;
-      }
-    } catch {
-      // Non-fatal if clipboard API unavailable
+    const copied = await copyTextToClipboard(text);
+    setWalletFeedback(
+      copied
+        ? `${label} copied to clipboard!`
+        : `${label} selected. Copy via keyboard or long press.`
+    );
+  };
+
+  const handleSignOutPress = async (): Promise<void> => {
+    if (!onSignOut || isSigningOutRef.current || isSigningOut) {
+      return;
     }
-    setWalletFeedback(`${label} selected. Copy via keyboard or long press.`);
+    isSigningOutRef.current = true;
+    setIsSigningOut(true);
+    try {
+      await Promise.resolve(onSignOut());
+    } catch (err: unknown) {
+      onErrorRef.current?.(err);
+    } finally {
+      isSigningOutRef.current = false;
+      setIsSigningOut(false);
+    }
   };
 
   const handleToggleExportPrivateKey = async (): Promise<void> => {
@@ -1055,6 +1075,50 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
           </Pressable>
         ) : null}
       </View>
+
+      {/* Account Session & Safe Sign Out Card */}
+      {authSession || onSignOut ? (
+        <View style={styles.card}>
+          <View style={styles.cardHeaderRow}>
+            <Text style={styles.label}>Account Session</Text>
+            <Text style={styles.proofBadgeTag}>
+              {authSession?.authMethod === "google"
+                ? "Google OAuth"
+                : "Embedded Wallet"}
+            </Text>
+          </View>
+          <Text style={styles.walletDescription}>
+            Signed in as{" "}
+            {authSession?.displayLabel ??
+              (userAddress
+                ? `${userAddress.slice(0, 6)}\u2026${userAddress.slice(-4)}`
+                : "Embedded Wallet")}
+            . Signing out returns to Login without deleting your encrypted
+            biometric vault or embedded wallet.
+          </Text>
+          {onSignOut ? (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Sign Out"
+              accessibilityState={{ disabled: isSigningOut }}
+              testID="dashboard-signout-button"
+              disabled={isSigningOut}
+              style={({ pressed }) => [
+                styles.signOutBtn,
+                isSigningOut ? styles.saveWeightBtnDisabled : null,
+                pressed ? styles.btnPressed : null
+              ]}
+              onPress={() => {
+                void handleSignOutPress();
+              }}
+            >
+              <Text style={styles.signOutBtnText}>
+                {isSigningOut ? "Signing Out..." : "Sign Out"}
+              </Text>
+            </Pressable>
+          ) : null}
+        </View>
+      ) : null}
 
       {/* Standalone Log Weight / Biometrics Modal */}
       <Modal
@@ -1885,5 +1949,19 @@ const styles = StyleSheet.create({
     fontSize: 13,
     fontWeight: "800",
     color: "#38BDF8"
+  },
+  signOutBtn: {
+    backgroundColor: "#2A1215",
+    borderRadius: 10,
+    paddingVertical: 11,
+    paddingHorizontal: 14,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#EF4444"
+  },
+  signOutBtnText: {
+    fontSize: 13,
+    fontWeight: "800",
+    color: "#FCA5A5"
   }
 });
