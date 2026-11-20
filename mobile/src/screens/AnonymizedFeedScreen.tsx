@@ -11,6 +11,7 @@ import {
 export interface AnonymizedFeedScreenProps {
   readonly items: readonly AnonymizedFeedRecord[];
   readonly cheerCountsByFeedId?: Readonly<Record<string, number>>;
+  readonly cheeredFeedIds?: Readonly<Record<string, boolean>>;
   readonly onCheer?: (feedId: string) => void | Promise<void>;
   readonly onError?: (error: unknown) => void;
 }
@@ -24,24 +25,44 @@ const AVATAR_PALETTE = [
   { bg: "#D97706", icon: "🏋️" }
 ];
 
+function isDuplicateCheerErr(err: unknown): boolean {
+  if (typeof err !== "object" || err === null || Array.isArray(err)) {
+    return false;
+  }
+  const record = err as { readonly name?: unknown; readonly code?: unknown };
+  return (
+    record.name === "DuplicateCheerError" ||
+    String(record.code ?? "") === "23505"
+  );
+}
+
 export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
   items,
   cheerCountsByFeedId = {},
+  cheeredFeedIds = {},
   onCheer,
   onError
 }) => {
   const [cheeredMap, setCheeredMap] = useState<Readonly<Record<string, boolean>>>({});
+  const cheeredRef = useRef<Record<string, boolean>>({});
   const [submittingFeedIds, setSubmittingFeedIds] = useState<
     Readonly<Record<string, boolean>>
   >({});
   const submittingFeedIdsRef = useRef<Record<string, boolean>>({});
 
   const handleCheerPress = async (feedId: string): Promise<void> => {
-    if (submittingFeedIdsRef.current[feedId] || submittingFeedIds[feedId]) {
+    if (
+      submittingFeedIdsRef.current[feedId] ||
+      submittingFeedIds[feedId] ||
+      cheeredFeedIds[feedId] ||
+      cheeredMap[feedId] ||
+      cheeredRef.current[feedId]
+    ) {
       return;
     }
     submittingFeedIdsRef.current[feedId] = true;
-    const wasAlreadyCheered = Boolean(cheeredMap[feedId]);
+    const wasAlreadyCheered = Boolean(cheeredFeedIds[feedId] || cheeredMap[feedId]);
+    cheeredRef.current[feedId] = true;
     setSubmittingFeedIds((prev) => ({
       ...prev,
       [feedId]: true
@@ -54,11 +75,21 @@ export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
     try {
       await Promise.resolve(onCheer?.(feedId));
     } catch (err: unknown) {
-      setCheeredMap((prev) => ({
-        ...prev,
-        [feedId]: wasAlreadyCheered
-      }));
-      onError?.(err);
+      if (isDuplicateCheerErr(err)) {
+        cheeredRef.current[feedId] = true;
+        setCheeredMap((prev) => ({
+          ...prev,
+          [feedId]: true
+        }));
+        onError?.(err);
+      } else {
+        cheeredRef.current[feedId] = wasAlreadyCheered;
+        setCheeredMap((prev) => ({
+          ...prev,
+          [feedId]: wasAlreadyCheered
+        }));
+        onError?.(err);
+      }
     } finally {
       submittingFeedIdsRef.current[feedId] = false;
       setSubmittingFeedIds((prev) => ({
@@ -105,7 +136,7 @@ export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
         }
         renderItem={({ item }) => {
           const cheerCount = cheerCountsByFeedId[item.id] ?? 0;
-          const isCheered = cheeredMap[item.id] ?? false;
+          const isCheered = Boolean(cheeredFeedIds[item.id] || cheeredMap[item.id]);
           const isSubmitting = Boolean(submittingFeedIds[item.id]);
           const avatar = getAvatarMeta(item.user_pseudonym);
 
@@ -167,8 +198,8 @@ export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
                 <Pressable
                   accessibilityRole="button"
                   accessibilityLabel={`Cheer for @${item.user_pseudonym}`}
-                  accessibilityState={{ disabled: isSubmitting }}
-                  disabled={isSubmitting}
+                  accessibilityState={{ disabled: isSubmitting || isCheered }}
+                  disabled={isSubmitting || isCheered}
                   style={({ pressed }) => [
                     styles.cheerButton,
                     isCheered ? styles.cheerButtonActive : null,
@@ -188,7 +219,7 @@ export const AnonymizedFeedScreen: React.FC<AnonymizedFeedScreenProps> = ({
                       isCheered ? styles.cheerTextActive : null
                     ]}
                   >
-                    {isCheered ? "Cheered!" : "Cheer"} ({cheerCount})
+                    {isCheered ? "Cheered ✓" : "Cheer"} ({cheerCount})
                   </Text>
                 </Pressable>
 
