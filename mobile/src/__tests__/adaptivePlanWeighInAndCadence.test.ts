@@ -1300,5 +1300,178 @@ describe("M2 R2+R3: Rolling Weigh-In Adaptation, Storage Timestamp & Live Cadenc
       expect(hasText(tree, "Latest Weight69 kg")).toBe(true);
       expect(hasText(tree, "7-Day Rolling Avg69 kg")).toBe(true);
     });
+
+    it("resets isSubmittingReviewRef cleanly in finally when plan approval or keep-current rejects and allows retry", async () => {
+      const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, BASE_START_MS);
+      const day14Ms = BASE_START_MS + CYCLE_LENGTH_DAYS * MS_PER_DAY;
+
+      let deferred = createDeferred<void>();
+      const onUpdatePlanCycle = vi
+        .fn()
+        .mockImplementation(() => deferred.promise);
+      const onError = vi.fn();
+
+      const props: DashboardScreenProps = {
+        streakCount: 14,
+        tokenBalanceDht: "140.0",
+        lastProofHash: null,
+        targetAssessment: BASE_ASSESSMENT,
+        activeCycle: cycle,
+        currentTimestampMs: day14Ms,
+        userAddress: TEST_ADDRESS,
+        onUpdatePlanCycle,
+        onError
+      };
+
+      // Open PlanReviewModal
+      let tree = renderWithHarness(DashboardScreen, props);
+      (findByLabel(tree, "14-Day Plan Review")!.onPress as () => void)();
+      tree = renderWithHarness(DashboardScreen, props);
+
+      const modalEl1 = findElement(
+        tree,
+        (_elProps, elType) => elType === PlanReviewModal
+      );
+      expect(modalEl1).not.toBeNull();
+      expect(modalEl1!.visible).toBe(true);
+      const review1 = modalEl1!.review as ProposedPlanReview;
+
+      // 1. Same-frame double-tap on Approve New Plan -> blocks second call while in-flight
+      const approveFn = modalEl1!.onApproveNewPlan as (rev: ProposedPlanReview) => void;
+      approveFn(review1);
+      approveFn(review1);
+      expect(onUpdatePlanCycle).toHaveBeenCalledTimes(1);
+
+      // Reject first approval attempt -> finally must reset isSubmittingReviewRef and surface onError
+      const approveErr = new Error("Plan archive disk full");
+      deferred.reject(approveErr);
+      await flushMicrotasks(10);
+
+      expect(onError).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(approveErr);
+
+      // Re-render -> Retry Approve New Plan succeeds because ref unlocked in finally
+      deferred = createDeferred<void>();
+      tree = renderWithHarness(DashboardScreen, props);
+      const modalElRetry = findElement(
+        tree,
+        (_elProps, elType) => elType === PlanReviewModal
+      );
+      (modalElRetry!.onApproveNewPlan as (rev: ProposedPlanReview) => void)(
+        modalElRetry!.review as ProposedPlanReview
+      );
+      expect(onUpdatePlanCycle).toHaveBeenCalledTimes(2);
+      deferred.resolve(undefined);
+      await flushMicrotasks(10);
+
+      // 2. Same check on Keep Current Plan -> blocks double-tap & unlocks in finally on failure
+      resetHarness();
+      let keepDeferred = createDeferred<void>();
+      const onUpdateKeep = vi
+        .fn()
+        .mockImplementation(() => keepDeferred.promise);
+      const onKeepError = vi.fn();
+
+      const keepProps: DashboardScreenProps = {
+        ...props,
+        onUpdatePlanCycle: onUpdateKeep,
+        onError: onKeepError
+      };
+
+      let keepTree = renderWithHarness(DashboardScreen, keepProps);
+      (findByLabel(keepTree, "14-Day Plan Review")!.onPress as () => void)();
+      keepTree = renderWithHarness(DashboardScreen, keepProps);
+
+      const keepModal1 = findElement(
+        keepTree,
+        (_elProps, elType) => elType === PlanReviewModal
+      );
+      const keepFn = keepModal1!.onKeepCurrentPlan as (rev: ProposedPlanReview) => void;
+      const keepReview = keepModal1!.review as ProposedPlanReview;
+      keepFn(keepReview);
+      keepFn(keepReview);
+      expect(onUpdateKeep).toHaveBeenCalledTimes(1);
+
+      const keepErr = new Error("Keep plan persistence failed");
+      keepDeferred.reject(keepErr);
+      await flushMicrotasks(10);
+
+      expect(onKeepError).toHaveBeenCalledTimes(1);
+      expect(onKeepError).toHaveBeenCalledWith(keepErr);
+
+      keepDeferred = createDeferred<void>();
+      keepTree = renderWithHarness(DashboardScreen, keepProps);
+      const keepModalRetry = findElement(
+        keepTree,
+        (_elProps, elType) => elType === PlanReviewModal
+      );
+      (keepModalRetry!.onKeepCurrentPlan as (rev: ProposedPlanReview) => void)(
+        keepModalRetry!.review as ProposedPlanReview
+      );
+      expect(onUpdateKeep).toHaveBeenCalledTimes(2);
+      keepDeferred.resolve(undefined);
+      await flushMicrotasks(10);
+    });
+
+    it("renders Account Session with Sign Out button and resets sign-out spinner cleanly in finally", async () => {
+      const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, BASE_START_MS);
+      const day2Ms = BASE_START_MS + 2 * MS_PER_DAY;
+      let signOutDeferred = createDeferred<void>();
+      const onSignOut = vi.fn().mockImplementation(() => signOutDeferred.promise);
+      const onError = vi.fn();
+
+      const props: DashboardScreenProps = {
+        streakCount: 2,
+        tokenBalanceDht: "20.0",
+        lastProofHash: null,
+        targetAssessment: BASE_ASSESSMENT,
+        activeCycle: cycle,
+        currentTimestampMs: day2Ms,
+        userAddress: TEST_ADDRESS,
+        authSession: {
+          authMethod: "google",
+          accountId: "google_sub_123",
+          displayLabel: "athlete@example.com",
+          walletAddress: TEST_ADDRESS,
+          signedInAtMs: day2Ms
+        },
+        onSignOut,
+        onError
+      };
+
+      let tree = renderWithHarness(DashboardScreen, props);
+      expect(hasText(tree, "Account Session")).toBe(true);
+      expect(hasText(tree, "Google OAuth")).toBe(true);
+      expect(hasText(tree, "athlete@example.com")).toBe(true);
+
+      const signOutBtn = findByLabel(tree, "Sign Out");
+      expect(signOutBtn).not.toBeNull();
+      expect(signOutBtn!.disabled).toBe(false);
+
+      // Same-frame double-tap blocked
+      (signOutBtn!.onPress as () => void)();
+      (signOutBtn!.onPress as () => void)();
+      expect(onSignOut).toHaveBeenCalledTimes(1);
+
+      tree = renderWithHarness(DashboardScreen, props);
+      expect(hasText(tree, "Signing Out...")).toBe(true);
+      expect(findByLabel(tree, "Sign Out")!.disabled).toBe(true);
+
+      const signOutErr = new Error("Session revoke interrupted");
+      signOutDeferred.reject(signOutErr);
+      await flushMicrotasks(10);
+
+      expect(onError).toHaveBeenCalledWith(signOutErr);
+      tree = renderWithHarness(DashboardScreen, props);
+      expect(hasText(tree, "Signing Out...")).toBe(false);
+      expect(findByLabel(tree, "Sign Out")!.disabled).toBe(false);
+
+      // Retry succeeds
+      signOutDeferred = createDeferred<void>();
+      (findByLabel(tree, "Sign Out")!.onPress as () => void)();
+      expect(onSignOut).toHaveBeenCalledTimes(2);
+      signOutDeferred.resolve(undefined);
+      await flushMicrotasks(10);
+    });
   });
 });

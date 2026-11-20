@@ -7,13 +7,18 @@ import {
   DataSovereigntyViolationError,
   DEFAULT_FALLBACK_CHEER_COUNTS,
   DEFAULT_FALLBACK_FEED_ITEMS,
+  DuplicateCheerError,
   FeedProofVerificationError,
   fetchAnonymizedFeed,
+  fetchCheeredFeedIdsForUser,
   generateFallbackUuid,
+  getCheeredFeedIdsForSender,
   getLocalFallbackCheerCounts,
   getLocalFallbackFeedItems,
   getSupabaseClient,
   getSupabaseAnonKey,
+  hasLocalPeerCheered,
+  isDuplicateCheerError,
   isSupabaseConfigured,
   MAX_RECURSION_DEPTH,
   PROHIBITED_BIOMETRIC_KEYS,
@@ -30,6 +35,8 @@ import {
   Address,
   AnonymizedFeedRecord,
   Bytes32,
+  DUPLICATE_CHEER_ERROR_MESSAGE,
+  POSTGRES_UNIQUE_VIOLATION_CODE,
   SignedWorkoutClaimPayload,
   WorkoutProof
 } from "@dehealth/shared";
@@ -1165,6 +1172,187 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
       );
       expect(secondResult.mode).toBe("live");
       expect(insertMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  // ============================================================================
+  // 9. Single Cheer per Post Deduplication & DuplicateCheerError
+  // ============================================================================
+  describe("Peer Cheer Deduplication & DuplicateCheerError", () => {
+    const FEED_A = "00000000-0000-4000-8000-000000000001";
+    const FEED_B = "00000000-0000-4000-8000-000000000002";
+
+    it("throws DuplicateCheerError in fallback mode on repeat cheer without double-incrementing count", async () => {
+      const initialCount = DEFAULT_FALLBACK_CHEER_COUNTS[FEED_A] ?? 0;
+
+      const first = await sendPeerCheer(FEED_A, "athlete_alpha");
+      expect(first).toEqual({ success: true, mode: "local-fallback" });
+      expect(getLocalFallbackCheerCounts()[FEED_A]).toBe(initialCount + 1);
+      expect(hasLocalPeerCheered(FEED_A, "athlete_alpha")).toBe(true);
+
+      // Case-insensitive and trimmed duplicate is rejected before incrementing
+      await expect(sendPeerCheer(FEED_A, "  ATHLETE_ALPHA  ")).rejects.toThrow(
+        DuplicateCheerError
+      );
+      expect(getLocalFallbackCheerCounts()[FEED_A]).toBe(initialCount + 1);
+    });
+
+    it("allows different senders on the same post and same sender on different posts", async () => {
+      const initialA = DEFAULT_FALLBACK_CHEER_COUNTS[FEED_A] ?? 0;
+      const initialB = DEFAULT_FALLBACK_CHEER_COUNTS[FEED_B] ?? 0;
+
+      await expect(sendPeerCheer(FEED_A, "sender_one")).resolves.toEqual({
+        success: true,
+        mode: "local-fallback"
+      });
+      await expect(sendPeerCheer(FEED_A, "sender_two")).resolves.toEqual({
+        success: true,
+        mode: "local-fallback"
+      });
+      await expect(sendPeerCheer(FEED_B, "sender_one")).resolves.toEqual({
+        success: true,
+        mode: "local-fallback"
+      });
+
+      const counts = getLocalFallbackCheerCounts();
+      expect(counts[FEED_A]).toBe(initialA + 2);
+      expect(counts[FEED_B]).toBe(initialB + 1);
+      expect(getCheeredFeedIdsForSender("sender_one")).toEqual({
+        [FEED_A]: true,
+        [FEED_B]: true
+      });
+      expect(getCheeredFeedIdsForSender("sender_two")).toEqual({
+        [FEED_A]: true
+      });
+    });
+
+    it("throws DuplicateCheerError when live Supabase returns Postgres 23505 instead of falling back", async () => {
+      const initialA = DEFAULT_FALLBACK_CHEER_COUNTS[FEED_A] ?? 0;
+      const singleMock = vi.fn().mockResolvedValue({
+        data: null,
+        error: {
+          code: POSTGRES_UNIQUE_VIOLATION_CODE,
+          message:
+            'duplicate key value violates unique constraint "peer_cheers_feed_id_sender_pseudonym_key"'
+        }
+      });
+      const selectMock = vi.fn().mockReturnValue({ single: singleMock });
+      const insertMock = vi.fn().mockReturnValue({ select: selectMock });
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      let caught: unknown;
+      try {
+        await sendPeerCheer(FEED_A, "live_dup_user");
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(DuplicateCheerError);
+      expect(isDuplicateCheerError(caught)).toBe(true);
+      expect((caught as DuplicateCheerError).message).toBe(
+        DUPLICATE_CHEER_ERROR_MESSAGE
+      );
+      expect((caught as DuplicateCheerError).code).toBe(
+        POSTGRES_UNIQUE_VIOLATION_CODE
+      );
+      expect((caught as DuplicateCheerError).feedId).toBe(FEED_A);
+      expect((caught as DuplicateCheerError).senderPseudonym).toBe("live_dup_user");
+
+      // Local cheer count must NOT increment on 23505, while local dedup state stays synced
+      expect(getLocalFallbackCheerCounts()[FEED_A]).toBe(initialA);
+      expect(hasLocalPeerCheered(FEED_A, "live_dup_user")).toBe(true);
+      expect(getCheeredFeedIdsForSender("live_dup_user")).toEqual({
+        [FEED_A]: true
+      });
+
+      // Subsequent attempt hits local dedup guard immediately with 0 extra Supabase calls
+      await expect(sendPeerCheer(FEED_A, "live_dup_user")).rejects.toThrow(
+        DuplicateCheerError
+      );
+      expect(insertMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("detects duplicate unique constraint error by message even when code is absent", async () => {
+      const singleMock = vi.fn().mockResolvedValue({
+        data: null,
+        error: {
+          message: "duplicate key value violates unique constraint"
+        }
+      });
+      const selectMock = vi.fn().mockReturnValue({ single: singleMock });
+      const insertMock = vi.fn().mockReturnValue({ select: selectMock });
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      await expect(sendPeerCheer(FEED_B, "msg_dup_user")).rejects.toThrow(
+        DuplicateCheerError
+      );
+      expect(hasLocalPeerCheered(FEED_B, "msg_dup_user")).toBe(true);
+    });
+
+    it("fetchCheeredFeedIdsForUser merges remote and local cheered posts and falls back gracefully on errors", async () => {
+      // Blank sender returns {}
+      expect(await fetchCheeredFeedIdsForUser("   ")).toEqual({});
+
+      // Record one cheer locally first
+      await sendPeerCheer(FEED_A, "hybrid_user");
+
+      // Remote Supabase returns a second cheered feed_id for the same user
+      const eqMock = vi.fn().mockResolvedValue({
+        data: [{ feed_id: FEED_B }, { feed_id: "" }, { feed_id: null }],
+        error: null
+      });
+      const selectMock = vi.fn().mockReturnValue({ eq: eqMock });
+      const fromMock = vi.fn().mockReturnValue({ select: selectMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const merged = await fetchCheeredFeedIdsForUser(" hybrid_user ");
+      expect(fromMock).toHaveBeenCalledWith("peer_cheers");
+      expect(selectMock).toHaveBeenCalledWith("feed_id");
+      expect(eqMock).toHaveBeenCalledWith("sender_pseudonym", "hybrid_user");
+      expect(merged).toEqual({
+        [FEED_A]: true,
+        [FEED_B]: true
+      });
+      expect(hasLocalPeerCheered(FEED_B, "hybrid_user")).toBe(true);
+
+      // Network failure falls back cleanly to local dedup state
+      const throwingSelect = vi.fn().mockImplementation(() => {
+        throw new Error("Network down");
+      });
+      setSupabaseClient({
+        from: vi.fn().mockReturnValue({ select: throwingSelect })
+      } as unknown as SupabaseClient);
+
+      const fallbackMap = await fetchCheeredFeedIdsForUser("hybrid_user");
+      expect(fallbackMap).toEqual({
+        [FEED_A]: true,
+        [FEED_B]: true
+      });
+    });
+
+    it("isDuplicateCheerError accurately identifies DuplicateCheerError and Postgres 23505 objects", () => {
+      expect(isDuplicateCheerError(new DuplicateCheerError())).toBe(true);
+      expect(isDuplicateCheerError({ name: "DuplicateCheerError" })).toBe(true);
+      expect(
+        isDuplicateCheerError({ code: POSTGRES_UNIQUE_VIOLATION_CODE })
+      ).toBe(true);
+      expect(isDuplicateCheerError({ code: 23505 })).toBe(true);
+
+      expect(isDuplicateCheerError(null)).toBe(false);
+      expect(isDuplicateCheerError(undefined)).toBe(false);
+      expect(isDuplicateCheerError([])).toBe(false);
+      expect(isDuplicateCheerError(new Error("other"))).toBe(false);
+      expect(isDuplicateCheerError({ code: "42P01" })).toBe(false);
+
+      expect(hasLocalPeerCheered("", "anyone")).toBe(false);
+      expect(getCheeredFeedIdsForSender("   ")).toEqual({});
+
+      resetFeedVerificationStateForTesting();
+      expect(getCheeredFeedIdsForSender("hybrid_user")).toEqual({});
     });
   });
 });

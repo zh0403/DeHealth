@@ -1,4 +1,8 @@
-import { DEFAULT_BASELINE_BIOMETRICS } from "@dehealth/shared";
+import {
+  Address,
+  AuthSessionMetadata,
+  DEFAULT_BASELINE_BIOMETRICS
+} from "@dehealth/shared";
 import { Wallet } from "ethers";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -90,8 +94,19 @@ import {
   VaultHydrationDeps
 } from "../../App";
 import {
+  AUTH_SESSION_STORAGE_KEY,
+  AuthSessionStorage,
+  continueWithWallet,
+  copyTextToClipboard,
+  DuplicateCheerError,
   ErrorNoticeModal,
+  initializeAuthSessionStorage,
   InsufficientGasError,
+  LoginScreen,
+  PlanPreviewModal,
+  resetAuthSessionStorage,
+  signInWithGoogle,
+  signOutSession,
   toErrorNoticePayload
 } from "../index";
 import { generate14DayPlan } from "../services/adaptivePlanEngine";
@@ -145,6 +160,8 @@ function makeDeps(
     initializeAdaptiveStorage(keyStore, backend);
   const ensureGovStorage = async (): Promise<GovernanceStorage> =>
     initializeGovernanceStorage(keyStore, backend);
+  const ensureAuthStorage = async (): Promise<AuthSessionStorage> =>
+    initializeAuthSessionStorage(keyStore, backend);
 
   return {
     getUserBiometrics: async () => (await ensureStorage()).getUserBiometrics(),
@@ -155,6 +172,8 @@ function makeDeps(
       (await ensureStorage()).getDailyProofSignedMap(),
     getGovernanceConfig: async () =>
       (await ensureGovStorage()).getGovernanceConfig(),
+    getPersistedAuthSession: async () =>
+      (await ensureAuthStorage()).getPersistedAuthSession(),
     clearStoredWallet: async () => clearStoredWallet(keyStore),
     clearVaultSecret: async () => clearVaultSecret(keyStore),
     purgeAdaptiveStorageKeys: async () => {
@@ -166,6 +185,10 @@ function makeDeps(
     purgeGovernanceStorageKey: async () => {
       await backend.removeItem(GOVERNANCE_STORAGE_KEY);
       resetGovernanceStorage();
+    },
+    purgeAuthSessionStorageKey: async () => {
+      await backend.removeItem(AUTH_SESSION_STORAGE_KEY);
+      resetAuthSessionStorage();
     }
   };
 }
@@ -175,6 +198,7 @@ describe("App boot hydration error surface and vault reset recovery", () => {
     capturedPressables.length = 0;
     resetAdaptiveStorage();
     resetGovernanceStorage();
+    resetAuthSessionStorage();
     resetWalletStorageForTesting();
   });
 
@@ -388,6 +412,57 @@ describe("App boot hydration error surface and vault reset recovery", () => {
       expect(typeof ErrorNoticeModal).toBe("function");
       expect(typeof toErrorNoticePayload).toBe("function");
       expect(typeof InsufficientGasError).toBe("function");
+    });
+
+    it("exports the new modules from mobile/src/index.ts without collisions", () => {
+      expect(typeof copyTextToClipboard).toBe("function");
+      expect(typeof signInWithGoogle).toBe("function");
+      expect(typeof continueWithWallet).toBe("function");
+      expect(typeof signOutSession).toBe("function");
+      expect(typeof LoginScreen).toBe("function");
+      expect(typeof PlanPreviewModal).toBe("function");
+      expect(typeof DuplicateCheerError).toBe("function");
+    });
+  });
+
+  describe("Auth session hydration & signOutSession vault preservation", () => {
+    it("hydrates persisted AuthSessionMetadata cleanly and clears only session on signOutSession without touching biometrics", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryStorageBackend();
+      const adaptiveStorage = await initializeAdaptiveStorage(keyStore, backend);
+      const authStorage = await initializeAuthSessionStorage(keyStore, backend);
+
+      const wallet = await getOrCreatePersistentWallet(keyStore);
+      await adaptiveStorage.saveUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
+
+      const session: AuthSessionMetadata = {
+        authMethod: "wallet",
+        accountId: `wallet:${wallet.address.toLowerCase()}`,
+        displayLabel: `${wallet.address.slice(0, 6)}\u2026${wallet.address.slice(-4)}`,
+        walletAddress: wallet.address as Address,
+        signedInAtMs: 1_700_000_000_000
+      };
+      await authStorage.savePersistedAuthSession(session);
+
+      const deps = makeDeps(keyStore, backend);
+      const hydrated = await hydrateVaultData(deps);
+      expect(hydrated.storedAuthSession).toEqual(session);
+      expect(hydrated.storedBio).toEqual(DEFAULT_BASELINE_BIOMETRICS);
+      expect(hydrated.persistentWallet.address).toBe(wallet.address);
+
+      await signOutSession({ storage: authStorage });
+      expect(await authStorage.getPersistedAuthSession()).toBeNull();
+
+      const afterSignOut = await hydrateVaultData(deps);
+      expect(afterSignOut.storedAuthSession).toBeNull();
+      expect(afterSignOut.storedBio).toEqual(DEFAULT_BASELINE_BIOMETRICS);
+      expect(afterSignOut.persistentWallet.address).toBe(wallet.address);
+
+      // Full resetVaultAndRecover wipes everything including auth session
+      await authStorage.savePersistedAuthSession(session);
+      const recovered = await resetVaultAndRecover(deps);
+      expect(recovered.storedAuthSession).toBeNull();
+      expect(recovered.storedBio).toBeNull();
     });
   });
 });

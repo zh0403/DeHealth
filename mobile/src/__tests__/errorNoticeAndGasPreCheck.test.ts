@@ -251,6 +251,10 @@ import {
   setL2Provider,
   setRewardGateAddress
 } from "../services/l2ContractService";
+import {
+  resetClipboardAdapterForTesting,
+  setClipboardAdapterForTesting
+} from "../services/clipboardService";
 import { resetPedometerAdapterForTesting } from "../services/sensorService";
 import { resetAdaptiveStorage } from "../storage/adaptiveStorage";
 
@@ -421,6 +425,7 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
     resetL2Config();
     resetAdaptiveStorage();
     resetPedometerAdapterForTesting();
+    resetClipboardAdapterForTesting();
     sensorMocks.isPedometerAvailable = null;
     sensorMocks.getTodayStepCount = null;
     wallet = new Wallet(TEST_PRIVATE_KEY);
@@ -435,6 +440,7 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
 
   afterEach(() => {
     resetHarness();
+    resetClipboardAdapterForTesting();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -555,6 +561,28 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
 
       vi.stubGlobal("navigator", {});
       expect(await copyWalletAddressToClipboard(wallet.address)).toBe(false);
+    });
+
+    it("copyWalletAddressToClipboard invokes injected native ClipboardAdapter.setStringAsync and falls back to navigator.clipboard.writeText on rejection or absence", async () => {
+      const setStringAsync = vi.fn().mockResolvedValue(true);
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      setClipboardAdapterForTesting({ setStringAsync });
+
+      expect(await copyWalletAddressToClipboard(`  ${wallet.address}  `)).toBe(true);
+      expect(setStringAsync).toHaveBeenCalledWith(wallet.address);
+      expect(writeText).not.toHaveBeenCalled();
+
+      // Rejecting native adapter falls back cleanly to navigator.clipboard.writeText
+      setStringAsync.mockRejectedValueOnce(new Error("Native clipboard error"));
+      expect(await copyWalletAddressToClipboard(wallet.address)).toBe(true);
+      expect(writeText).toHaveBeenCalledTimes(1);
+      expect(writeText).toHaveBeenCalledWith(wallet.address);
+
+      // Absent native adapter (null) also uses navigator.clipboard.writeText
+      setClipboardAdapterForTesting(null);
+      expect(await copyWalletAddressToClipboard(wallet.address)).toBe(true);
+      expect(writeText).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -1090,12 +1118,12 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       expect(cheerBtn!.disabled).toBe(false);
       expect(hasText(tree, "Cheer (4)")).toBe(true);
 
-      // Press cheer -> optimistic Cheered! + disabled=true while pending
+      // Press cheer -> optimistic Cheered ✓ + disabled=true while pending
       (cheerBtn!.onPress as () => void)();
       tree = renderWithHarness(AnonymizedFeedScreen, props);
       const cheerBtnPending = findByLabel(tree, "Cheer for @iron_fox");
       expect(cheerBtnPending!.disabled).toBe(true);
-      expect(hasText(tree, "Cheered! (4)")).toBe(true);
+      expect(hasText(tree, "Cheered ✓ (4)")).toBe(true);
 
       // Reject async cheer -> rolls back, notifies onError, clears disabled in finally
       const cheerErr = new Error("Supabase RPC unavailable");
@@ -1109,7 +1137,7 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       expect(onError).toHaveBeenCalledWith(cheerErr);
     });
 
-    it("keeps Cheered! state when synchronous or resolving onCheer completes and handles missing onError safely", async () => {
+    it("keeps Cheered ✓ state and locks against duplicate cheers when resolving onCheer completes and handles missing onError safely", async () => {
       // Resolving async cheer
       const resolvingProps: AnonymizedFeedScreenProps = {
         items: sampleFeed,
@@ -1121,8 +1149,8 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       (findByLabel(tree, "Cheer for @iron_fox")!.onPress as () => void)();
       await flushMicrotasks(10);
       tree = renderWithHarness(AnonymizedFeedScreen, resolvingProps);
-      expect(findByLabel(tree, "Cheer for @iron_fox")!.disabled).toBe(false);
-      expect(hasText(tree, "Cheered! (2)")).toBe(true);
+      expect(findByLabel(tree, "Cheer for @iron_fox")!.disabled).toBe(true);
+      expect(hasText(tree, "Cheered ✓ (2)")).toBe(true);
 
       // Rejecting async cheer when onError is omitted must not cause unhandled rejection
       resetHarness();
@@ -1180,7 +1208,7 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       expect(onCheer).toHaveBeenCalledTimes(2);
       expect(onCheer.mock.calls).toEqual([["feed-1"], ["feed-2"]]);
 
-      // feed-1 rejects -> rolls back & unlocks in finally; feed-2 resolves -> stays Cheered! & unlocks
+      // feed-1 rejects -> rolls back & unlocks in finally; feed-2 resolves -> stays Cheered ✓ & stays locked
       deferredByFeed["feed-1"]!.reject(new Error("Feed 1 cheer timeout"));
       deferredByFeed["feed-2"]!.resolve(undefined);
       await flushMicrotasks(10);
@@ -1188,9 +1216,9 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       tree = renderWithHarness(AnonymizedFeedScreen, props);
       expect(onError).toHaveBeenCalledTimes(1);
       expect(findByLabel(tree, "Cheer for @iron_fox")!.disabled).toBe(false);
-      expect(findByLabel(tree, "Cheer for @swift_hawk")!.disabled).toBe(false);
+      expect(findByLabel(tree, "Cheer for @swift_hawk")!.disabled).toBe(true);
       expect(hasText(tree, "Cheer (4)")).toBe(true);
-      expect(hasText(tree, "Cheered! (9)")).toBe(true);
+      expect(hasText(tree, "Cheered ✓ (9)")).toBe(true);
 
       // Retry feed-1 after finally reset succeeds
       deferredByFeed["feed-1"] = createDeferred<void>();

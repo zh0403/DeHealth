@@ -7,6 +7,7 @@ import {
   exportWalletPrivateKey,
   getOrCreatePersistentWallet,
   getStoredWallet,
+  importPersistentWallet,
   isValidPrivateKey,
   resetWalletStorageForTesting,
   WALLET_PRIVATE_KEY_STORAGE_KEY,
@@ -761,6 +762,220 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
 
       const dw3 = await getOrCreatePersistentWallet();
       expect(dw3.address).not.toBe(dw2a.address);
+    });
+  });
+
+  describe("importPersistentWallet", () => {
+    it("imports a 0x-prefixed hex private key (with surrounding whitespace / mixed case) and persists it", async () => {
+      const store = new InMemoryKeyStore();
+      const generated = Wallet.createRandom();
+      const expectedAddress = generated.address;
+      const mixedCaseKey = `  0x${generated.privateKey.slice(2).toUpperCase()}  `;
+
+      const imported = await importPersistentWallet(mixedCaseKey, store);
+      expect(imported).toBeInstanceOf(Wallet);
+      expect(imported.address).toBe(expectedAddress);
+      expect(imported.privateKey).toBe(generated.privateKey);
+
+      const persisted = await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY);
+      expect(persisted).toBe(generated.privateKey);
+      const reloaded = await getStoredWallet(store);
+      expect(reloaded?.address).toBe(expectedAddress);
+    });
+
+    it("normalizes and imports a 64-character hex private key without 0x prefix", async () => {
+      const store = new InMemoryKeyStore();
+      const generated = Wallet.createRandom();
+      const rawHexNoPrefix = generated.privateKey.slice(2);
+
+      const imported = await importPersistentWallet(` ${rawHexNoPrefix} `, store);
+      expect(imported.address).toBe(generated.address);
+      expect(imported.privateKey).toBe(generated.privateKey);
+      expect(await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
+        generated.privateKey
+      );
+    });
+
+    it("fails closed on invalid private key formats BEFORE touching storage or overwriting an existing wallet", async () => {
+      const store = new InMemoryKeyStore();
+      const existing = await getOrCreatePersistentWallet(store);
+      const getItemSpy = vi.spyOn(store, "getItem");
+      const setItemSpy = vi.spyOn(store, "setItem");
+
+      const invalidInputs = [
+        "",
+        "   ",
+        "0x1234",
+        "g".repeat(64),
+        "0x" + "a1".repeat(31),
+        "0x" + "a1".repeat(33),
+        "not-a-private-key"
+      ];
+
+      for (const badInput of invalidInputs) {
+        await expect(importPersistentWallet(badInput, store)).rejects.toThrow(
+          WalletStorageError
+        );
+      }
+
+      expect(getItemSpy).not.toHaveBeenCalled();
+      expect(setItemSpy).not.toHaveBeenCalled();
+      expect(await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
+        existing.privateKey
+      );
+
+      // Zero scalar (passes regex, invalid secp256k1 key) also fails without touching storage
+      setItemSpy.mockClear();
+      await expect(
+        importPersistentWallet("0x" + "00".repeat(32), store)
+      ).rejects.toThrow(WalletStorageError);
+      expect(setItemSpy).not.toHaveBeenCalled();
+      expect((await getStoredWallet(store))?.address).toBe(existing.address);
+    });
+
+    it("throws WalletStorageError on read-back mismatch and recovers queue cleanly for subsequent imports", async () => {
+      const inner = new InMemoryKeyStore();
+      let failWrite = true;
+      const flakyStore: vaultKeyProvider.SecureKeyStore = {
+        getItem: (key) => inner.getItem(key),
+        setItem: async (key, value) => {
+          if (failWrite) {
+            return;
+          }
+          return inner.setItem(key, value);
+        },
+        deleteItem: (key) => inner.deleteItem(key)
+      };
+
+      const targetWallet = Wallet.createRandom();
+      await expect(
+        importPersistentWallet(targetWallet.privateKey, flakyStore)
+      ).rejects.toThrow(WalletStorageError);
+
+      // Queue must NOT be wedged after rejection
+      failWrite = false;
+      const recovered = await importPersistentWallet(
+        targetWallet.privateKey,
+        flakyStore
+      );
+      expect(recovered.address).toBe(targetWallet.address);
+      expect(await inner.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
+        targetWallet.privateKey
+      );
+    });
+
+    it("updates cachedWallet on default platform store and wraps VaultKeyUnavailableError into WalletStorageError", async () => {
+      const platformStore = new InMemoryKeyStore();
+      const spy = vi
+        .spyOn(vaultKeyProvider, "createPlatformKeyStore")
+        .mockResolvedValue(platformStore);
+
+      const importedTarget = Wallet.createRandom();
+      const imported = await importPersistentWallet(importedTarget.privateKey);
+      expect(imported.address).toBe(importedTarget.address);
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      // Subsequent getOrCreatePersistentWallet hits cachedWallet without re-resolving platform store
+      const cached = await getOrCreatePersistentWallet();
+      expect(cached).toBe(imported);
+      expect(spy).toHaveBeenCalledTimes(1);
+
+      resetWalletStorageForTesting();
+      vi.spyOn(vaultKeyProvider, "createPlatformKeyStore").mockRejectedValueOnce(
+        new vaultKeyProvider.VaultKeyUnavailableError("Hardware keystore unavailable")
+      );
+      await expect(
+        importPersistentWallet(importedTarget.privateKey)
+      ).rejects.toThrow(WalletStorageError);
+    });
+
+    it("serializes concurrent operations in strict FIFO order across custom and default stores", async () => {
+      // Custom store: create -> import1 -> import2
+      const inner = new InMemoryKeyStore();
+      const ops: string[] = [];
+      let releaseFirstSet!: () => void;
+      const firstSetGate = new Promise<void>((resolve) => {
+        releaseFirstSet = resolve;
+      });
+      let setCount = 0;
+
+      const customStore: vaultKeyProvider.SecureKeyStore = {
+        getItem: async (key) => {
+          ops.push("getItem");
+          return inner.getItem(key);
+        },
+        setItem: async (key, value) => {
+          setCount += 1;
+          ops.push(`setItem#${setCount}`);
+          if (setCount === 1) {
+            await firstSetGate;
+          }
+          return inner.setItem(key, value);
+        },
+        deleteItem: (key) => inner.deleteItem(key)
+      };
+
+      const wImport1 = Wallet.createRandom();
+      const wImport2 = Wallet.createRandom();
+
+      const createPromise = getOrCreatePersistentWallet(customStore);
+      await Promise.resolve();
+      const importPromise1 = importPersistentWallet(wImport1.privateKey, customStore);
+      const importPromise2 = importPersistentWallet(wImport2.privateKey, customStore);
+
+      releaseFirstSet();
+      const [created, imp1, imp2] = await Promise.all([
+        createPromise,
+        importPromise1,
+        importPromise2
+      ]);
+
+      expect(created).toBeInstanceOf(Wallet);
+      expect(imp1.address).toBe(wImport1.address);
+      expect(imp2.address).toBe(wImport2.address);
+      expect(ops).toEqual([
+        "getItem",
+        "setItem#1",
+        "getItem",
+        "setItem#2",
+        "getItem",
+        "setItem#3",
+        "getItem"
+      ]);
+      expect(await inner.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
+        wImport2.privateKey
+      );
+
+      // Default store: concurrent create -> import1 -> import2 -> getOrCreate keeps final imported key cached
+      resetWalletStorageForTesting();
+      const defaultInner = new InMemoryKeyStore();
+      let releaseDefaultStore!: (store: InMemoryKeyStore) => void;
+      const deferredStore = new Promise<InMemoryKeyStore>((resolve) => {
+        releaseDefaultStore = resolve;
+      });
+      vi.spyOn(vaultKeyProvider, "createPlatformKeyStore")
+        .mockReturnValueOnce(deferredStore)
+        .mockResolvedValue(defaultInner);
+
+      const dCreate = getOrCreatePersistentWallet();
+      const dImp1 = importPersistentWallet(wImport1.privateKey);
+      const dImp2 = importPersistentWallet(wImport2.privateKey);
+      const dAfter = getOrCreatePersistentWallet();
+
+      releaseDefaultStore(defaultInner);
+      const [, rImp1, rImp2, rAfter] = await Promise.all([
+        dCreate,
+        dImp1,
+        dImp2,
+        dAfter
+      ]);
+
+      expect(rImp1.address).toBe(wImport1.address);
+      expect(rImp2.address).toBe(wImport2.address);
+      expect(rAfter.address).toBe(wImport2.address);
+      expect(await defaultInner.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
+        wImport2.privateKey
+      );
     });
   });
 });
