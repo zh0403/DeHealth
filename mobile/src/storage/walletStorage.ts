@@ -83,6 +83,113 @@ async function resolveWalletFromStore(store: SecureKeyStore): Promise<Wallet> {
   return newWallet;
 }
 
+async function persistImportedWallet(
+  store: SecureKeyStore,
+  normalizedPrivateKey: string
+): Promise<Wallet> {
+  let wallet: Wallet;
+  try {
+    wallet = new Wallet(normalizedPrivateKey);
+  } catch (err) {
+    throw new WalletStorageError(
+      err instanceof Error
+        ? `Invalid private key: ${err.message}`
+        : "Invalid private key."
+    );
+  }
+
+  await store.setItem(WALLET_PRIVATE_KEY_STORAGE_KEY, wallet.privateKey);
+
+  const readBack = await store.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY);
+  if (readBack !== wallet.privateKey) {
+    throw new WalletStorageError(
+      "Wallet private key could not be persisted to secure storage; refusing to import wallet."
+    );
+  }
+
+  return wallet;
+}
+
+/**
+ * Validates, normalizes, and imports an Ethereum private key into persistent
+ * secure storage, replacing any previously stored key on the target store.
+ *
+ * Serializes through the per-store FIFO queue and verifies persistence with a
+ * read-back check before returning the resulting Wallet.
+ */
+export async function importPersistentWallet(
+  privateKey: string,
+  keyStore?: SecureKeyStore
+): Promise<Wallet> {
+  const trimmed = typeof privateKey === "string" ? privateKey.trim() : "";
+  const normalized = /^[0-9a-fA-F]{64}$/.test(trimmed)
+    ? `0x${trimmed}`
+    : trimmed;
+
+  if (!isValidPrivateKey(normalized)) {
+    throw new WalletStorageError(
+      "Invalid private key format. Expected a 64-character hex Ethereum private key."
+    );
+  }
+
+  if (keyStore) {
+    const state = getStoreQueueState(keyStore);
+    state.activeBatch = null;
+
+    const previousTail = state.tail;
+    const work = (async (): Promise<Wallet> => {
+      await previousTail;
+      try {
+        return await persistImportedWallet(keyStore, normalized);
+      } catch (err) {
+        if (err instanceof VaultKeyUnavailableError) {
+          throw new WalletStorageError(err.message);
+        }
+        throw err;
+      }
+    })();
+
+    state.tail = work.then(
+      () => undefined,
+      () => undefined
+    );
+    return work;
+  }
+
+  const state = defaultQueueState;
+  cachedWallet = null;
+  state.activeBatch = null;
+
+  const previousTail = state.tail;
+  let tailMarker!: Promise<void>;
+  const work = (async (): Promise<Wallet> => {
+    await previousTail;
+    if (state === defaultQueueState) {
+      cachedWallet = null;
+    }
+    try {
+      const store = await createPlatformKeyStore();
+      const wallet = await persistImportedWallet(store, normalized);
+      if (state === defaultQueueState && state.tail === tailMarker) {
+        cachedWallet = wallet;
+      }
+      return wallet;
+    } catch (err) {
+      if (err instanceof VaultKeyUnavailableError) {
+        throw new WalletStorageError(err.message);
+      }
+      throw err;
+    }
+  })();
+
+  tailMarker = work.then(
+    () => undefined,
+    () => undefined
+  );
+  state.tail = tailMarker;
+  return work;
+}
+
 /**
  * Returns the persisted embedded wallet, generating and persisting a new one
  * on first launch via platform-secure storage (expo-secure-store on native,

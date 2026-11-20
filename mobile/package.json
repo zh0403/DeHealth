@@ -19,6 +19,7 @@
     "@supabase/supabase-js": "^2.46.1",
     "ethers": "^6.13.4",
     "expo": "~51.0.28",
+    "expo-clipboard": "~6.0.3",
     "expo-crypto": "~13.0.2",
     "expo-secure-store": "~13.0.2",
     "expo-sensors": "~13.0.9",

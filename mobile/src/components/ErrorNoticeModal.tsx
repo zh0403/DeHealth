@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
+import { copyTextToClipboard } from "../services/clipboardService";
 import {
   DEFAULT_INSUFFICIENT_GAS_MESSAGE,
   InsufficientGasError
@@ -90,24 +91,7 @@ export function toErrorNoticePayload(
 export async function copyWalletAddressToClipboard(
   address: string
 ): Promise<boolean> {
-  const trimmed = address.trim();
-  if (trimmed.length === 0) {
-    return false;
-  }
-
-  try {
-    if (
-      typeof navigator !== "undefined" &&
-      typeof navigator.clipboard?.writeText === "function"
-    ) {
-      await navigator.clipboard.writeText(trimmed);
-      return true;
-    }
-  } catch {
-    return false;
-  }
-
-  return false;
+  return copyTextToClipboard(address);
 }
 
 export const ErrorNoticeModal: React.FC<ErrorNoticeModalProps> = ({
