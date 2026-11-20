@@ -1,4 +1,4 @@
-import { Bytes32 } from "./eip712";
+import { Address, Bytes32 } from "./eip712";
 
 export interface UserProfile {
   readonly age: number;
@@ -236,4 +236,20 @@ export interface ProposedPlanReview {
   readonly proposedMacroSplit: MacroSplit;
   readonly rationale: string;
   readonly status: PlanReviewStatus;
+}
+
+// ============================================================================
+// Authentication Session Models
+// ============================================================================
+
+export const AUTH_METHODS = ["google", "wallet"] as const;
+
+export type AuthMethod = (typeof AUTH_METHODS)[number];
+
+export interface AuthSessionMetadata {
+  readonly authMethod: AuthMethod;
+  readonly accountId: string;
+  readonly displayLabel: string;
+  readonly walletAddress: Address;
+  readonly signedInAtMs: number;
 }

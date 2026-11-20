@@ -8,6 +8,11 @@ import {
   AddressSchema,
   AnonymizedFeedInsertSchema,
   ARBITRUM_SEPOLIA_CHAIN_ID,
+  AUTH_METHODS,
+  AuthMethod,
+  AuthMethodSchema,
+  AuthSessionMetadata,
+  AuthSessionMetadataSchema,
   Bytes32,
   Bytes32Schema,
   createDeHealthDomain,
@@ -16,6 +21,7 @@ import {
   DEFAULT_BASELINE_BIOMETRICS,
   DEHEALTH_EIP712_DOMAIN_NAME,
   DEHEALTH_EIP712_VERSION,
+  DUPLICATE_CHEER_ERROR_MESSAGE,
   Eip712DomainSchema,
   FITNESS_GOALS,
   FitnessGoalSchema,
@@ -27,12 +33,14 @@ import {
   HexSignatureSchema,
   MacroSplit,
   MacroSplitSchema,
+  makePeerCheerDedupKey,
   PeerCheerInsertSchema,
   PLAN_CYCLE_STATUSES,
   PLAN_REVIEW_STATUSES,
   PlanCycleStatusSchema,
   PlanReviewStatus,
   PlanReviewStatusSchema,
+  POSTGRES_UNIQUE_VIOLATION_CODE,
   ProposedPlanReview,
   ProposedPlanReviewSchema,
   SignedWorkoutClaimPayloadSchema,
@@ -1544,6 +1552,166 @@ describe("Shared Domain Layer & Cryptographic Schemas", () => {
         status: "pending"
       });
       expect(reviewResult.success).toBe(false);
+    });
+  });
+
+  // ==========================================================================
+  // Auth Session & Peer Cheer Deduplication Test Suite
+  // ==========================================================================
+
+  describe("AuthMethodSchema & AUTH_METHODS", () => {
+    it("exports supported authentication methods and validates each variant", () => {
+      expect(AUTH_METHODS).toEqual(["google", "wallet"]);
+      for (const method of AUTH_METHODS) {
+        expect(AuthMethodSchema.parse(method)).toBe(method);
+      }
+    });
+
+    it("rejects invalid authentication method values", () => {
+      expect(() => AuthMethodSchema.parse("apple")).toThrow();
+      expect(() => AuthMethodSchema.parse("GOOGLE")).toThrow();
+      expect(() => AuthMethodSchema.parse("")).toThrow();
+      expect(() => AuthMethodSchema.parse(null)).toThrow();
+      expect(() => AuthMethodSchema.parse(42)).toThrow();
+    });
+  });
+
+  describe("AuthSessionMetadataSchema", () => {
+    const validSession: AuthSessionMetadata = {
+      authMethod: "google",
+      accountId: "google-oauth2-sub-123456",
+      displayLabel: "athlete@example.com",
+      walletAddress: sampleValidAddress,
+      signedInAtMs: 1710000000000
+    };
+
+    it("parses valid google and wallet sessions and trims accountId and displayLabel", () => {
+      const parsedGoogle = AuthSessionMetadataSchema.parse({
+        ...validSession,
+        accountId: "  google-oauth2-sub-123456  ",
+        displayLabel: "  athlete@example.com  "
+      });
+      expect(parsedGoogle).toEqual(validSession);
+
+      const parsedWallet = AuthSessionMetadataSchema.parse({
+        authMethod: "wallet" satisfies AuthMethod,
+        accountId: "0x1111222233334444555566667777888899990000",
+        displayLabel: "  0x1111...0000  ",
+        walletAddress: sampleValidAddress,
+        signedInAtMs: 1710000005000
+      });
+      expect(parsedWallet.authMethod).toBe("wallet");
+      expect(parsedWallet.displayLabel).toBe("0x1111...0000");
+    });
+
+    it("rejects malformed walletAddress values", () => {
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, walletAddress: "0x123" })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({
+          ...validSession,
+          walletAddress: "1111222233334444555566667777888899990000"
+        })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, walletAddress: "" })
+      ).toThrow();
+    });
+
+    it("validates accountId and displayLabel non-empty trimmed bounds (1 to 128 chars)", () => {
+      expect(
+        AuthSessionMetadataSchema.parse({ ...validSession, accountId: "a".repeat(128) })
+      ).toBeDefined();
+      expect(
+        AuthSessionMetadataSchema.parse({ ...validSession, displayLabel: "b".repeat(128) })
+      ).toBeDefined();
+
+      expect(() => AuthSessionMetadataSchema.parse({ ...validSession, accountId: "" })).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, accountId: "   " })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, accountId: "a".repeat(129) })
+      ).toThrow();
+
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, displayLabel: "" })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, displayLabel: "   " })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, displayLabel: "b".repeat(129) })
+      ).toThrow();
+    });
+
+    it("rejects non-positive, float, and non-finite signedInAtMs values", () => {
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, signedInAtMs: 0 })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, signedInAtMs: -1 })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, signedInAtMs: 1710000000000.5 })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, signedInAtMs: Infinity })
+      ).toThrow();
+      expect(() =>
+        AuthSessionMetadataSchema.parse({ ...validSession, signedInAtMs: -Infinity })
+      ).toThrow();
+    });
+
+    it("rejects extra biometric keys via strict() mode", () => {
+      const withWeight = AuthSessionMetadataSchema.safeParse({
+        ...validSession,
+        weightKg: 72.5
+      });
+      expect(withWeight.success).toBe(false);
+
+      const withStepCount = AuthSessionMetadataSchema.safeParse({
+        ...validSession,
+        stepCount: 10500
+      });
+      expect(withStepCount.success).toBe(false);
+
+      expect(() =>
+        AuthSessionMetadataSchema.parse({
+          ...validSession,
+          avgHeartRateBpm: 140
+        })
+      ).toThrow();
+    });
+  });
+
+  describe("Peer Cheer Deduplication Constants & Key Helper", () => {
+    it("exports standard duplicate cheer error message and postgres unique violation code", () => {
+      expect(DUPLICATE_CHEER_ERROR_MESSAGE).toBe("You have already cheered this milestone.");
+      expect(POSTGRES_UNIQUE_VIOLATION_CODE).toBe("23505");
+    });
+
+    it("normalizes feedId and senderPseudonym by trimming and lowercasing", () => {
+      const key = makePeerCheerDedupKey(
+        "  550E8400-E29B-41D4-A716-446655440000  ",
+        "  CheerLeader_99 \t"
+      );
+      expect(key).toBe("550e8400-e29b-41d4-a716-446655440000::cheerleader_99");
+      expect(
+        makePeerCheerDedupKey("550e8400-e29b-41d4-a716-446655440000", "cheerleader_99")
+      ).toBe(key);
+    });
+
+    it("throws when feedId or senderPseudonym is empty or whitespace-only", () => {
+      expect(() => makePeerCheerDedupKey("", "cheerleader_99")).toThrow();
+      expect(() => makePeerCheerDedupKey("   \t\n ", "cheerleader_99")).toThrow();
+      expect(() =>
+        makePeerCheerDedupKey("550e8400-e29b-41d4-a716-446655440000", "")
+      ).toThrow();
+      expect(() =>
+        makePeerCheerDedupKey("550e8400-e29b-41d4-a716-446655440000", "   ")
+      ).toThrow();
     });
   });
 });

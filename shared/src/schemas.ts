@@ -13,6 +13,9 @@ import {
 import {
   ACTIVITY_LEVELS,
   AdaptivePlanCycle,
+  AUTH_METHODS,
+  AuthMethod,
+  AuthSessionMetadata,
   DailyPlan,
   FITNESS_GOALS,
   FitnessGoal,
@@ -268,3 +271,50 @@ export const ProposedPlanReviewSchema: z.ZodType<ProposedPlanReview> = z.object(
   rationale: z.string().trim().min(1),
   status: PlanReviewStatusSchema
 });
+
+// ============================================================================
+// Auth Session & Peer Cheer Deduplication Schemas
+// ============================================================================
+
+export const AuthMethodSchema: z.ZodType<AuthMethod> = z.enum(AUTH_METHODS);
+
+export const AuthSessionMetadataSchema: z.ZodType<
+  AuthSessionMetadata,
+  z.ZodTypeDef,
+  {
+    authMethod: AuthMethod;
+    accountId: string;
+    displayLabel: string;
+    walletAddress: string;
+    signedInAtMs: number;
+  }
+> = z
+  .object({
+    authMethod: AuthMethodSchema,
+    accountId: z.string().trim().min(1).max(128),
+    displayLabel: z.string().trim().min(1).max(128),
+    walletAddress: AddressSchema,
+    signedInAtMs: z.number().int().positive()
+  })
+  .strict();
+
+export const DUPLICATE_CHEER_ERROR_MESSAGE = "You have already cheered this milestone.";
+
+export const POSTGRES_UNIQUE_VIOLATION_CODE = "23505";
+
+/**
+ * Builds a normalized deduplication key for a peer cheer `(feed_id, sender_pseudonym)` pair.
+ */
+export function makePeerCheerDedupKey(feedId: string, senderPseudonym: string): string {
+  const normalizedFeedId = feedId.trim().toLowerCase();
+  if (normalizedFeedId.length === 0) {
+    throw new Error("feedId must not be empty");
+  }
+
+  const normalizedSender = senderPseudonym.trim().toLowerCase();
+  if (normalizedSender.length === 0) {
+    throw new Error("senderPseudonym must not be empty");
+  }
+
+  return `${normalizedFeedId}::${normalizedSender}`;
+}
