@@ -659,6 +659,9 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
     it("copies wallet address in 1 tap, shows feedback, resets feedback on re-open, and falls back without clipboard", async () => {
       const writeText = vi.fn().mockResolvedValue(undefined);
       vi.stubGlobal("navigator", { clipboard: { writeText } });
+      // Exercise the browser clipboard path deterministically instead of
+      // racing a real dynamic import of the native module.
+      setClipboardAdapterForTesting(null);
 
       const onCopyWalletAddress = vi.fn();
       const onDismiss = vi.fn();
