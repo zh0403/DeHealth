@@ -1561,13 +1561,14 @@ describe("Shared Domain Layer & Cryptographic Schemas", () => {
 
   describe("AuthMethodSchema & AUTH_METHODS", () => {
     it("exports supported authentication methods and validates each variant", () => {
-      expect(AUTH_METHODS).toEqual(["google", "wallet"]);
+      expect(AUTH_METHODS).toEqual(["google", "metamask", "walletconnect", "local"]);
       for (const method of AUTH_METHODS) {
         expect(AuthMethodSchema.parse(method)).toBe(method);
       }
     });
 
-    it("rejects invalid authentication method values", () => {
+    it("rejects legacy wallet and invalid authentication method values", () => {
+      expect(() => AuthMethodSchema.parse("wallet")).toThrow();
       expect(() => AuthMethodSchema.parse("apple")).toThrow();
       expect(() => AuthMethodSchema.parse("GOOGLE")).toThrow();
       expect(() => AuthMethodSchema.parse("")).toThrow();
@@ -1585,7 +1586,7 @@ describe("Shared Domain Layer & Cryptographic Schemas", () => {
       signedInAtMs: 1710000000000
     };
 
-    it("parses valid google and wallet sessions and trims accountId and displayLabel", () => {
+    it("parses valid sessions for all 4 AUTH_METHODS and trims accountId and displayLabel", () => {
       const parsedGoogle = AuthSessionMetadataSchema.parse({
         ...validSession,
         accountId: "  google-oauth2-sub-123456  ",
@@ -1593,15 +1594,56 @@ describe("Shared Domain Layer & Cryptographic Schemas", () => {
       });
       expect(parsedGoogle).toEqual(validSession);
 
-      const parsedWallet = AuthSessionMetadataSchema.parse({
-        authMethod: "wallet" satisfies AuthMethod,
-        accountId: "0x1111222233334444555566667777888899990000",
-        displayLabel: "  0x1111...0000  ",
-        walletAddress: sampleValidAddress,
-        signedInAtMs: 1710000005000
-      });
-      expect(parsedWallet.authMethod).toBe("wallet");
-      expect(parsedWallet.displayLabel).toBe("0x1111...0000");
+      const sessionsByMethod: ReadonlyArray<{
+        readonly authMethod: AuthMethod;
+        readonly accountId: string;
+        readonly displayLabel: string;
+      }> = [
+        {
+          authMethod: "google",
+          accountId: "  google-oauth2-sub-123456  ",
+          displayLabel: "  athlete@example.com  "
+        },
+        {
+          authMethod: "metamask",
+          accountId: "0x1111222233334444555566667777888899990000",
+          displayLabel: "  0x1111...0000  "
+        },
+        {
+          authMethod: "walletconnect",
+          accountId: "  wc:0x1111222233334444555566667777888899990000  ",
+          displayLabel: "  WalletConnect 0x1111...0000  "
+        },
+        {
+          authMethod: "local",
+          accountId: "  local-0x1111222233334444555566667777888899990000  ",
+          displayLabel: "  Local Vault 0x1111...0000  "
+        }
+      ];
+
+      for (const entry of sessionsByMethod) {
+        const parsed = AuthSessionMetadataSchema.parse({
+          authMethod: entry.authMethod,
+          accountId: entry.accountId,
+          displayLabel: entry.displayLabel,
+          walletAddress: sampleValidAddress,
+          signedInAtMs: 1710000005000
+        });
+        expect(parsed.authMethod).toBe(entry.authMethod);
+        expect(parsed.accountId).toBe(entry.accountId.trim());
+        expect(parsed.displayLabel).toBe(entry.displayLabel.trim());
+      }
+    });
+
+    it("rejects legacy wallet and invalid authMethod values in AuthSessionMetadataSchema", () => {
+      for (const invalidMethod of ["wallet", "apple", "METAMASK", ""]) {
+        expect(() =>
+          AuthSessionMetadataSchema.parse({
+            ...validSession,
+            authMethod: invalidMethod
+          })
+        ).toThrow();
+      }
     });
 
     it("rejects malformed walletAddress values", () => {

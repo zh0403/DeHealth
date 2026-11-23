@@ -242,7 +242,12 @@ export interface ProposedPlanReview {
 // Authentication Session Models
 // ============================================================================
 
-export const AUTH_METHODS = ["google", "wallet"] as const;
+export const AUTH_METHODS = [
+  "google",
+  "metamask",
+  "walletconnect",
+  "local"
+] as const;
 
 export type AuthMethod = (typeof AUTH_METHODS)[number];
 
