@@ -264,6 +264,7 @@ const seenVerifiedClaimKeys = new Set<string>();
 const seenVerifiedProofHashes = new Set<string>();
 const cheeredPairKeys = new Set<string>();
 const cheeredFeedIdsBySender = new Map<string, Set<string>>();
+const inFlightCheerKeys = new Set<string>();
 
 /**
  * Clears in-memory replay/duplicate verification state for verified feed proofs
@@ -274,6 +275,7 @@ export function resetFeedVerificationStateForTesting(): void {
   seenVerifiedProofHashes.clear();
   cheeredPairKeys.clear();
   cheeredFeedIdsBySender.clear();
+  inFlightCheerKeys.clear();
 }
 
 /**
@@ -335,15 +337,22 @@ export function recordLocalCheer(feedId: string): void {
   localCheerCounts[feedId] = current + 1;
 }
 
+/**
+ * Normalizes a sender pseudonym by trimming whitespace and lowercasing so
+ * deduplication, local tracking, and Supabase queries share a canonical form.
+ */
+export function normalizeSenderPseudonym(senderPseudonym: string): string {
+  return senderPseudonym.trim().toLowerCase();
+}
+
 function recordLocalCheeredPair(feedId: string, senderPseudonym: string): void {
   const trimmedFeedId = feedId.trim();
-  const trimmedSender = senderPseudonym.trim();
-  if (!trimmedFeedId || !trimmedSender) {
+  const normalizedSender = normalizeSenderPseudonym(senderPseudonym);
+  if (!trimmedFeedId || !normalizedSender) {
     return;
   }
-  cheeredPairKeys.add(makePeerCheerDedupKey(trimmedFeedId, trimmedSender));
+  cheeredPairKeys.add(makePeerCheerDedupKey(trimmedFeedId, normalizedSender));
 
-  const normalizedSender = trimmedSender.toLowerCase();
   let feedIds = cheeredFeedIdsBySender.get(normalizedSender);
   if (!feedIds) {
     feedIds = new Set<string>();
@@ -361,11 +370,11 @@ export function hasLocalPeerCheered(
   senderPseudonym: string
 ): boolean {
   const trimmedFeedId = feedId.trim();
-  const trimmedSender = senderPseudonym.trim();
-  if (!trimmedFeedId || !trimmedSender) {
+  const normalizedSender = normalizeSenderPseudonym(senderPseudonym);
+  if (!trimmedFeedId || !normalizedSender) {
     return false;
   }
-  return cheeredPairKeys.has(makePeerCheerDedupKey(trimmedFeedId, trimmedSender));
+  return cheeredPairKeys.has(makePeerCheerDedupKey(trimmedFeedId, normalizedSender));
 }
 
 /**
@@ -375,7 +384,7 @@ export function hasLocalPeerCheered(
 export function getCheeredFeedIdsForSender(
   senderPseudonym: string
 ): Record<string, boolean> {
-  const normalizedSender = senderPseudonym.trim().toLowerCase();
+  const normalizedSender = normalizeSenderPseudonym(senderPseudonym);
   if (!normalizedSender) {
     return {};
   }
@@ -398,8 +407,8 @@ export function getCheeredFeedIdsForSender(
 export async function fetchCheeredFeedIdsForUser(
   senderPseudonym: string
 ): Promise<Record<string, boolean>> {
-  const trimmedSender = senderPseudonym.trim();
-  if (!trimmedSender) {
+  const normalizedSender = normalizeSenderPseudonym(senderPseudonym);
+  if (!normalizedSender) {
     return {};
   }
 
@@ -409,12 +418,12 @@ export async function fetchCheeredFeedIdsForUser(
       const { data, error } = await client
         .from("peer_cheers")
         .select("feed_id")
-        .eq("sender_pseudonym", trimmedSender);
+        .eq("sender_pseudonym", normalizedSender);
 
       if (!error && Array.isArray(data)) {
         for (const row of data as Array<{ readonly feed_id?: unknown }>) {
           if (typeof row?.feed_id === "string" && row.feed_id.trim().length > 0) {
-            recordLocalCheeredPair(row.feed_id, trimmedSender);
+            recordLocalCheeredPair(row.feed_id, normalizedSender);
           }
         }
       }
@@ -423,7 +432,7 @@ export async function fetchCheeredFeedIdsForUser(
     }
   }
 
-  return getCheeredFeedIdsForSender(trimmedSender);
+  return getCheeredFeedIdsForSender(normalizedSender);
 }
 
 // Supabase client instance management
@@ -726,49 +735,25 @@ export async function sendPeerCheer(
     feed_id: feedId,
     sender_pseudonym: senderPseudonym
   });
+  const normalizedSender = normalizeSenderPseudonym(validated.sender_pseudonym);
 
   const dedupKey = makePeerCheerDedupKey(
     validated.feed_id,
-    validated.sender_pseudonym
+    normalizedSender
   );
-  if (cheeredPairKeys.has(dedupKey)) {
+  if (cheeredPairKeys.has(dedupKey) || inFlightCheerKeys.has(dedupKey)) {
     throw new DuplicateCheerError(
       DUPLICATE_CHEER_ERROR_MESSAGE,
       validated.feed_id,
-      validated.sender_pseudonym
+      normalizedSender
     );
   }
-
-  const client = getSupabaseClient();
-  if (!client) {
-    recordLocalCheeredPair(validated.feed_id, validated.sender_pseudonym);
-    recordLocalCheer(validated.feed_id);
-    return {
-      success: true,
-      mode: "local-fallback"
-    };
-  }
+  inFlightCheerKeys.add(dedupKey);
 
   try {
-    const { error } = await client
-      .from("peer_cheers")
-      .insert({
-        feed_id: validated.feed_id,
-        sender_pseudonym: validated.sender_pseudonym
-      })
-      .select("id, feed_id, sender_pseudonym, created_at")
-      .single();
-
-    if (error) {
-      if (isPostgresUniqueViolation(error)) {
-        recordLocalCheeredPair(validated.feed_id, validated.sender_pseudonym);
-        throw new DuplicateCheerError(
-          DUPLICATE_CHEER_ERROR_MESSAGE,
-          validated.feed_id,
-          validated.sender_pseudonym
-        );
-      }
-      recordLocalCheeredPair(validated.feed_id, validated.sender_pseudonym);
+    const client = getSupabaseClient();
+    if (!client) {
+      recordLocalCheeredPair(validated.feed_id, normalizedSender);
       recordLocalCheer(validated.feed_id);
       return {
         success: true,
@@ -776,7 +761,32 @@ export async function sendPeerCheer(
       };
     }
 
-    recordLocalCheeredPair(validated.feed_id, validated.sender_pseudonym);
+    const { error } = await client
+      .from("peer_cheers")
+      .insert({
+        feed_id: validated.feed_id,
+        sender_pseudonym: normalizedSender
+      })
+      .select("id, feed_id, sender_pseudonym, created_at")
+      .single();
+
+    if (error) {
+      if (isPostgresUniqueViolation(error)) {
+        recordLocalCheeredPair(validated.feed_id, normalizedSender);
+        throw new DuplicateCheerError(
+          DUPLICATE_CHEER_ERROR_MESSAGE,
+          validated.feed_id,
+          normalizedSender
+        );
+      }
+      recordLocalCheer(validated.feed_id);
+      return {
+        success: true,
+        mode: "local-fallback"
+      };
+    }
+
+    recordLocalCheeredPair(validated.feed_id, normalizedSender);
     recordLocalCheer(validated.feed_id);
     return {
       success: true,
@@ -786,11 +796,12 @@ export async function sendPeerCheer(
     if (isDuplicateCheerError(err)) {
       throw err;
     }
-    recordLocalCheeredPair(validated.feed_id, validated.sender_pseudonym);
     recordLocalCheer(validated.feed_id);
     return {
       success: true,
       mode: "local-fallback"
     };
+  } finally {
+    inFlightCheerKeys.delete(dedupKey);
   }
 }
