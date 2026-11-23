@@ -861,12 +861,31 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       expect(res.session.authMethod).toBe("google");
       expect(res.session.accountId).toBe("supa-pkce-user-1");
 
-      // Replay of completed code after flow finishes is rejected as unsolicited
-      await expect(
-        completeOAuthRedirectCallback(
+      // Replay of a completed code after the flow finishes is a quiet no-op
+      expect(
+        await completeOAuthRedirectCallback(
           "dehealth://auth-callback?code=pkce-code-777"
         )
-      ).rejects.toThrow(/Unsolicited Google OAuth callback rejected/);
+      ).toBe(false);
+      expect(exchangeCodeForSessionMock).toHaveBeenCalledTimes(1);
+      expect(
+        await handleIncomingOAuthRedirectUrl(
+          "dehealth://auth-callback?code=pkce-code-777",
+          { keyStore, storage }
+        )
+      ).toBeNull();
+
+      // An unknown code, or a completed code mixed with a token or error, is
+      // still rejected as unsolicited
+      for (const url of [
+        "dehealth://auth-callback?code=never-completed",
+        "dehealth://auth-callback?code=pkce-code-777&error=access_denied",
+        "dehealth://auth-callback?code=pkce-code-777#access_token=tok"
+      ]) {
+        await expect(completeOAuthRedirectCallback(url)).rejects.toThrow(
+          /Unsolicited Google OAuth callback rejected/
+        );
+      }
 
       // While an OAuth attempt IS pending:
       //  a) Duplicate delivery of completed PKCE code deduplicates cleanly

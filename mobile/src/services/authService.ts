@@ -869,6 +869,21 @@ export async function completeOAuthRedirectCallback(
       params.errorDescription
   );
 
+  // The OS can deliver a redirect through the link listener after the active
+  // sign-in already consumed it (for example Android Custom Tabs). Treat a
+  // repeat of a completed authorization code as a quiet no-op. Anything else
+  // that arrives with no sign-in pending is still rejected below.
+  if (
+    !pendingGoogleOAuthAttempt &&
+    params.code &&
+    !params.accessToken &&
+    !params.error &&
+    !params.errorDescription &&
+    completedOAuthExchanges.has(`code:${params.code}`)
+  ) {
+    return false;
+  }
+
   if (
     !pendingGoogleOAuthAttempt &&
     (hasOAuthCredentialOrError || isAuthCallbackRedirectUrl(callbackUrl))
