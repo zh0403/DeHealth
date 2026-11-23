@@ -90,6 +90,7 @@ import {
   deriveLiveMetricsFromVault,
   hydrateVaultData,
   resetVaultAndRecover,
+  resolveClaimSigner,
   VaultBootGate,
   VaultHydrationDeps
 } from "../../App";
@@ -500,5 +501,114 @@ describe("App boot hydration error surface and vault reset recovery", () => {
       expect(recovered.storedAuthSession).toBeNull();
       expect(recovered.storedBio).toBeNull();
     });
+
+    it("drops persisted metamask/walletconnect sessions to LoginScreen when silent externalSigner restore fails on boot, preserving vault (E1)", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryStorageBackend();
+      const adaptiveStorage = await initializeAdaptiveStorage(keyStore, backend);
+      const authStorage = await initializeAuthSessionStorage(keyStore, backend);
+
+      const embeddedWallet = await getOrCreatePersistentWallet(keyStore);
+      await adaptiveStorage.saveUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
+
+      const externalWallet = Wallet.createRandom();
+      const externalAddress = externalWallet.address as Address;
+
+      for (const method of ["metamask", "walletconnect"] as const) {
+        const extSession: AuthSessionMetadata = {
+          authMethod: method,
+          accountId: externalAddress,
+          displayLabel: `${method} (${externalAddress.slice(0, 6)}…${externalAddress.slice(-4)})`,
+          walletAddress: externalAddress,
+          signedInAtMs: 1_750_000_000_000
+        };
+        await authStorage.savePersistedAuthSession(extSession);
+
+        const deps: VaultHydrationDeps = {
+          ...makeDeps(keyStore, backend),
+          restoreExternalSigner: vi.fn().mockResolvedValue(null),
+          clearPersistedAuthSession: async () => {
+            await authStorage.clearPersistedAuthSession();
+          }
+        };
+
+        const hydrated = await hydrateVaultData(deps);
+        expect(hydrated.storedAuthSession).toBeNull();
+        expect(hydrated.externalSigner).toBeNull();
+        expect(await authStorage.getPersistedAuthSession()).toBeNull();
+
+        // Vault and embedded wallet remain 100% intact
+        expect(hydrated.storedBio).toEqual(DEFAULT_BASELINE_BIOMETRICS);
+        expect(hydrated.persistentWallet.address).toBe(embeddedWallet.address);
+      }
+    });
+
+    it("restores externalSigner cleanly alongside metamask/walletconnect session when silent restore succeeds on boot (E1)", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryStorageBackend();
+      await initializeAdaptiveStorage(keyStore, backend);
+      const authStorage = await initializeAuthSessionStorage(keyStore, backend);
+
+      await getOrCreatePersistentWallet(keyStore);
+      const externalWallet = Wallet.createRandom();
+      const externalAddress = externalWallet.address as Address;
+      const wcSession: AuthSessionMetadata = {
+        authMethod: "walletconnect",
+        accountId: externalAddress,
+        displayLabel: `WalletConnect (${externalAddress.slice(0, 6)}…${externalAddress.slice(-4)})`,
+        walletAddress: externalAddress,
+        signedInAtMs: 1_750_000_000_000
+      };
+      await authStorage.savePersistedAuthSession(wcSession);
+
+      const deps: VaultHydrationDeps = {
+        ...makeDeps(keyStore, backend),
+        restoreExternalSigner: vi.fn().mockResolvedValue(externalWallet),
+        clearPersistedAuthSession: async () => {
+          await authStorage.clearPersistedAuthSession();
+        }
+      };
+
+      const hydrated = await hydrateVaultData(deps);
+      expect(hydrated.storedAuthSession).toEqual(wcSession);
+      expect(hydrated.externalSigner).toBe(externalWallet);
+      expect(await authStorage.getPersistedAuthSession()).toEqual(wcSession);
+    });
+  });
+});
+
+describe("resolveClaimSigner external wallet guard", () => {
+  const external = Wallet.createRandom();
+  const local = Wallet.createRandom();
+  const baseSession = {
+    accountId: "acct",
+    displayLabel: "label",
+    walletAddress: external.address as Address,
+    signedInAtMs: 1_700_000_000_000
+  };
+
+  it("returns the external signer for metamask and walletconnect sessions", () => {
+    for (const authMethod of ["metamask", "walletconnect"] as const) {
+      const session: AuthSessionMetadata = { ...baseSession, authMethod };
+      expect(resolveClaimSigner(session, external, local)).toBe(external);
+    }
+  });
+
+  it("throws instead of falling back to the local wallet when an external signer is missing", () => {
+    for (const authMethod of ["metamask", "walletconnect"] as const) {
+      const session: AuthSessionMetadata = { ...baseSession, authMethod };
+      expect(() => resolveClaimSigner(session, null, local)).toThrow(
+        /External wallet signer is disconnected/
+      );
+    }
+  });
+
+  it("uses the local wallet for local and google sessions and when no session exists", () => {
+    for (const authMethod of ["local", "google"] as const) {
+      const session: AuthSessionMetadata = { ...baseSession, authMethod };
+      expect(resolveClaimSigner(session, external, local)).toBe(local);
+    }
+    expect(resolveClaimSigner(null, null, local)).toBe(local);
+    expect(resolveClaimSigner(null, null, null)).toBeUndefined();
   });
 });

@@ -23,26 +23,36 @@ import {
   AuthError,
   AuthSessionStorage,
   clearPersistedAuthSession,
+  completeOAuthRedirectCallback,
   createEip1193Signer,
   Eip1193Provider,
   formatShortAddress,
   getAuthSessionStorage,
   getPersistedAuthSession,
   getWalletConnectProjectId,
+  handleIncomingOAuthRedirectUrl,
   initializeAuthSessionStorage,
   purgeAuthSessionStorageKey,
   resetAuthSessionStorage,
+  resetDeepLinkOpenerForTesting,
   resetMetaMaskAdapterForTesting,
+  resetOAuthBrowserAdapterForTesting,
+  resetUniversalProviderFactoryForTesting,
   resetWalletConnectAdapterForTesting,
+  restoreExternalWalletSignerOnBoot,
   savePersistedAuthSession,
   setAuthSessionStorage,
+  setDeepLinkOpenerForTesting,
   setMetaMaskAdapterForTesting,
+  setOAuthBrowserAdapterForTesting,
+  setUniversalProviderFactoryForTesting,
   setWalletConnectAdapterForTesting,
   signInWithGoogle,
   signInWithMetaMask,
   signInWithWalletConnect,
   signOutSession,
-  startLocalSession
+  startLocalSession,
+  UniversalProviderLike
 } from "../services/authService";
 import {
   signWorkoutProof,
@@ -170,6 +180,9 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
     resetWalletStorageForTesting();
     resetMetaMaskAdapterForTesting();
     resetWalletConnectAdapterForTesting();
+    resetOAuthBrowserAdapterForTesting();
+    resetUniversalProviderFactoryForTesting();
+    resetDeepLinkOpenerForTesting();
 
     originalWcProjectId = process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
     delete process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
@@ -188,6 +201,9 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
     resetWalletStorageForTesting();
     resetMetaMaskAdapterForTesting();
     resetWalletConnectAdapterForTesting();
+    resetOAuthBrowserAdapterForTesting();
+    resetUniversalProviderFactoryForTesting();
+    resetDeepLinkOpenerForTesting();
 
     if (originalWcProjectId === undefined) {
       delete process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
@@ -492,7 +508,10 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       ]);
       expect(signInWithOAuthMock).toHaveBeenCalledWith({
         provider: "google",
-        options: { redirectTo: "dehealth://auth-callback" }
+        options: {
+          redirectTo: "dehealth://auth-callback",
+          skipBrowserRedirect: true
+        }
       });
       expect(result.mode).toBe("live");
       expect(result.oauthUrl).toBe(
@@ -758,6 +777,133 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
         `Local Session (${formatShortAddress(second.walletAddress)})`
       );
       expect(await getPersistedAuthSession()).toEqual(second.session);
+    });
+
+    it("opens WebBrowser auth session, exchanges PKCE code / implicit tokens from redirect URL, and deduplicates incoming deep links (G1)", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const storage = await initializeAuthSessionStorage(keyStore, backend);
+
+      const exchangeCodeForSessionMock = vi.fn().mockResolvedValue({
+        data: { session: { access_token: "pkce-at" } },
+        error: null
+      });
+      const setSessionMock = vi.fn().mockResolvedValue({
+        data: { session: { access_token: "hash-at" } },
+        error: null
+      });
+      const getUserMock = vi.fn().mockResolvedValue({
+        data: {
+          user: {
+            id: "supa-pkce-user-1",
+            email: "pkce@dehealth.xyz"
+          }
+        },
+        error: null
+      });
+
+      setSupabaseClient({
+        auth: {
+          signInWithOAuth: vi.fn().mockResolvedValue({
+            data: {
+              provider: "google",
+              url: "https://accounts.google.com/o/oauth2/v2/auth?pkce=1"
+            },
+            error: null
+          }),
+          exchangeCodeForSession: exchangeCodeForSessionMock,
+          setSession: setSessionMock,
+          getUser: getUserMock
+        }
+      } as unknown as SupabaseClient);
+
+      const openAuthSessionAsyncMock = vi.fn().mockResolvedValue({
+        type: "success",
+        url: "dehealth://auth-callback?code=pkce-code-777"
+      });
+      setOAuthBrowserAdapterForTesting({
+        openAuthSessionAsync: openAuthSessionAsyncMock
+      });
+
+      const res = await signInWithGoogle({
+        keyStore,
+        storage,
+        nowMs: 70_000
+      });
+
+      expect(openAuthSessionAsyncMock).toHaveBeenCalledWith(
+        "https://accounts.google.com/o/oauth2/v2/auth?pkce=1",
+        "dehealth://auth-callback"
+      );
+      expect(exchangeCodeForSessionMock).toHaveBeenCalledWith("pkce-code-777");
+      expect(res.session.authMethod).toBe("google");
+      expect(res.session.accountId).toBe("supa-pkce-user-1");
+
+      // Duplicate deep-link delivery of same PKCE code does NOT double-exchange
+      const dupHandled = await completeOAuthRedirectCallback(
+        "dehealth://auth-callback?code=pkce-code-777"
+      );
+      expect(dupHandled).toBe(true);
+      expect(exchangeCodeForSessionMock).toHaveBeenCalledTimes(1);
+
+      // Hash-fragment token deep-link sets Supabase session and hydrates Google session
+      const incomingResult = await handleIncomingOAuthRedirectUrl(
+        "dehealth://auth-callback#access_token=tok_abc&refresh_token=ref_xyz",
+        { keyStore, storage, nowMs: 71_000 }
+      );
+      expect(setSessionMock).toHaveBeenCalledWith({
+        access_token: "tok_abc",
+        refresh_token: "ref_xyz"
+      });
+      expect(incomingResult?.session.authMethod).toBe("google");
+      expect(incomingResult?.walletAddress).toBe(res.walletAddress);
+
+      // Non-OAuth deep-link URLs are ignored cleanly
+      expect(
+        await handleIncomingOAuthRedirectUrl("dehealth://dashboard/checkin", {
+          keyStore,
+          storage
+        })
+      ).toBeNull();
+    });
+
+    it("fails closed when WebBrowser OAuth is cancelled/dismissed or returns OAuth error without saving session (G1)", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const storage = await initializeAuthSessionStorage(keyStore, backend);
+
+      setSupabaseClient({
+        auth: {
+          signInWithOAuth: vi.fn().mockResolvedValue({
+            data: {
+              provider: "google",
+              url: "https://accounts.google.com/o/oauth2/v2/auth?cancel=1"
+            },
+            error: null
+          }),
+          getUser: vi.fn()
+        }
+      } as unknown as SupabaseClient);
+
+      setOAuthBrowserAdapterForTesting({
+        openAuthSessionAsync: vi.fn().mockResolvedValue({ type: "cancel" })
+      });
+      await expect(signInWithGoogle({ keyStore, storage })).rejects.toThrow(
+        /Google sign-in was cancelled/
+      );
+
+      setOAuthBrowserAdapterForTesting({
+        openAuthSessionAsync: vi.fn().mockResolvedValue({
+          type: "success",
+          url: "dehealth://auth-callback?error=access_denied&error_description=User+denied+consent"
+        })
+      });
+      await expect(signInWithGoogle({ keyStore, storage })).rejects.toThrow(
+        /User denied consent/
+      );
+
+      expect(await getStoredWallet(keyStore)).toBeNull();
+      expect(await getPersistedAuthSession(storage)).toBeNull();
     });
   });
 
@@ -1150,11 +1296,13 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
         /WalletConnect Project ID is not configured/
       );
 
-      // Configured project ID but no adapter
+      // Configured project ID but provider loader unavailable
       process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = "wc-project-123";
+      setWalletConnectAdapterForTesting(null);
       await expect(signInWithWalletConnect({ storage })).rejects.toThrow(
         /WalletConnect v2 provider is unavailable/
       );
+      resetWalletConnectAdapterForTesting();
 
       // Adapter rejects with Error and AuthError
       await expect(
@@ -1191,6 +1339,124 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       }
 
       expect(await getPersistedAuthSession(storage)).toBeNull();
+    });
+
+    it("uses native UniversalProvider + Linking deep link out-of-the-box for WalletConnect & MetaMask Mobile fallback, and supports silent boot restore (E1, E2)", async () => {
+      const backend = new MemoryBackend();
+      const storage = new AuthSessionStorage(testSecret, backend);
+      process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = "wc-native-proj-777";
+      delete (globalThis as GlobalWithWalletMocks).ethereum;
+      delete (globalThis as GlobalWithWalletMocks).window;
+
+      const remoteWallet = Wallet.createRandom();
+      const openedUrls: string[] = [];
+      setDeepLinkOpenerForTesting(async (url: string) => {
+        openedUrls.push(url);
+      });
+
+      const listeners = new Map<string, (payload: string) => void>();
+      const disconnectMock = vi.fn().mockResolvedValue(undefined);
+      const mockProvider: UniversalProviderLike = {
+        session: undefined,
+        on: (event, listener) => {
+          listeners.set(event, listener);
+        },
+        off: (event) => {
+          listeners.delete(event);
+        },
+        connect: vi.fn().mockImplementation(async () => {
+          listeners.get("display_uri")?.("wc:abc123@2?relay-protocol=irn&symKey=xyz");
+          (mockProvider as { session: UniversalProviderLike["session"] }).session = {
+            namespaces: {
+              eip155: {
+                accounts: [`eip155:421614:${remoteWallet.address}`]
+              }
+            }
+          };
+          return mockProvider.session;
+        }),
+        request: async ({ method, params }) => {
+          const eip1193 = createWalletBackedEip1193Provider(remoteWallet, []);
+          return eip1193.request({
+            method,
+            params: Array.isArray(params) ? params : undefined
+          });
+        },
+        disconnect: disconnectMock
+      };
+
+      setUniversalProviderFactoryForTesting(async () => mockProvider);
+
+      // 1. Native MetaMask Mobile fallback when window.ethereum is absent
+      const mmRes = await signInWithMetaMask({ storage, nowMs: 80_000 });
+      expect(mmRes.session.authMethod).toBe("metamask");
+      expect(mmRes.walletAddress).toBe(remoteWallet.address);
+      expect(mmRes.signer).not.toBeNull();
+      expect(openedUrls[0]).toBe(
+        `https://metamask.app.link/wc?uri=${encodeURIComponent(
+          "wc:abc123@2?relay-protocol=irn&symKey=xyz"
+        )}`
+      );
+
+      // 2. Native WalletConnect v2 without injected test adapter triggers Linking.openURL with raw wc: URI
+      resetUniversalProviderFactoryForTesting();
+      setUniversalProviderFactoryForTesting(async () => mockProvider);
+      const wcRes = await signInWithWalletConnect({ storage, nowMs: 81_000 });
+      expect(wcRes.session.authMethod).toBe("walletconnect");
+      expect(wcRes.walletAddress).toBe(remoteWallet.address);
+      expect(openedUrls[1]).toBe("wc:abc123@2?relay-protocol=irn&symKey=xyz");
+
+      const proof: WorkoutProof = {
+        user: wcRes.walletAddress,
+        telemetryHash: sampleTelemetryHash,
+        streakCount: 3n,
+        nonce: 1n,
+        deadline: 1_970_000_000n
+      };
+      const signedClaim = await signWorkoutProof(
+        wcRes.signer!,
+        proof,
+        sampleContractAddress
+      );
+      expect(
+        verifyWorkoutProofSignature(signedClaim, sampleContractAddress)
+      ).toBe(true);
+
+      // 3. Silent boot restore succeeds while WC session is alive, and returns null if absent or mismatched
+      const restoredWc = await restoreExternalWalletSignerOnBoot(wcRes.session);
+      expect(restoredWc).not.toBeNull();
+      expect(await restoredWc!.getAddress()).toBe(remoteWallet.address);
+
+      // Disconnect on sign-out clears active UniversalProvider
+      await signOutSession({ storage });
+      expect(disconnectMock).toHaveBeenCalledTimes(1);
+
+      // Boot restore after session gone returns null
+      resetUniversalProviderFactoryForTesting();
+      setUniversalProviderFactoryForTesting(async () => ({
+        session: undefined,
+        on: vi.fn(),
+        connect: vi.fn(),
+        request: vi.fn()
+      }));
+      expect(
+        await restoreExternalWalletSignerOnBoot(wcRes.session)
+      ).toBeNull();
+
+      // Silent MetaMask restore via eth_accounts (matches expected address, skips mismatched)
+      (globalThis as GlobalWithWalletMocks).ethereum = {
+        request: vi.fn().mockResolvedValue([remoteWallet.address])
+      };
+      const restoredMm = await restoreExternalWalletSignerOnBoot(mmRes.session);
+      expect(restoredMm).not.toBeNull();
+      expect(await restoredMm!.getAddress()).toBe(remoteWallet.address);
+
+      (globalThis as GlobalWithWalletMocks).ethereum = {
+        request: vi.fn().mockResolvedValue([Wallet.createRandom().address])
+      };
+      expect(
+        await restoreExternalWalletSignerOnBoot(mmRes.session)
+      ).toBeNull();
     });
   });
 

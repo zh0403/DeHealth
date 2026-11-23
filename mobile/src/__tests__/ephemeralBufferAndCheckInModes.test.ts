@@ -1034,6 +1034,119 @@ describe("Ephemeral Daily Buffer & Dual-Mode Check-In Suite", () => {
       expect(hasText(tree, "Log a meal or finish 1 exercise to unlock")).toBe(true);
     });
 
+    it("serializes concurrent ephemeral food, exercise, and step writes via FIFO queue with zero dropped entries (B1)", async () => {
+      const dateKey = "2026-11-21";
+      const promises: Promise<DailyEphemeralLogBuffer>[] = [];
+
+      for (let i = 0; i < 5; i += 1) {
+        promises.push(
+          appendEphemeralFoodLog({
+            dateKey,
+            cycleId,
+            dayNumber: 1,
+            entry: {
+              id: `concurrent-meal-${i}`,
+              presetId: DUAL_TRACK_FOOD_PRESETS[0]!.id,
+              name: DUAL_TRACK_FOOD_PRESETS[0]!.name,
+              grams: 100 + i * 10,
+              caloriesKcal: 165,
+              proteinGrams: 31,
+              carbsGrams: 0,
+              fatGrams: 3.6,
+              loggedAtMs: 1_763_712_000_000 + i
+            }
+          })
+        );
+      }
+
+      const ex0 = emptyDay.exercises[0]!;
+      promises.push(
+        recordEphemeralExerciseTick({
+          dateKey,
+          cycleId,
+          dayNumber: 1,
+          tick: {
+            exerciseId: ex0.id,
+            name: ex0.name,
+            completed: true,
+            updatedAtMs: 1_763_712_010_000
+          }
+        })
+      );
+
+      promises.push(
+        recordEphemeralStepLog({
+          dateKey,
+          cycleId,
+          dayNumber: 1,
+          entry: {
+            id: "concurrent-step-1",
+            steps: 6420,
+            source: "hardware",
+            recordedAtMs: 1_763_712_020_000
+          }
+        })
+      );
+
+      // Inject an invalid write in the middle of the concurrent batch to verify queue never stalls
+      const invalidWrite = appendEphemeralFoodLog({
+        dateKey,
+        cycleId,
+        dayNumber: 1,
+        entry: {
+          id: "invalid-meal",
+          presetId: "bad",
+          name: "Bad",
+          grams: -5,
+          caloriesKcal: 0,
+          proteinGrams: 0,
+          carbsGrams: 0,
+          fatGrams: 0,
+          loggedAtMs: 1_763_712_030_000
+        }
+      });
+
+      await expect(invalidWrite).rejects.toThrow();
+      await Promise.all(promises);
+
+      const finalBuffer = await getDailyEphemeralLogBuffer();
+      expect(finalBuffer).not.toBeNull();
+      expect(finalBuffer?.foodLogs).toHaveLength(5);
+      expect(finalBuffer?.foodLogs.map((f) => f.id)).toEqual([
+        "concurrent-meal-0",
+        "concurrent-meal-1",
+        "concurrent-meal-2",
+        "concurrent-meal-3",
+        "concurrent-meal-4"
+      ]);
+      expect(finalBuffer?.exerciseTicks).toHaveLength(1);
+      expect(finalBuffer?.exerciseTicks[0]?.completed).toBe(true);
+      expect(finalBuffer?.stepLogs).toHaveLength(1);
+      expect(finalBuffer?.stepLogs[0]?.steps).toBe(6420);
+
+      // Concurrent purge queued behind appends removes buffer deterministically
+      await Promise.all([
+        appendEphemeralFoodLog({
+          dateKey,
+          cycleId,
+          dayNumber: 1,
+          entry: {
+            id: "tail-meal",
+            presetId: DUAL_TRACK_FOOD_PRESETS[0]!.id,
+            name: DUAL_TRACK_FOOD_PRESETS[0]!.name,
+            grams: 120,
+            caloriesKcal: 198,
+            proteinGrams: 37.2,
+            carbsGrams: 0,
+            fatGrams: 4.3,
+            loggedAtMs: 1_763_712_040_000
+          }
+        }),
+        purgeDailyEphemeralLogBuffer()
+      ]);
+      expect(await getDailyEphemeralLogBuffer()).toBeNull();
+    });
+
     it("hydrates from matching initialEphemeralBuffer prop and ignores stale initialEphemeralBuffer", () => {
       const sameDayBuffer: DailyEphemeralLogBuffer = {
         dateKey: "2026-11-21",
