@@ -31,6 +31,7 @@ import {
   getPersistedAuthSession,
   getWalletConnectProjectId,
   handleIncomingOAuthRedirectUrl,
+  hasPendingGoogleOAuthAttempt,
   initializeAuthSessionStorage,
   purgeAuthSessionStorageKey,
   resetAuthSessionStorage,
@@ -45,6 +46,7 @@ import {
   setDeepLinkOpenerForTesting,
   setMetaMaskAdapterForTesting,
   setOAuthBrowserAdapterForTesting,
+  setPendingGoogleOAuthAttemptForTesting,
   setUniversalProviderFactoryForTesting,
   setWalletConnectAdapterForTesting,
   signInWithGoogle,
@@ -779,7 +781,7 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       expect(await getPersistedAuthSession()).toEqual(second.session);
     });
 
-    it("opens WebBrowser auth session, exchanges PKCE code / implicit tokens from redirect URL, and deduplicates incoming deep links (G1)", async () => {
+    it("enforces PKCE code exchange, arms/clears pending OAuth attempt state, rejects unsolicited callbacks and implicit tokens (G1, S2)", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const storage = await initializeAuthSessionStorage(keyStore, backend);
@@ -788,10 +790,7 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
         data: { session: { access_token: "pkce-at" } },
         error: null
       });
-      const setSessionMock = vi.fn().mockResolvedValue({
-        data: { session: { access_token: "hash-at" } },
-        error: null
-      });
+      const setSessionMock = vi.fn();
       const getUserMock = vi.fn().mockResolvedValue({
         data: {
           user: {
@@ -817,9 +816,30 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
         }
       } as unknown as SupabaseClient);
 
-      const openAuthSessionAsyncMock = vi.fn().mockResolvedValue({
-        type: "success",
-        url: "dehealth://auth-callback?code=pkce-code-777"
+      // 1. Unsolicited dehealth://auth-callback URLs must reject before any OAuth flow starts
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
+      await expect(
+        handleIncomingOAuthRedirectUrl(
+          "dehealth://auth-callback?code=unsolicited-code",
+          { keyStore, storage }
+        )
+      ).rejects.toThrow(/Unsolicited Google OAuth callback rejected/);
+      await expect(
+        handleIncomingOAuthRedirectUrl(
+          "dehealth://auth-callback#access_token=attacker_tok&refresh_token=r",
+          { keyStore, storage }
+        )
+      ).rejects.toThrow(/Unsolicited Google OAuth callback rejected/);
+      expect(exchangeCodeForSessionMock).not.toHaveBeenCalled();
+      expect(setSessionMock).not.toHaveBeenCalled();
+
+      let pendingDuringBrowserOpen = false;
+      const openAuthSessionAsyncMock = vi.fn().mockImplementation(async () => {
+        pendingDuringBrowserOpen = hasPendingGoogleOAuthAttempt();
+        return {
+          type: "success",
+          url: "dehealth://auth-callback?code=pkce-code-777"
+        };
       });
       setOAuthBrowserAdapterForTesting({
         openAuthSessionAsync: openAuthSessionAsyncMock
@@ -831,6 +851,8 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
         nowMs: 70_000
       });
 
+      expect(pendingDuringBrowserOpen).toBe(true);
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
       expect(openAuthSessionAsyncMock).toHaveBeenCalledWith(
         "https://accounts.google.com/o/oauth2/v2/auth?pkce=1",
         "dehealth://auth-callback"
@@ -839,26 +861,47 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       expect(res.session.authMethod).toBe("google");
       expect(res.session.accountId).toBe("supa-pkce-user-1");
 
-      // Duplicate deep-link delivery of same PKCE code does NOT double-exchange
-      const dupHandled = await completeOAuthRedirectCallback(
-        "dehealth://auth-callback?code=pkce-code-777"
-      );
-      expect(dupHandled).toBe(true);
+      // Replay of completed code after flow finishes is rejected as unsolicited
+      await expect(
+        completeOAuthRedirectCallback(
+          "dehealth://auth-callback?code=pkce-code-777"
+        )
+      ).rejects.toThrow(/Unsolicited Google OAuth callback rejected/);
+
+      // While an OAuth attempt IS pending:
+      //  a) Duplicate delivery of completed PKCE code deduplicates cleanly
+      setPendingGoogleOAuthAttemptForTesting(true);
+      expect(
+        await completeOAuthRedirectCallback(
+          "dehealth://auth-callback?code=pkce-code-777"
+        )
+      ).toBe(true);
       expect(exchangeCodeForSessionMock).toHaveBeenCalledTimes(1);
 
-      // Hash-fragment token deep-link sets Supabase session and hydrates Google session
+      //  b) Raw implicit URL access tokens are strictly rejected (PKCE required)
+      await expect(
+        handleIncomingOAuthRedirectUrl(
+          "dehealth://auth-callback#access_token=tok_abc&refresh_token=ref_xyz",
+          { keyStore, storage, nowMs: 71_000 }
+        )
+      ).rejects.toThrow(/requires a PKCE authorization code/);
+      expect(setSessionMock).not.toHaveBeenCalled();
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
+
+      //  c) Valid PKCE deep-link while attempt is armed exchanges code & clears pending flag
+      setPendingGoogleOAuthAttemptForTesting(true);
       const incomingResult = await handleIncomingOAuthRedirectUrl(
-        "dehealth://auth-callback#access_token=tok_abc&refresh_token=ref_xyz",
-        { keyStore, storage, nowMs: 71_000 }
+        "dehealth://auth-callback?code=pkce-incoming-888",
+        { keyStore, storage, nowMs: 72_000 }
       );
-      expect(setSessionMock).toHaveBeenCalledWith({
-        access_token: "tok_abc",
-        refresh_token: "ref_xyz"
-      });
+      expect(exchangeCodeForSessionMock).toHaveBeenCalledWith(
+        "pkce-incoming-888"
+      );
       expect(incomingResult?.session.authMethod).toBe("google");
       expect(incomingResult?.walletAddress).toBe(res.walletAddress);
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
 
-      // Non-OAuth deep-link URLs are ignored cleanly
+      // Non-OAuth deep-link URLs are ignored cleanly without arming/rejecting
       expect(
         await handleIncomingOAuthRedirectUrl("dehealth://dashboard/checkin", {
           keyStore,
@@ -867,7 +910,7 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       ).toBeNull();
     });
 
-    it("fails closed when WebBrowser OAuth is cancelled/dismissed or returns OAuth error without saving session (G1)", async () => {
+    it("fails closed when WebBrowser OAuth is cancelled/dismissed or returns OAuth error without saving session (G1, S2)", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const storage = await initializeAuthSessionStorage(keyStore, backend);
@@ -891,6 +934,7 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       await expect(signInWithGoogle({ keyStore, storage })).rejects.toThrow(
         /Google sign-in was cancelled/
       );
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
 
       setOAuthBrowserAdapterForTesting({
         openAuthSessionAsync: vi.fn().mockResolvedValue({
@@ -901,6 +945,7 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       await expect(signInWithGoogle({ keyStore, storage })).rejects.toThrow(
         /User denied consent/
       );
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
 
       expect(await getStoredWallet(keyStore)).toBeNull();
       expect(await getPersistedAuthSession(storage)).toBeNull();

@@ -97,13 +97,24 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
       expect(getSupabaseClient()).toBeNull();
     });
 
-    it("instantiates and caches client when valid environment variables are present", () => {
+    it("instantiates and caches client with strict PKCE and zero-session-persistence auth config (S2)", () => {
       process.env.EXPO_PUBLIC_SUPABASE_URL = "https://mock-project.supabase.co";
       process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY = "mock-anon-key-12345";
 
       const client = getSupabaseClient();
       expect(client).not.toBeNull();
       expect(isSupabaseConfigured()).toBe(true);
+
+      const authInternals = client!.auth as unknown as {
+        readonly flowType?: string;
+        readonly persistSession?: boolean;
+        readonly detectSessionInUrl?: boolean;
+        readonly autoRefreshToken?: boolean;
+      };
+      expect(authInternals.flowType).toBe("pkce");
+      expect(authInternals.persistSession).toBe(false);
+      expect(authInternals.detectSessionInUrl).toBe(false);
+      expect(authInternals.autoRefreshToken).toBe(false);
 
       // Verify cached client is reused on subsequent calls
       const clientAgain = getSupabaseClient();

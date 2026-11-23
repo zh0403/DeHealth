@@ -16,6 +16,7 @@ import {
   restoreExternalWalletSignerOnBoot,
   setDeepLinkOpenerForTesting,
   setMetaMaskAdapterForTesting,
+  setPendingGoogleOAuthAttemptForTesting,
   setUniversalProviderFactoryForTesting,
   setWalletConnectAdapterForTesting,
   signInWithWalletConnect,
@@ -49,6 +50,7 @@ describe("device OAuth, external wallet pairing and boot restore hardening", () 
     resetOAuthBrowserAdapterForTesting();
     resetUniversalProviderFactoryForTesting();
     resetDeepLinkOpenerForTesting();
+    setPendingGoogleOAuthAttemptForTesting(false);
     delete process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
   });
 
@@ -59,6 +61,7 @@ describe("device OAuth, external wallet pairing and boot restore hardening", () 
     resetOAuthBrowserAdapterForTesting();
     resetUniversalProviderFactoryForTesting();
     resetDeepLinkOpenerForTesting();
+    setPendingGoogleOAuthAttemptForTesting(false);
   });
 
   describe("app configuration", () => {
@@ -83,6 +86,7 @@ describe("device OAuth, external wallet pairing and boot restore hardening", () 
       setSupabaseClient({
         auth: { exchangeCodeForSession: exchange }
       } as unknown as SupabaseClient);
+      setPendingGoogleOAuthAttemptForTesting(true);
 
       const url = "dehealth://auth-callback?code=concurrent-code";
       const first = completeOAuthRedirectCallback(url);
@@ -92,20 +96,23 @@ describe("device OAuth, external wallet pairing and boot restore hardening", () 
       expect(exchange).toHaveBeenCalledTimes(1);
     });
 
-    it("rejects with AuthError when the code exchange or session hydration fails", async () => {
+    it("rejects unsolicited callbacks, implicit tokens, and failed PKCE code exchanges with AuthError", async () => {
+      const setSessionMock = vi.fn();
       setSupabaseClient({
         auth: {
           exchangeCodeForSession: vi.fn().mockResolvedValue({
             data: null,
             error: { message: "exchange denied" }
           }),
-          setSession: vi.fn().mockResolvedValue({
-            data: null,
-            error: { message: "session denied" }
-          })
+          setSession: setSessionMock
         }
       } as unknown as SupabaseClient);
 
+      await expect(
+        completeOAuthRedirectCallback("dehealth://auth-callback?code=unsolicited")
+      ).rejects.toThrow(/Unsolicited Google OAuth callback rejected/);
+
+      setPendingGoogleOAuthAttemptForTesting(true);
       await expect(
         completeOAuthRedirectCallback("dehealth://auth-callback?code=bad-code")
       ).rejects.toThrow(/exchange denied/);
@@ -113,17 +120,28 @@ describe("device OAuth, external wallet pairing and boot restore hardening", () 
         completeOAuthRedirectCallback(
           "dehealth://auth-callback#access_token=bad&refresh_token=r"
         )
-      ).rejects.toThrow(/session denied/);
+      ).rejects.toThrow(/requires a PKCE authorization code/);
+      expect(setSessionMock).not.toHaveBeenCalled();
       await expect(
         completeOAuthRedirectCallback("dehealth://auth-callback?code=bad-code")
       ).rejects.toBeInstanceOf(AuthError);
     });
 
-    it("ignores URLs that carry no OAuth credentials", async () => {
+    it("rejects a bare auth-callback URL when no Google sign-in is active", async () => {
+      await expect(
+        completeOAuthRedirectCallback("dehealth://auth-callback")
+      ).rejects.toThrow(/Unsolicited Google OAuth callback rejected/);
+    });
+
+    it("ignores non-auth deep links and non-credential auth URLs when armed", async () => {
       const exchange = vi.fn();
       setSupabaseClient({
         auth: { exchangeCodeForSession: exchange }
       } as unknown as SupabaseClient);
+      expect(
+        await completeOAuthRedirectCallback("dehealth://dashboard/feed")
+      ).toBe(false);
+      setPendingGoogleOAuthAttemptForTesting(true);
       expect(
         await completeOAuthRedirectCallback("dehealth://auth-callback?foo=bar")
       ).toBe(false);

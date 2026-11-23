@@ -91,6 +91,7 @@ import {
   hydrateVaultData,
   resetVaultAndRecover,
   resolveClaimSigner,
+  resolveRenderSigner,
   VaultBootGate,
   VaultHydrationDeps
 } from "../../App";
@@ -610,5 +611,61 @@ describe("resolveClaimSigner external wallet guard", () => {
     }
     expect(resolveClaimSigner(null, null, local)).toBe(local);
     expect(resolveClaimSigner(null, null, null)).toBeUndefined();
+  });
+});
+
+describe("resolveRenderSigner strict isolation and synchronous polyfills (R1, P1)", () => {
+  const external = Wallet.createRandom();
+  const local = Wallet.createRandom();
+  const baseSession = {
+    accountId: "acct-render",
+    displayLabel: "label",
+    walletAddress: external.address as Address,
+    signedInAtMs: 1_700_000_000_000
+  };
+
+  it("passes externalSigner only for metamask/walletconnect and never falls back to localWallet (R1)", () => {
+    for (const authMethod of ["metamask", "walletconnect"] as const) {
+      const session: AuthSessionMetadata = { ...baseSession, authMethod };
+      expect(resolveRenderSigner(session, external, local)).toBe(external);
+      expect(resolveRenderSigner(session, null, local)).toBeNull();
+    }
+  });
+
+  it("passes localWallet only for google/local sessions and returns null when unauthenticated (R1)", () => {
+    for (const authMethod of ["google", "local"] as const) {
+      const session: AuthSessionMetadata = { ...baseSession, authMethod };
+      expect(resolveRenderSigner(session, external, local)).toBe(local);
+    }
+    expect(resolveRenderSigner(null, external, local)).toBeNull();
+  });
+
+  it("synchronously loads @walletconnect/react-native-compat and installs crypto shim before downstream imports (P1)", async () => {
+    const order: string[] = [];
+    vi.resetModules();
+    vi.doMock("@walletconnect/react-native-compat", () => {
+      order.push("walletconnect-react-native-compat");
+      return {};
+    });
+    vi.doMock("../runtime/cryptoShim", () => ({
+      installCryptoShim: () => {
+        order.push("installCryptoShim");
+        return "native";
+      }
+    }));
+
+    try {
+      await import("../../polyfills");
+      order.push("downstream-module");
+      expect(order).toEqual([
+        "walletconnect-react-native-compat",
+        "installCryptoShim",
+        "downstream-module"
+      ]);
+    } finally {
+      vi.doUnmock("@walletconnect/react-native-compat");
+      vi.doUnmock("../runtime/cryptoShim");
+      vi.resetModules();
+    }
   });
 });

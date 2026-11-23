@@ -858,6 +858,51 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       expect(hasText(tree, "Claimed ✓")).toBe(false);
     });
 
+    it("fails closed with a disconnected-signer error when no signer is available", async () => {
+      const onDispatchSignedClaim = vi.fn().mockResolvedValue(undefined);
+      const onError = vi.fn();
+
+      const props: MicroCheckInScreenProps = {
+        userAddress: wallet.address as Address,
+        verifyingContract: TEST_GATE_ADDRESS,
+        currentStreak: 1,
+        currentNonce: 0n,
+        signer: null,
+        userProfile: TEST_PROFILE,
+        dailyPlan: unlockedDay,
+        cycleId,
+        vaultSecretHex: TEST_SECRET,
+        isProofSigned: false,
+        initialStepCount: 1000,
+        initialStepSource: "manual-fallback",
+        initialPedometerAvailable: false,
+        onDispatchSignedClaim,
+        onError
+      };
+
+      let tree = renderWithHarness(MicroCheckInScreen, props);
+      const expressCardBtn = findElement(
+        tree,
+        (elProps) =>
+          elProps.accessibilityRole === "button" &&
+          hasText(elProps.children as React.ReactNode, "Cardio / Brisk Walk")
+      );
+      expect(expressCardBtn).not.toBeNull();
+      (expressCardBtn!.onPress as () => void)();
+
+      await vi.waitFor(() => {
+        expect(onError).toHaveBeenCalledTimes(1);
+      });
+      await flushMicrotasks();
+      tree = renderWithHarness(MicroCheckInScreen, props);
+
+      expect((onError.mock.calls[0]?.[0] as Error).message).toContain(
+        "Wallet signer is disconnected"
+      );
+      expect(onDispatchSignedClaim).not.toHaveBeenCalled();
+      expect(hasText(tree, "Signing...")).toBe(false);
+    });
+
     it("handles syncSteps rejection via try/catch/finally and suppresses stale updates after unmount", async () => {
       const availDeferred = createDeferred<boolean>();
       sensorMocks.isPedometerAvailable = () => availDeferred.promise;
