@@ -9,6 +9,7 @@ import {
   WeightLogEntry,
   WeightLogEntrySchema
 } from "@dehealth/shared";
+import { z } from "zod";
 import {
   EncryptedStorageAdapter,
   KeyValueStorageBackend
@@ -28,10 +29,114 @@ export const ADAPTIVE_STORAGE_KEYS = {
   DAILY_COMPLETION_STATE: "@dehealth/daily_completion_state",
   TELEMETRY_SALTS: "@dehealth/telemetry_salts",
   DAILY_TELEMETRY_COMMITMENTS: "@dehealth/daily_telemetry_commitments",
-  LAST_LOG_TIMESTAMP_MS: "@dehealth/last_log_timestamp_ms"
+  LAST_LOG_TIMESTAMP_MS: "@dehealth/last_log_timestamp_ms",
+  DAILY_EPHEMERAL_LOG_BUFFER: "@dehealth/daily_ephemeral_log_buffer"
 } as const;
 
 export const STORAGE_KEYS = ADAPTIVE_STORAGE_KEYS;
+
+const LOCAL_CALENDAR_DATE_KEY_REGEX = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Formats an epoch timestamp (ms) into the device's local calendar date key `YYYY-MM-DD`.
+ */
+export function formatLocalCalendarDateKey(nowMs: number = Date.now()): string {
+  if (!Number.isFinite(nowMs)) {
+    throw new Error("nowMs must be a finite epoch timestamp");
+  }
+  const d = new Date(nowMs);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export interface EphemeralFoodLogEntry {
+  readonly id: string;
+  readonly presetId: string;
+  readonly name: string;
+  readonly grams: number;
+  readonly caloriesKcal: number;
+  readonly proteinGrams: number;
+  readonly carbsGrams: number;
+  readonly fatGrams: number;
+  readonly loggedAtMs: number;
+}
+
+export const EphemeralFoodLogEntrySchema: z.ZodType<EphemeralFoodLogEntry> = z
+  .object({
+    id: z.string().trim().min(1),
+    presetId: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    grams: z.number().finite().positive(),
+    caloriesKcal: z.number().finite().min(0),
+    proteinGrams: z.number().finite().min(0),
+    carbsGrams: z.number().finite().min(0),
+    fatGrams: z.number().finite().min(0),
+    loggedAtMs: z.number().int().positive()
+  })
+  .strict();
+
+export interface EphemeralExerciseTick {
+  readonly exerciseId: string;
+  readonly name: string;
+  readonly completed: boolean;
+  readonly updatedAtMs: number;
+}
+
+export const EphemeralExerciseTickSchema: z.ZodType<EphemeralExerciseTick> = z
+  .object({
+    exerciseId: z.string().trim().min(1),
+    name: z.string().trim().min(1),
+    completed: z.boolean(),
+    updatedAtMs: z.number().int().positive()
+  })
+  .strict();
+
+export interface EphemeralStepEntry {
+  readonly id: string;
+  readonly steps: number;
+  readonly source: "hardware" | "manual-fallback";
+  readonly recordedAtMs: number;
+}
+
+export const EphemeralStepEntrySchema: z.ZodType<EphemeralStepEntry> = z
+  .object({
+    id: z.string().trim().min(1),
+    steps: z.number().int().min(0).max(200_000),
+    source: z.enum(["hardware", "manual-fallback"]),
+    recordedAtMs: z.number().int().positive()
+  })
+  .strict();
+
+export interface DailyEphemeralLogBuffer {
+  readonly dateKey: string;
+  readonly cycleId: string;
+  readonly dayNumber: number;
+  readonly foodLogs: readonly EphemeralFoodLogEntry[];
+  readonly exerciseTicks: readonly EphemeralExerciseTick[];
+  readonly stepLogs: readonly EphemeralStepEntry[];
+  readonly updatedAtMs: number;
+}
+
+export const DailyEphemeralLogBufferSchema: z.ZodType<DailyEphemeralLogBuffer> = z
+  .object({
+    dateKey: z
+      .string()
+      .regex(LOCAL_CALENDAR_DATE_KEY_REGEX, "dateKey must match YYYY-MM-DD"),
+    cycleId: z.string().trim().min(1),
+    dayNumber: z.number().int().min(1).max(14),
+    foodLogs: z.array(EphemeralFoodLogEntrySchema),
+    exerciseTicks: z.array(EphemeralExerciseTickSchema),
+    stepLogs: z.array(EphemeralStepEntrySchema),
+    updatedAtMs: z.number().int().positive()
+  })
+  .strict();
+
+export interface EphemeralBufferRolloverResult {
+  readonly purged: boolean;
+  readonly activeBuffer: DailyEphemeralLogBuffer | null;
+}
 
 export const DAILY_PROOF_SIGNED_KEY_PREFIX = "daily_proof_signed:";
 
@@ -415,6 +520,165 @@ export class AdaptiveStorage {
   }
 
   /**
+   * Validates and encrypts the daily ephemeral log buffer strictly on-device.
+   */
+  async saveDailyEphemeralLogBuffer(buffer: DailyEphemeralLogBuffer): Promise<void> {
+    await this.persistEphemeralBuffer(buffer);
+  }
+
+  /**
+   * Retrieves the current daily ephemeral log buffer, returning null if absent
+   * or if Zod validation fails. MAC/envelope tampering errors propagate.
+   */
+  async getDailyEphemeralLogBuffer(): Promise<DailyEphemeralLogBuffer | null> {
+    const raw = await this.adapter.getEncryptedItem<unknown>(
+      ADAPTIVE_STORAGE_KEYS.DAILY_EPHEMERAL_LOG_BUFFER
+    );
+    if (raw === null || raw === undefined) {
+      return null;
+    }
+    const parsed = DailyEphemeralLogBufferSchema.safeParse(raw);
+    return parsed.success ? parsed.data : null;
+  }
+
+  /**
+   * Appends a food log entry to the active day's encrypted buffer, or
+   * initializes a fresh buffer when absent or when dateKey changes.
+   */
+  async appendEphemeralFoodLog(params: {
+    readonly dateKey: string;
+    readonly cycleId: string;
+    readonly dayNumber: number;
+    readonly entry: EphemeralFoodLogEntry;
+  }): Promise<DailyEphemeralLogBuffer> {
+    const validatedEntry = EphemeralFoodLogEntrySchema.parse(params.entry);
+    const base = await this.readOrInitDailyBuffer(params);
+    return this.persistEphemeralBuffer({
+      dateKey: params.dateKey,
+      cycleId: params.cycleId,
+      dayNumber: params.dayNumber,
+      foodLogs: [...base.foodLogs, validatedEntry],
+      exerciseTicks: base.exerciseTicks,
+      stepLogs: base.stepLogs,
+      updatedAtMs: Math.max(Date.now(), validatedEntry.loggedAtMs)
+    });
+  }
+
+  /**
+   * Upserts an exercise completion tick by exerciseId in the encrypted daily buffer,
+   * initializing a fresh buffer when absent or when dateKey changes.
+   */
+  async recordEphemeralExerciseTick(params: {
+    readonly dateKey: string;
+    readonly cycleId: string;
+    readonly dayNumber: number;
+    readonly tick: EphemeralExerciseTick;
+  }): Promise<DailyEphemeralLogBuffer> {
+    const validatedTick = EphemeralExerciseTickSchema.parse(params.tick);
+    const base = await this.readOrInitDailyBuffer(params);
+    const existingIdx = base.exerciseTicks.findIndex(
+      (item) => item.exerciseId === validatedTick.exerciseId
+    );
+    const nextTicks = [...base.exerciseTicks];
+    if (existingIdx >= 0) {
+      nextTicks[existingIdx] = validatedTick;
+    } else {
+      nextTicks.push(validatedTick);
+    }
+    return this.persistEphemeralBuffer({
+      dateKey: params.dateKey,
+      cycleId: params.cycleId,
+      dayNumber: params.dayNumber,
+      foodLogs: base.foodLogs,
+      exerciseTicks: nextTicks,
+      stepLogs: base.stepLogs,
+      updatedAtMs: Math.max(Date.now(), validatedTick.updatedAtMs)
+    });
+  }
+
+  /**
+   * Appends a step entry to the active day's encrypted buffer, or initializes
+   * a fresh buffer when absent or when dateKey changes.
+   */
+  async recordEphemeralStepLog(params: {
+    readonly dateKey: string;
+    readonly cycleId: string;
+    readonly dayNumber: number;
+    readonly entry: EphemeralStepEntry;
+  }): Promise<DailyEphemeralLogBuffer> {
+    const validatedEntry = EphemeralStepEntrySchema.parse(params.entry);
+    const base = await this.readOrInitDailyBuffer(params);
+    return this.persistEphemeralBuffer({
+      dateKey: params.dateKey,
+      cycleId: params.cycleId,
+      dayNumber: params.dayNumber,
+      foodLogs: base.foodLogs,
+      exerciseTicks: base.exerciseTicks,
+      stepLogs: [...base.stepLogs, validatedEntry],
+      updatedAtMs: Math.max(Date.now(), validatedEntry.recordedAtMs)
+    });
+  }
+
+  /**
+   * Purges ONLY the daily ephemeral raw log buffer, leaving proofSignedMap and
+   * completion receipts intact.
+   */
+  async purgeDailyEphemeralLogBuffer(): Promise<void> {
+    await this.adapter.removeEncryptedItem(
+      ADAPTIVE_STORAGE_KEYS.DAILY_EPHEMERAL_LOG_BUFFER
+    );
+  }
+
+  /**
+   * Purges prior-day unsigned ephemeral buffers on local calendar rollover while
+   * retaining buffers whose dateKey matches todayDateKey.
+   */
+  async rolloverStaleDailyEphemeralLogBuffer(
+    todayDateKey: string = formatLocalCalendarDateKey()
+  ): Promise<EphemeralBufferRolloverResult> {
+    if (!LOCAL_CALENDAR_DATE_KEY_REGEX.test(todayDateKey)) {
+      throw new Error("todayDateKey must match YYYY-MM-DD");
+    }
+    const existing = await this.getDailyEphemeralLogBuffer();
+    if (existing && existing.dateKey !== todayDateKey) {
+      await this.purgeDailyEphemeralLogBuffer();
+      return { purged: true, activeBuffer: null };
+    }
+    return { purged: false, activeBuffer: existing };
+  }
+
+  private async persistEphemeralBuffer(
+    buffer: DailyEphemeralLogBuffer
+  ): Promise<DailyEphemeralLogBuffer> {
+    const validated = DailyEphemeralLogBufferSchema.parse(buffer);
+    await this.adapter.setEncryptedItem(
+      ADAPTIVE_STORAGE_KEYS.DAILY_EPHEMERAL_LOG_BUFFER,
+      validated
+    );
+    return validated;
+  }
+
+  private async readOrInitDailyBuffer(params: {
+    readonly dateKey: string;
+    readonly cycleId: string;
+    readonly dayNumber: number;
+  }): Promise<DailyEphemeralLogBuffer> {
+    const existing = await this.getDailyEphemeralLogBuffer();
+    if (existing && existing.dateKey === params.dateKey) {
+      return existing;
+    }
+    return {
+      dateKey: params.dateKey,
+      cycleId: params.cycleId,
+      dayNumber: params.dayNumber,
+      foodLogs: [],
+      exerciseTicks: [],
+      stepLogs: [],
+      updatedAtMs: Date.now()
+    };
+  }
+
+  /**
    * Completely removes all adaptive storage keys, resetting local state.
    */
   async clearAllAdaptiveData(): Promise<void> {
@@ -606,6 +870,53 @@ export async function saveLastLogTimestampMs(timestampMs: number): Promise<void>
 
 export async function getLastLogTimestampMs(): Promise<number | null> {
   return (await resolveStorage()).getLastLogTimestampMs();
+}
+
+export async function saveDailyEphemeralLogBuffer(
+  buffer: DailyEphemeralLogBuffer
+): Promise<void> {
+  return (await resolveStorage()).saveDailyEphemeralLogBuffer(buffer);
+}
+
+export async function getDailyEphemeralLogBuffer(): Promise<DailyEphemeralLogBuffer | null> {
+  return (await resolveStorage()).getDailyEphemeralLogBuffer();
+}
+
+export async function appendEphemeralFoodLog(params: {
+  readonly dateKey: string;
+  readonly cycleId: string;
+  readonly dayNumber: number;
+  readonly entry: EphemeralFoodLogEntry;
+}): Promise<DailyEphemeralLogBuffer> {
+  return (await resolveStorage()).appendEphemeralFoodLog(params);
+}
+
+export async function recordEphemeralExerciseTick(params: {
+  readonly dateKey: string;
+  readonly cycleId: string;
+  readonly dayNumber: number;
+  readonly tick: EphemeralExerciseTick;
+}): Promise<DailyEphemeralLogBuffer> {
+  return (await resolveStorage()).recordEphemeralExerciseTick(params);
+}
+
+export async function recordEphemeralStepLog(params: {
+  readonly dateKey: string;
+  readonly cycleId: string;
+  readonly dayNumber: number;
+  readonly entry: EphemeralStepEntry;
+}): Promise<DailyEphemeralLogBuffer> {
+  return (await resolveStorage()).recordEphemeralStepLog(params);
+}
+
+export async function purgeDailyEphemeralLogBuffer(): Promise<void> {
+  return (await resolveStorage()).purgeDailyEphemeralLogBuffer();
+}
+
+export async function rolloverStaleDailyEphemeralLogBuffer(
+  todayDateKey: string = formatLocalCalendarDateKey()
+): Promise<EphemeralBufferRolloverResult> {
+  return (await resolveStorage()).rolloverStaleDailyEphemeralLogBuffer(todayDateKey);
 }
 
 /**

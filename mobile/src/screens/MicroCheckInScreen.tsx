@@ -43,9 +43,17 @@ import {
 } from "../services/sensorService";
 export type { StepCountSource } from "../services/sensorService";
 import {
+  appendEphemeralFoodLog,
+  DailyEphemeralLogBuffer,
+  EphemeralFoodLogEntry,
+  formatLocalCalendarDateKey,
   getActivePlanCycle,
   getDailyTelemetryCommitment,
   makeDailyProofSignedKey,
+  purgeDailyEphemeralLogBuffer,
+  recordEphemeralExerciseTick,
+  recordEphemeralStepLog,
+  rolloverStaleDailyEphemeralLogBuffer,
   saveDailyProofSigned,
   saveDailyTaskCompletion,
   saveDailyTelemetryCommitment,
@@ -142,6 +150,8 @@ export const DUAL_TRACK_FOOD_PRESETS: readonly FoodPresetItem[] = Object.freeze(
   })
 ]);
 
+export type CheckInMode = "quick" | "detailed";
+
 export interface LoggedMealRecord {
   readonly id: string;
   readonly presetId: string;
@@ -151,6 +161,74 @@ export interface LoggedMealRecord {
   readonly proteinGrams: number;
   readonly carbsGrams: number;
   readonly fatGrams: number;
+}
+
+function mapEphemeralFoodLogsToMeals(
+  foodLogs: readonly EphemeralFoodLogEntry[]
+): LoggedMealRecord[] {
+  return [...foodLogs].reverse().map((entry) => ({
+    id: entry.id,
+    presetId: entry.presetId,
+    name: entry.name,
+    grams: entry.grams,
+    caloriesKcal: entry.caloriesKcal,
+    proteinGrams: entry.proteinGrams,
+    carbsGrams: entry.carbsGrams,
+    fatGrams: entry.fatGrams
+  }));
+}
+
+function mergeEphemeralBufferIntoPlan(
+  plan: DailyPlan,
+  buffer: DailyEphemeralLogBuffer
+): DailyPlan {
+  const tickByExerciseId = new Map<string, boolean>();
+  for (const tick of buffer.exerciseTicks) {
+    tickByExerciseId.set(tick.exerciseId, tick.completed);
+  }
+
+  const nextExercises: WorkoutExerciseItem[] = plan.exercises.map((ex) =>
+    tickByExerciseId.has(ex.id)
+      ? { ...ex, completed: tickByExerciseId.get(ex.id)! }
+      : ex
+  );
+
+  let foodCalories = 0;
+  let foodProtein = 0;
+  let foodCarbs = 0;
+  let foodFat = 0;
+  for (const meal of buffer.foodLogs) {
+    foodCalories += meal.caloriesKcal;
+    foodProtein += meal.proteinGrams;
+    foodCarbs += meal.carbsGrams;
+    foodFat += meal.fatGrams;
+  }
+
+  const nextCalories = Math.max(
+    plan.loggedCaloriesKcal,
+    Math.round(foodCalories)
+  );
+  const nextProtein = Math.max(
+    plan.loggedProteinGrams,
+    Number(foodProtein.toFixed(1))
+  );
+  const nextCarbs = Math.max(
+    plan.loggedCarbsGrams,
+    Number(foodCarbs.toFixed(1))
+  );
+  const nextFat = Math.max(plan.loggedFatGrams, Number(foodFat.toFixed(1)));
+  const allExercisesDone =
+    nextExercises.length > 0 && nextExercises.every((ex) => ex.completed);
+
+  return {
+    ...plan,
+    loggedCaloriesKcal: nextCalories,
+    loggedProteinGrams: nextProtein,
+    loggedCarbsGrams: nextCarbs,
+    loggedFatGrams: nextFat,
+    exercises: nextExercises,
+    completed: plan.completed || (allExercisesDone && nextCalories > 0)
+  };
 }
 
 const DEFAULT_PROFILE: UserProfile = {
@@ -335,6 +413,9 @@ export interface MicroCheckInScreenProps {
   readonly initialStepCount?: number;
   readonly initialStepSource?: StepCountSource;
   readonly initialPedometerAvailable?: boolean;
+  readonly initialCheckInMode?: CheckInMode;
+  readonly initialEphemeralBuffer?: DailyEphemeralLogBuffer | null;
+  readonly currentDateKey?: string;
   readonly onUpdateDailyPlan?: (updatedPlan: DailyPlan) => void;
   readonly onDispatchSignedClaim: (payload: SignedWorkoutClaimPayload) => Promise<void>;
   readonly onCopyWalletAddress?: (address: string) => Promise<void> | void;
@@ -365,6 +446,9 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   initialStepCount,
   initialStepSource,
   initialPedometerAvailable,
+  initialCheckInMode = "quick",
+  initialEphemeralBuffer,
+  currentDateKey,
   onUpdateDailyPlan,
   onDispatchSignedClaim,
   onCopyWalletAddress,
@@ -375,12 +459,21 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
 }) => {
   const onErrorRef = useRef(onError);
   onErrorRef.current = onError;
-  const fatigueOptions = useMemo(
-    () => ({
-      inactivityThresholdHours,
-      fatigueScalingMultiplier
-    }),
-    [inactivityThresholdHours, fatigueScalingMultiplier]
+
+  const effectiveDateKey =
+    currentDateKey && currentDateKey.trim().length > 0
+      ? currentDateKey.trim()
+      : formatLocalCalendarDateKey();
+
+  const sameDayInitialBuffer =
+    initialEphemeralBuffer &&
+    initialEphemeralBuffer.dateKey === effectiveDateKey
+      ? initialEphemeralBuffer
+      : null;
+
+  const [checkInMode, setCheckInMode] = useState<CheckInMode>(initialCheckInMode);
+  const [ephemeralStepLogsCount, setEphemeralStepLogsCount] = useState<number>(
+    () => sameDayInitialBuffer?.stepLogs.length ?? 0
   );
 
   const defaultInitialPlan = useMemo<DailyPlan>(() => {
@@ -388,53 +481,95 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     return cycle.dailyPlans[0]!;
   }, []);
 
-  const [localPlan, setLocalPlan] = useState<DailyPlan>(() =>
-    applyRuntimeFatigueScaling(
+  const [localPlan, setLocalPlan] = useState<DailyPlan>(() => {
+    const scaled = applyRuntimeFatigueScaling(
       externalDailyPlan ?? defaultInitialPlan,
       lastLogTimestampMs,
       Date.now(),
-      fatigueOptions
-    )
-  );
+      {
+        inactivityThresholdHours,
+        fatigueScalingMultiplier
+      }
+    );
+    return sameDayInitialBuffer
+      ? mergeEphemeralBufferIntoPlan(scaled, sameDayInitialBuffer)
+      : scaled;
+  });
 
+  const isFirstPlanSyncRef = useRef<boolean>(true);
   useEffect(() => {
-    if (externalDailyPlan) {
-      const resolved = applyRuntimeFatigueScaling(
-        externalDailyPlan,
-        lastLogTimestampMs,
-        Date.now(),
-        fatigueOptions
-      );
-      setLocalPlan(resolved);
-      if (resolved !== externalDailyPlan && onUpdateDailyPlan) {
+    if (!externalDailyPlan) {
+      isFirstPlanSyncRef.current = false;
+      return;
+    }
+    const scaled = applyRuntimeFatigueScaling(
+      externalDailyPlan,
+      lastLogTimestampMs,
+      Date.now(),
+      {
+        inactivityThresholdHours,
+        fatigueScalingMultiplier
+      }
+    );
+    const resolved = sameDayInitialBuffer
+      ? mergeEphemeralBufferIntoPlan(scaled, sameDayInitialBuffer)
+      : scaled;
+    if (isFirstPlanSyncRef.current) {
+      isFirstPlanSyncRef.current = false;
+      if (scaled !== externalDailyPlan && onUpdateDailyPlan) {
         onUpdateDailyPlan(resolved);
       }
+      return;
     }
-  }, [externalDailyPlan, lastLogTimestampMs, fatigueOptions]);
+    setLocalPlan(resolved);
+    if (scaled !== externalDailyPlan && onUpdateDailyPlan) {
+      onUpdateDailyPlan(resolved);
+    }
+  }, [
+    externalDailyPlan,
+    lastLogTimestampMs,
+    inactivityThresholdHours,
+    fatigueScalingMultiplier,
+    initialEphemeralBuffer,
+    effectiveDateKey
+  ]);
+
+  const initialBufferedStep =
+    initialStepCount === undefined &&
+    sameDayInitialBuffer &&
+    sameDayInitialBuffer.stepLogs.length > 0
+      ? sameDayInitialBuffer.stepLogs[sameDayInitialBuffer.stepLogs.length - 1]!
+      : null;
 
   const [pedometerAvailable, setPedometerAvailable] = useState<boolean>(
     initialPedometerAvailable ?? initialStepSource === "hardware"
   );
-  const [todaySteps, setTodaySteps] = useState<number>(() =>
-    typeof initialStepCount === "number" &&
-    Number.isFinite(initialStepCount) &&
-    initialStepCount >= 0
-      ? Math.round(initialStepCount)
-      : 0
-  );
+  const [todaySteps, setTodaySteps] = useState<number>(() => {
+    if (
+      typeof initialStepCount === "number" &&
+      Number.isFinite(initialStepCount) &&
+      initialStepCount >= 0
+    ) {
+      return Math.round(initialStepCount);
+    }
+    return initialBufferedStep ? initialBufferedStep.steps : 0;
+  });
   const [stepSource, setStepSource] = useState<StepCountSource>(
-    initialStepSource ??
+    () =>
+      initialStepSource ??
+      initialBufferedStep?.source ??
       (initialPedometerAvailable ? "hardware" : "manual-fallback")
   );
-  const [manualStepsInput, setManualStepsInput] = useState<string>(() =>
-    String(
+  const [manualStepsInput, setManualStepsInput] = useState<string>(() => {
+    if (
       typeof initialStepCount === "number" &&
-        Number.isFinite(initialStepCount) &&
-        initialStepCount >= 0
-        ? Math.round(initialStepCount)
-        : 0
-    )
-  );
+      Number.isFinite(initialStepCount) &&
+      initialStepCount >= 0
+    ) {
+      return String(Math.round(initialStepCount));
+    }
+    return String(initialBufferedStep ? initialBufferedStep.steps : 0);
+  });
   const [stepInputError, setStepInputError] = useState<string | null>(null);
   const [isSyncingSteps, setIsSyncingSteps] = useState<boolean>(false);
   const [isUpdatingTask, setIsUpdatingTask] = useState<boolean>(false);
@@ -455,9 +590,17 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         const reading = await getTodayStepCount(0);
         if (!mounted) return;
         setPedometerAvailable(available);
-        setTodaySteps(reading.steps);
-        setStepSource(reading.source);
-        setManualStepsInput(String(reading.steps));
+        setTodaySteps((prev) =>
+          reading.source === "hardware" || prev === 0 ? reading.steps : prev
+        );
+        setStepSource((prev) =>
+          reading.source === "hardware" ? reading.source : prev
+        );
+        setManualStepsInput((prev) =>
+          reading.source === "hardware" || prev === "0"
+            ? String(reading.steps)
+            : prev
+        );
       } catch (err: unknown) {
         if (!mounted) return;
         setPedometerAvailable(false);
@@ -473,11 +616,57 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     };
   }, [initialPedometerAvailable, initialStepCount]);
 
+  useEffect(() => {
+    if (initialEphemeralBuffer !== undefined) {
+      return;
+    }
+    let mounted = true;
+    const hydrateAndRollover = async (): Promise<void> => {
+      try {
+        const res = await rolloverStaleDailyEphemeralLogBuffer(effectiveDateKey);
+        if (!mounted) {
+          return;
+        }
+        if (res.purged) {
+          setLoggedMeals([]);
+          setEphemeralStepLogsCount(0);
+          return;
+        }
+        if (res.activeBuffer) {
+          const activeBuffer = res.activeBuffer;
+          setLoggedMeals(mapEphemeralFoodLogsToMeals(activeBuffer.foodLogs));
+          setEphemeralStepLogsCount(activeBuffer.stepLogs.length);
+          if (initialStepCount === undefined && activeBuffer.stepLogs.length > 0) {
+            const latestStep =
+              activeBuffer.stepLogs[activeBuffer.stepLogs.length - 1]!;
+            setTodaySteps(latestStep.steps);
+            setStepSource(latestStep.source);
+            setManualStepsInput(String(latestStep.steps));
+          }
+          setLocalPlan((prev) =>
+            mergeEphemeralBufferIntoPlan(prev, activeBuffer)
+          );
+        }
+      } catch {
+        // Non-fatal if vault or storage backend is uninitialized
+      }
+    };
+    void hydrateAndRollover();
+    return () => {
+      mounted = false;
+    };
+  }, [effectiveDateKey, initialEphemeralBuffer, initialStepCount]);
+
   const [selectedPresetId, setSelectedPresetId] = useState<string>(
     DUAL_TRACK_FOOD_PRESETS[0]!.id
   );
   const [portionGramsInput, setPortionGramsInput] = useState<string>("150");
-  const [loggedMeals, setLoggedMeals] = useState<readonly LoggedMealRecord[]>([]);
+  const [loggedMeals, setLoggedMeals] = useState<readonly LoggedMealRecord[]>(
+    () =>
+      sameDayInitialBuffer
+        ? mapEphemeralFoodLogsToMeals(sameDayInitialBuffer.foodLogs)
+        : []
+  );
 
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const isSubmittingRef = useRef<boolean>(false);
@@ -578,6 +767,46 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     }
   };
 
+  const recordFoodPortion = async (
+    preset: FoodPresetItem,
+    grams: number,
+    idPrefix: string,
+    buildStatus: (scaled: FoodPresetItem) => string
+  ): Promise<void> => {
+    const updatedPlan = addFoodPortionToDailyPlan(localPlan, preset, grams);
+    applyPlanUpdate(updatedPlan);
+
+    const nowMs = Date.now();
+    const scaled = scaleFoodPresetPortion(preset, grams);
+    const newMeal: LoggedMealRecord = {
+      id: `${idPrefix}_${nowMs}_${loggedMeals.length + 1}`,
+      presetId: preset.id,
+      name: preset.name,
+      grams,
+      caloriesKcal: scaled.caloriesKcal,
+      proteinGrams: scaled.proteinGrams,
+      carbsGrams: scaled.carbsGrams,
+      fatGrams: scaled.fatGrams
+    };
+    setLoggedMeals((prev) => [newMeal, ...prev]);
+    setStatusStep(buildStatus(scaled));
+
+    try {
+      await appendEphemeralFoodLog({
+        dateKey: effectiveDateKey,
+        cycleId: resolvedCycleId,
+        dayNumber: localPlan.dayNumber,
+        entry: {
+          ...newMeal,
+          loggedAtMs: nowMs
+        }
+      });
+      await saveDailyTaskCompletion(localPlan.dayNumber, "nutrition_logged", true);
+    } catch {
+      // Non-fatal in preview environments
+    }
+  };
+
   const handleLogFoodPortion = async (): Promise<void> => {
     if (isUpdatingTaskRef.current || isUpdatingTask) {
       return;
@@ -590,33 +819,13 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     isUpdatingTaskRef.current = true;
     setIsUpdatingTask(true);
     try {
-      const updatedPlan = addFoodPortionToDailyPlan(
-        localPlan,
+      await recordFoodPortion(
         selectedPreset,
-        parsedGrams
+        parsedGrams,
+        "meal",
+        (scaled) =>
+          `Logged ${parsedGrams}g ${selectedPreset.name} (+${Math.round(scaled.caloriesKcal)} kcal, +${scaled.proteinGrams}g P)`
       );
-      applyPlanUpdate(updatedPlan);
-
-      const newMeal: LoggedMealRecord = {
-        id: `meal_${Date.now()}_${loggedMeals.length + 1}`,
-        presetId: selectedPreset.id,
-        name: selectedPreset.name,
-        grams: parsedGrams,
-        caloriesKcal: scaledPreview.caloriesKcal,
-        proteinGrams: scaledPreview.proteinGrams,
-        carbsGrams: scaledPreview.carbsGrams,
-        fatGrams: scaledPreview.fatGrams
-      };
-      setLoggedMeals((prev) => [newMeal, ...prev]);
-      setStatusStep(
-        `Logged ${parsedGrams}g ${selectedPreset.name} (+${Math.round(scaledPreview.caloriesKcal)} kcal, +${scaledPreview.proteinGrams}g P)`
-      );
-
-      try {
-        await saveDailyTaskCompletion(localPlan.dayNumber, "nutrition_logged", true);
-      } catch {
-        // Non-fatal in preview environments
-      }
     } catch (err: unknown) {
       const message =
         err instanceof Error ? err.message : "Failed to log food portion";
@@ -640,12 +849,24 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
 
       const toggled = updatedPlan.exercises.find((ex) => ex.id === exerciseId);
       if (toggled) {
+        const nextStats = getWorkoutCompletionStats(updatedPlan.exercises);
         setStatusStep(
           toggled.completed
-            ? `Checked off ${toggled.name} (${workoutStats.completedCount + 1}/${workoutStats.totalCount})`
+            ? `Checked off ${toggled.name} (${nextStats.completedCount}/${nextStats.totalCount})`
             : `Unchecked ${toggled.name}`
         );
         try {
+          await recordEphemeralExerciseTick({
+            dateKey: effectiveDateKey,
+            cycleId: resolvedCycleId,
+            dayNumber: localPlan.dayNumber,
+            tick: {
+              exerciseId: toggled.id,
+              name: toggled.name,
+              completed: toggled.completed,
+              updatedAtMs: Date.now()
+            }
+          });
           await saveDailyTaskCompletion(
             localPlan.dayNumber,
             `exercise_${exerciseId}`,
@@ -666,7 +887,105 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     }
   };
 
-  const handleApplyManualSteps = (): void => {
+  const handleQuickWorkoutDone = async (): Promise<void> => {
+    if (isUpdatingTaskRef.current || isUpdatingTask) {
+      return;
+    }
+    isUpdatingTaskRef.current = true;
+    setIsUpdatingTask(true);
+    try {
+      const incomplete = localPlan.exercises.filter((ex) => !ex.completed);
+      const nextExercises: WorkoutExerciseItem[] = localPlan.exercises.map(
+        (ex) => ({
+          ...ex,
+          completed: true
+        })
+      );
+      const allExercisesDone =
+        nextExercises.length > 0 && nextExercises.every((ex) => ex.completed);
+      const nextPlan: DailyPlan = {
+        ...localPlan,
+        exercises: nextExercises,
+        completed: allExercisesDone && localPlan.loggedCaloriesKcal > 0
+      };
+      applyPlanUpdate(nextPlan);
+      setStatusStep(
+        `Express workout marked done (${nextExercises.length}/${nextExercises.length} exercises) — Daily Proof unlocked!`
+      );
+
+      const targetTicks = incomplete.length > 0 ? incomplete : nextExercises;
+      const nowMs = Date.now();
+      try {
+        for (const ex of targetTicks) {
+          await recordEphemeralExerciseTick({
+            dateKey: effectiveDateKey,
+            cycleId: resolvedCycleId,
+            dayNumber: localPlan.dayNumber,
+            tick: {
+              exerciseId: ex.id,
+              name: ex.name,
+              completed: true,
+              updatedAtMs: nowMs
+            }
+          });
+          await saveDailyTaskCompletion(
+            localPlan.dayNumber,
+            `exercise_${ex.id}`,
+            true
+          );
+        }
+      } catch {
+        // Non-fatal in preview environments
+      }
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Failed to complete quick workout";
+      setStatusStep(`Quick workout update failed: ${message}`);
+      onErrorRef.current?.(err);
+    } finally {
+      isUpdatingTaskRef.current = false;
+      setIsUpdatingTask(false);
+    }
+  };
+
+  const handleQuickNutritionDone = async (): Promise<void> => {
+    if (isUpdatingTaskRef.current || isUpdatingTask) {
+      return;
+    }
+    isUpdatingTaskRef.current = true;
+    setIsUpdatingTask(true);
+    try {
+      const basePreset = DUAL_TRACK_FOOD_PRESETS[0]!;
+      const quickGrams =
+        localPlan.loggedCaloriesKcal === 0
+          ? Math.max(
+              150,
+              Math.round(
+                (Math.max(330, Math.round(localPlan.targetCaloriesKcal * 0.25)) /
+                  Math.max(1, basePreset.caloriesKcal)) *
+                  basePreset.servingSizeGrams
+              )
+            )
+          : 150;
+      await recordFoodPortion(
+        basePreset,
+        quickGrams,
+        "meal_quick",
+        (scaled) =>
+          `Express nutrition target met (+${Math.round(scaled.caloriesKcal)} kcal, +${scaled.proteinGrams}g P) — Daily Proof unlocked!`
+      );
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Failed to log quick nutrition";
+      setStatusStep(`Quick nutrition update failed: ${message}`);
+      onErrorRef.current?.(err);
+    } finally {
+      isUpdatingTaskRef.current = false;
+      setIsUpdatingTask(false);
+    }
+  };
+
+  const handleApplyManualSteps = async (): Promise<void> => {
     const trimmed = manualStepsInput.trim();
     const parsed = Number(trimmed);
     if (
@@ -681,11 +1000,29 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     setStepInputError(null);
     setTodaySteps(parsed);
     setStepSource("manual-fallback");
+    setEphemeralStepLogsCount((prev) => prev + 1);
     setStatusStep(
       parsed >= dailyStepGoal
         ? `Manual step goal reached (${parsed} / ${dailyStepGoal} steps) — tracked for personal progress (log a meal or exercise to unlock Daily Proof).`
         : `Updated local step count: ${parsed} / ${dailyStepGoal} steps (on-device only).`
     );
+
+    const nowMs = Date.now();
+    try {
+      await recordEphemeralStepLog({
+        dateKey: effectiveDateKey,
+        cycleId: resolvedCycleId,
+        dayNumber: localPlan.dayNumber,
+        entry: {
+          id: `step_${nowMs}`,
+          steps: parsed,
+          source: "manual-fallback",
+          recordedAtMs: nowMs
+        }
+      });
+    } catch {
+      // Non-fatal in preview environments
+    }
   };
 
   const handleSignAndDispatchProof = async (
@@ -773,6 +1110,14 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
 
       setStatusStep("3/3 Dispatching verified proof to DeHealthRewardGate...");
       await onDispatchSignedClaim(signedPayload);
+
+      try {
+        await purgeDailyEphemeralLogBuffer();
+      } catch {
+        // Non-fatal in preview environments
+      }
+      setLoggedMeals([]);
+      setEphemeralStepLogsCount(0);
 
       const signedKey = makeDailyProofSignedKey(effectiveCycleId, dayIndex);
       setLocalProofSignedKeys((prev) => ({
@@ -863,6 +1208,51 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     }
   };
 
+  const renderStepStatusBadge = (): React.ReactNode => (
+    <View
+      accessibilityLabel="Daily Step Counter Status"
+      accessibilityState={{ busy: isSyncingSteps }}
+      style={
+        pedometerAvailable && stepSource === "hardware"
+          ? styles.workoutProgressBadge
+          : styles.manualStepBadge
+      }
+    >
+      <Text
+        style={
+          pedometerAvailable && stepSource === "hardware"
+            ? styles.workoutProgressBadgeText
+            : styles.manualStepBadgeText
+        }
+      >
+        {isSyncingSteps
+          ? "Syncing steps..."
+          : pedometerAvailable && stepSource === "hardware"
+            ? "Hardware Pedometer"
+            : "Manual Step Fallback"}
+      </Text>
+    </View>
+  );
+
+  const renderStepEligibilityNotice = (): React.ReactNode => {
+    if (todaySteps >= dailyStepGoal) {
+      return stepSource === "hardware" ? (
+        <Text style={styles.stepGoalMetText}>
+          ✓ Daily step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — Daily Proof eligible
+        </Text>
+      ) : (
+        <Text style={styles.stepGoalPersonalText}>
+          ✓ Personal step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — tracked on-device
+        </Text>
+      );
+    }
+    return (
+      <Text style={styles.stepSovereigntyHint}>
+        Raw step counts stay strictly on-device and never leave to Supabase or L2.
+      </Text>
+    );
+  };
+
   return (
     <ScrollView
       style={styles.container}
@@ -909,6 +1299,71 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         <Text style={styles.subtitle}>
           Log portions with deterministic macro math and tick off your scheduled
           workout sets. Only your 32-byte Keccak-256 digest leaves the phone.
+        </Text>
+      </View>
+
+      {/* Segmented Mode Toggle */}
+      <View style={styles.modeToggleRow}>
+        <Pressable
+          testID="checkin-mode-quick"
+          accessibilityRole="tab"
+          accessibilityLabel="Quick Check (<60s)"
+          accessibilityState={{ selected: checkInMode === "quick" }}
+          style={[
+            styles.modeToggleTab,
+            checkInMode === "quick" ? styles.modeToggleTabActive : null
+          ]}
+          onPress={() => {
+            setCheckInMode("quick");
+          }}
+        >
+          <Text
+            style={[
+              styles.modeToggleTabText,
+              checkInMode === "quick" ? styles.modeToggleTabTextActive : null
+            ]}
+          >
+            Quick Check (&lt;60s)
+          </Text>
+        </Pressable>
+
+        <Pressable
+          testID="checkin-mode-detailed"
+          accessibilityRole="tab"
+          accessibilityLabel="Detailed Log"
+          accessibilityState={{ selected: checkInMode === "detailed" }}
+          style={[
+            styles.modeToggleTab,
+            checkInMode === "detailed" ? styles.modeToggleTabActive : null
+          ]}
+          onPress={() => {
+            setCheckInMode("detailed");
+          }}
+        >
+          <Text
+            style={[
+              styles.modeToggleTabText,
+              checkInMode === "detailed" ? styles.modeToggleTabTextActive : null
+            ]}
+          >
+            Detailed Log
+          </Text>
+        </Pressable>
+      </View>
+
+      {/* Privacy & 11:59 PM Settlement Notice Banner */}
+      <View testID="ephemeral-buffer-notice" style={styles.ephemeralNoticeBanner}>
+        <Text style={styles.ephemeralNoticeCounts}>
+          {loggedMeals.length} meals • {workoutStats.completedCount}/
+          {workoutStats.totalCount} exercises • {todaySteps.toLocaleString()} steps
+          {ephemeralStepLogsCount > 0
+            ? ` (${ephemeralStepLogsCount} step updates)`
+            : ""}
+        </Text>
+        <Text style={styles.ephemeralNoticeBody}>
+          Encrypted local daily buffer • Auto-purges after proof signing • 11:59 PM
+          daily settlement reminder (unsigned logs from prior days auto-purge at
+          midnight rollover).
         </Text>
       </View>
 
@@ -1000,10 +1455,114 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         </View>
       ) : null}
 
-      {/* ===================================================================== */}
-      {/* TRACK 1: NUTRITION & CALORIE TARGET CARD (QUICK FOOD & GRAM CALC)     */}
-      {/* ===================================================================== */}
-      <View style={styles.trackCard}>
+      {checkInMode === "quick" ? (
+        <View testID="quick-checkin-panel">
+          <Pressable
+            testID="quick-workout-done-btn"
+            accessibilityRole="button"
+            accessibilityLabel="Express Workout Done"
+            accessibilityState={{ disabled: isUpdatingTask }}
+            disabled={isUpdatingTask}
+            style={[
+              styles.quickActionCard,
+              workoutStats.allCompleted ? styles.quickActionCardCompleted : null,
+              isUpdatingTask ? styles.buttonDisabled : null
+            ]}
+            onPress={() => {
+              void handleQuickWorkoutDone();
+            }}
+          >
+            <View style={styles.quickActionTextCol}>
+              <Text style={styles.trackTag}>QUICK WORKOUT • 1-TAP</Text>
+              <Text style={styles.quickCardTitle}>🏋️ Express Workout Done</Text>
+              <Text style={styles.quickCardSub}>
+                {workoutStats.completedCount}/{workoutStats.totalCount} done
+                {localPlan.isFatigueScaled
+                  ? ` • -${fatigueReductionPct}% Fatigue Scaled`
+                  : ""}
+              </Text>
+            </View>
+            <Text style={styles.quickActionCta}>
+              {workoutStats.allCompleted ? "Done ✓" : "Mark Done →"}
+            </Text>
+          </Pressable>
+
+          <Pressable
+            testID="quick-nutrition-done-btn"
+            accessibilityRole="button"
+            accessibilityLabel="Express Nutrition Target Met"
+            accessibilityState={{ disabled: isUpdatingTask }}
+            disabled={isUpdatingTask}
+            style={[
+              styles.quickActionCard,
+              localPlan.loggedCaloriesKcal > 0
+                ? styles.quickActionCardCompleted
+                : null,
+              isUpdatingTask ? styles.buttonDisabled : null
+            ]}
+            onPress={() => {
+              void handleQuickNutritionDone();
+            }}
+          >
+            <View style={styles.quickActionTextCol}>
+              <Text style={styles.trackTag}>QUICK NUTRITION • 1-TAP</Text>
+              <Text style={styles.quickCardTitle}>
+                🥗 Express Nutrition Target Met
+              </Text>
+              <Text style={styles.quickCardSub}>
+                {localPlan.loggedCaloriesKcal} / {localPlan.targetCaloriesKcal} kcal •{" "}
+                {loggedMeals.length} meals
+              </Text>
+            </View>
+            <Text style={styles.quickActionCta}>
+              {localPlan.loggedCaloriesKcal > 0 ? "Logged ✓" : "Log Target →"}
+            </Text>
+          </Pressable>
+
+          <View testID="quick-step-goal-card" style={styles.trackCard}>
+            <View style={styles.trackHeaderRow}>
+              <View>
+                <Text style={styles.trackTag}>STEP VERIFICATION</Text>
+                <Text style={styles.quickCardTitle}>
+                  👟 Hardware Step Goal Reached
+                </Text>
+              </View>
+              {renderStepStatusBadge()}
+            </View>
+
+            <View style={styles.stepSummaryRow}>
+              <Text style={styles.stepCountText}>
+                {todaySteps.toLocaleString()} / {dailyStepGoal.toLocaleString()} steps
+              </Text>
+              <Text style={styles.stepPctText}>{stepGoalProgressPct}%</Text>
+            </View>
+
+            <View style={styles.progressBarBg}>
+              <View
+                style={[
+                  styles.progressBarFill,
+                  { width: `${stepGoalProgressPct}%` }
+                ]}
+              />
+            </View>
+
+            {renderStepEligibilityNotice()}
+
+            {!pedometerAvailable || stepSource === "manual-fallback" ? (
+              <View style={styles.manualProgressBadge}>
+                <Text style={styles.manualProgressBadgeText}>
+                  Manual entry tracked for personal progress (hardware pedometer required for step-only proof unlock)
+                </Text>
+              </View>
+            ) : null}
+          </View>
+        </View>
+      ) : (
+        <>
+          {/* ===================================================================== */}
+          {/* TRACK 1: NUTRITION & CALORIE TARGET CARD (QUICK FOOD & GRAM CALC)     */}
+          {/* ===================================================================== */}
+          <View style={styles.trackCard}>
         <View style={styles.trackHeaderRow}>
           <View>
             <Text style={styles.trackTag}>TRACK 1 • DETERMINISTIC NUTRITION</Text>
@@ -1236,105 +1795,73 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         })}
       </View>
 
-      {/* ===================================================================== */}
-      {/* TRACK 3: ON-DEVICE STEP COUNTER / MANUAL FALLBACK CARD                */}
-      {/* ===================================================================== */}
-      <View style={styles.trackCard}>
-        <View style={styles.trackHeaderRow}>
-          <View>
-            <Text style={styles.trackTag}>TRACK 3 • ON-DEVICE TELEMETRY</Text>
-            <Text style={styles.trackTitle}>👟 Daily Step Counter</Text>
-          </View>
-          <View
-            accessibilityLabel="Daily Step Counter Status"
-            accessibilityState={{ busy: isSyncingSteps }}
-            style={
-              pedometerAvailable && stepSource === "hardware"
-                ? styles.workoutProgressBadge
-                : styles.manualStepBadge
-            }
-          >
-            <Text
-              style={
-                pedometerAvailable && stepSource === "hardware"
-                  ? styles.workoutProgressBadgeText
-                  : styles.manualStepBadgeText
-              }
-            >
-              {isSyncingSteps
-                ? "Syncing steps..."
-                : pedometerAvailable && stepSource === "hardware"
-                  ? "Hardware Pedometer"
-                  : "Manual Step Fallback"}
-            </Text>
-          </View>
-        </View>
+          {/* ===================================================================== */}
+          {/* TRACK 3: ON-DEVICE STEP COUNTER / MANUAL FALLBACK CARD                */}
+          {/* ===================================================================== */}
+          <View style={styles.trackCard}>
+            <View style={styles.trackHeaderRow}>
+              <View>
+                <Text style={styles.trackTag}>TRACK 3 • ON-DEVICE TELEMETRY</Text>
+                <Text style={styles.trackTitle}>👟 Daily Step Counter</Text>
+              </View>
+              {renderStepStatusBadge()}
+            </View>
 
-        <View style={styles.stepSummaryRow}>
-          <Text style={styles.stepCountText}>
-            {todaySteps.toLocaleString()} / {dailyStepGoal.toLocaleString()} steps
-          </Text>
-          <Text style={styles.stepPctText}>{stepGoalProgressPct}%</Text>
-        </View>
-
-        <View style={styles.progressBarBg}>
-          <View
-            style={[
-              styles.progressBarFill,
-              { width: `${stepGoalProgressPct}%` }
-            ]}
-          />
-        </View>
-
-        {todaySteps >= dailyStepGoal ? (
-          stepSource === "hardware" ? (
-            <Text style={styles.stepGoalMetText}>
-              ✓ Daily step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — Daily Proof eligible
-            </Text>
-          ) : (
-            <Text style={styles.stepGoalPersonalText}>
-              ✓ Personal step goal reached ({dailyStepGoal.toLocaleString()}+ steps) — tracked on-device
-            </Text>
-          )
-        ) : (
-          <Text style={styles.stepSovereigntyHint}>
-            Raw step counts stay strictly on-device and never leave to Supabase or L2.
-          </Text>
-        )}
-
-        {!pedometerAvailable || stepSource === "manual-fallback" ? (
-          <View>
-            <View style={styles.manualProgressBadge}>
-              <Text style={styles.manualProgressBadgeText}>
-                Manual entry tracked for personal progress (hardware pedometer required for step-only proof unlock)
+            <View style={styles.stepSummaryRow}>
+              <Text style={styles.stepCountText}>
+                {todaySteps.toLocaleString()} / {dailyStepGoal.toLocaleString()} steps
               </Text>
+              <Text style={styles.stepPctText}>{stepGoalProgressPct}%</Text>
             </View>
-            <View style={styles.manualStepRow}>
-              <TextInput
-                accessibilityLabel="Manual step count input"
-                style={styles.manualStepInput}
-                value={manualStepsInput}
-                onChangeText={setManualStepsInput}
-                keyboardType="numeric"
-                placeholder="Enter today's steps"
-                placeholderTextColor="#64748B"
-              />
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Apply Manual Steps"
-                style={styles.applyStepsBtn}
-                onPress={handleApplyManualSteps}
-              >
-                <Text style={styles.applyStepsBtnText}>Apply Steps</Text>
-              </Pressable>
-            </View>
-          </View>
-        ) : null}
 
-        {stepInputError ? (
-          <Text style={styles.stepErrorText}>{stepInputError}</Text>
-        ) : null}
-      </View>
+            <View style={styles.progressBarBg}>
+              <View
+                style={[
+                  styles.progressBarFill,
+                  { width: `${stepGoalProgressPct}%` }
+                ]}
+              />
+            </View>
+
+            {renderStepEligibilityNotice()}
+
+            {!pedometerAvailable || stepSource === "manual-fallback" ? (
+              <View>
+                <View style={styles.manualProgressBadge}>
+                  <Text style={styles.manualProgressBadgeText}>
+                    Manual entry tracked for personal progress (hardware pedometer required for step-only proof unlock)
+                  </Text>
+                </View>
+                <View style={styles.manualStepRow}>
+                  <TextInput
+                    accessibilityLabel="Manual step count input"
+                    style={styles.manualStepInput}
+                    value={manualStepsInput}
+                    onChangeText={setManualStepsInput}
+                    keyboardType="numeric"
+                    placeholder="Enter today's steps"
+                    placeholderTextColor="#64748B"
+                  />
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel="Apply Manual Steps"
+                    style={styles.applyStepsBtn}
+                    onPress={() => {
+                      void handleApplyManualSteps();
+                    }}
+                  >
+                    <Text style={styles.applyStepsBtnText}>Apply Steps</Text>
+                  </Pressable>
+                </View>
+              </View>
+            ) : null}
+
+            {stepInputError ? (
+              <Text style={styles.stepErrorText}>{stepInputError}</Text>
+            ) : null}
+          </View>
+        </>
+      )}
 
       {/* ===================================================================== */}
       {/* CRYPTOGRAPHIC PROOF GATE BUTTON                                       */}
@@ -2147,5 +2674,89 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#F87171",
     marginTop: 6
+  },
+  modeToggleRow: {
+    flexDirection: "row",
+    gap: 8,
+    backgroundColor: "#0F172A",
+    borderRadius: 12,
+    padding: 4,
+    borderWidth: 1,
+    borderColor: "#1E293B",
+    marginBottom: 12
+  },
+  modeToggleTab: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 9,
+    alignItems: "center",
+    justifyContent: "center"
+  },
+  modeToggleTabActive: {
+    backgroundColor: "#1E3A8A",
+    borderWidth: 1,
+    borderColor: "#38BDF8"
+  },
+  modeToggleTabText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#94A3B8"
+  },
+  modeToggleTabTextActive: {
+    color: "#F8FAFC"
+  },
+  ephemeralNoticeBanner: {
+    backgroundColor: "#0F172A",
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: "#1E293B",
+    marginBottom: 16
+  },
+  ephemeralNoticeCounts: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#38BDF8",
+    marginBottom: 4
+  },
+  ephemeralNoticeBody: {
+    fontSize: 11,
+    color: "#94A3B8",
+    lineHeight: 16
+  },
+  quickActionCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#161F30",
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 12,
+    borderWidth: 1,
+    borderColor: "#1E293B"
+  },
+  quickActionCardCompleted: {
+    borderColor: "#10B981",
+    backgroundColor: "#052E16"
+  },
+  quickActionTextCol: {
+    flex: 1,
+    marginRight: 12
+  },
+  quickCardTitle: {
+    fontSize: 16,
+    fontWeight: "700",
+    color: "#F8FAFC",
+    marginBottom: 2
+  },
+  quickCardSub: {
+    fontSize: 12,
+    color: "#94A3B8"
+  },
+  quickActionCta: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#38BDF8"
   }
 });
