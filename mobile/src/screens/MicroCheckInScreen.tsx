@@ -398,7 +398,7 @@ export interface MicroCheckInScreenProps {
   readonly verifyingContract: Address;
   readonly currentStreak: number;
   readonly currentNonce: bigint;
-  readonly signer: Signer;
+  readonly signer?: Signer | null;
   readonly collectTelemetry?: () => TelemetryData;
   readonly userProfile?: UserProfile;
   readonly dailyPlan?: DailyPlan;
@@ -1106,6 +1106,11 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         deadline: deadlineSeconds
       };
 
+      if (!signer) {
+        throw new Error(
+          "Wallet signer is disconnected. Please sign in again before signing."
+        );
+      }
       const signedPayload = await signWorkoutProof(signer, proof, verifyingContract);
 
       setStatusStep("3/3 Dispatching verified proof to DeHealthRewardGate...");

@@ -500,6 +500,8 @@ export function getSupabaseClient(): SupabaseClient | null {
   try {
     cachedClient = createClient(url, anonKey, {
       auth: {
+        flowType: "pkce",
+        detectSessionInUrl: false,
         persistSession: false,
         autoRefreshToken: false
       }

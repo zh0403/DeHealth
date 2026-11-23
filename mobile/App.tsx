@@ -178,6 +178,27 @@ export function resolveClaimSigner(
   return localWallet ?? undefined;
 }
 
+/**
+ * Selects the render-time signer for interactive UI screens without ever
+ * falling back to the embedded local wallet when an external wallet session
+ * (`metamask` / `walletconnect`) is active, and passes the local wallet only
+ * for verified `"google"` or `"local"` sessions.
+ */
+export function resolveRenderSigner(
+  session: AuthSessionMetadata | null,
+  externalSigner: Signer | null,
+  localWallet: Signer | null
+): Signer | null {
+  const authMethod = session?.authMethod;
+  if (authMethod === "metamask" || authMethod === "walletconnect") {
+    return externalSigner;
+  }
+  if (authMethod === "google" || authMethod === "local") {
+    return localWallet;
+  }
+  return null;
+}
+
 export interface DerivedVaultMetrics {
   readonly streakCount: number;
   readonly fallbackBalanceDht: string;
@@ -1110,7 +1131,7 @@ export default function App(): React.ReactElement {
     );
   }
 
-  const activeSigner: Signer = externalSigner ?? wallet;
+  const activeSigner = resolveRenderSigner(authSession, externalSigner, wallet);
 
   return (
     <SafeAreaView style={styles.viewport}>

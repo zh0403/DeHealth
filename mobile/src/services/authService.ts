@@ -237,6 +237,8 @@ export function setOAuthBrowserAdapterForTesting(
  */
 export function resetOAuthBrowserAdapterForTesting(): void {
   customOAuthBrowserAdapter = undefined;
+  pendingGoogleOAuthAttempt = false;
+  activeGoogleSignInCalls = 0;
   inFlightOAuthExchanges.clear();
   completedOAuthExchanges.clear();
 }
@@ -613,6 +615,8 @@ export function setAuthSessionStorage(storage: AuthSessionStorage): void {
 export function resetAuthSessionStorage(): void {
   defaultAuthStorage = null;
   authInitPromise = null;
+  pendingGoogleOAuthAttempt = false;
+  activeGoogleSignInCalls = 0;
   inFlightOAuthExchanges.clear();
   completedOAuthExchanges.clear();
 }
@@ -819,26 +823,74 @@ function parseOAuthCallbackParams(
 
 const inFlightOAuthExchanges = new Map<string, Promise<boolean>>();
 const completedOAuthExchanges = new Set<string>();
+let pendingGoogleOAuthAttempt = false;
+let activeGoogleSignInCalls = 0;
 
 /**
- * Extracts Supabase PKCE authorization `code` or implicit OAuth tokens
- * (`access_token` / `refresh_token`) from a deep-link redirect URL and completes
- * the Supabase session. Deduplicates identical in-flight/completed redirect URLs
- * so concurrent WebBrowser and Linking listeners never consume a single-use PKCE
- * code twice. Returns `true` when OAuth credentials were exchanged.
+ * Returns true while a user-initiated Google OAuth flow is awaiting redirect
+ * verification, preventing unsolicited `dehealth://auth-callback` deep links.
+ */
+export function hasPendingGoogleOAuthAttempt(): boolean {
+  return pendingGoogleOAuthAttempt;
+}
+
+/**
+ * Arms or clears the pending Google OAuth attempt flag for deterministic tests.
+ */
+export function setPendingGoogleOAuthAttemptForTesting(
+  pending: boolean
+): void {
+  pendingGoogleOAuthAttempt = pending;
+}
+
+function isAuthCallbackRedirectUrl(url: string): boolean {
+  const normalized = url.trim().toLowerCase();
+  return (
+    normalized.startsWith("dehealth://auth-callback") ||
+    normalized.includes("/auth-callback")
+  );
+}
+
+/**
+ * Extracts Supabase PKCE authorization `code` from a redirect callback URL and
+ * exchanges it via `client.auth.exchangeCodeForSession`. Rejects unsolicited
+ * OAuth callbacks when `hasPendingGoogleOAuthAttempt()` is false and rejects raw
+ * implicit URL tokens (`access_token` / `refresh_token`) in favor of strict PKCE.
  */
 export async function completeOAuthRedirectCallback(
   callbackUrl: string,
   supabaseClient?: ReturnType<typeof getSupabaseClient>
 ): Promise<boolean> {
   const params = parseOAuthCallbackParams(callbackUrl);
+  const hasOAuthCredentialOrError = Boolean(
+    params.code ||
+      params.accessToken ||
+      params.error ||
+      params.errorDescription
+  );
+
+  if (
+    !pendingGoogleOAuthAttempt &&
+    (hasOAuthCredentialOrError || isAuthCallbackRedirectUrl(callbackUrl))
+  ) {
+    throw new AuthError(
+      "Unsolicited Google OAuth callback rejected: no sign-in flow is active."
+    );
+  }
+
   if (params.errorDescription || params.error) {
     throw new AuthError(
       params.errorDescription ?? params.error ?? "Google sign-in failed."
     );
   }
 
-  if (!params.code && !params.accessToken) {
+  if (params.accessToken && !params.code) {
+    throw new AuthError(
+      "Google sign-in requires a PKCE authorization code; implicit URL tokens are rejected."
+    );
+  }
+
+  if (!params.code) {
     return false;
   }
 
@@ -848,9 +900,7 @@ export async function completeOAuthRedirectCallback(
     return false;
   }
 
-  const dedupKey = params.code
-    ? `code:${params.code}`
-    : `token:${params.accessToken ?? ""}`;
+  const dedupKey = `code:${params.code}`;
   if (completedOAuthExchanges.has(dedupKey)) {
     return true;
   }
@@ -860,41 +910,19 @@ export async function completeOAuthRedirectCallback(
   }
 
   const runExchange = (async (): Promise<boolean> => {
-    if (params.code) {
-      if (typeof client.auth?.exchangeCodeForSession !== "function") {
-        throw new AuthError(GOOGLE_UNVERIFIED_MESSAGE);
-      }
-      const exchangeResult = await client.auth.exchangeCodeForSession(
-        params.code
+    if (typeof client.auth?.exchangeCodeForSession !== "function") {
+      throw new AuthError(GOOGLE_UNVERIFIED_MESSAGE);
+    }
+    const exchangeResult = await client.auth.exchangeCodeForSession(
+      params.code!
+    );
+    if (exchangeResult?.error) {
+      throw new AuthError(
+        exchangeResult.error.message || "Google OAuth code exchange failed."
       );
-      if (exchangeResult?.error) {
-        throw new AuthError(
-          exchangeResult.error.message || "Google OAuth code exchange failed."
-        );
-      }
-      completedOAuthExchanges.add(dedupKey);
-      return true;
     }
-
-    if (params.accessToken) {
-      if (typeof client.auth?.setSession !== "function") {
-        throw new AuthError(GOOGLE_UNVERIFIED_MESSAGE);
-      }
-      const sessionResult = await client.auth.setSession({
-        access_token: params.accessToken,
-        refresh_token: params.refreshToken ?? ""
-      });
-      if (sessionResult?.error) {
-        throw new AuthError(
-          sessionResult.error.message ||
-            "Google OAuth session hydration failed."
-        );
-      }
-      completedOAuthExchanges.add(dedupKey);
-      return true;
-    }
-
-    return false;
+    completedOAuthExchanges.add(dedupKey);
+    return true;
   })();
 
   inFlightOAuthExchanges.set(dedupKey, runExchange);
@@ -984,24 +1012,30 @@ export async function hydrateVerifiedGoogleSession(
 
 /**
  * Handles an incoming cold or warm OAuth redirect URL (via `Linking`), completing
- * token/code exchange and hydrating the verified `"google"` session. Returns
- * `null` for non-OAuth URLs.
+ * PKCE code exchange and hydrating the verified `"google"` session ONLY when a
+ * Google OAuth attempt is active. Returns `null` for non-OAuth URLs.
  */
 export async function handleIncomingOAuthRedirectUrl(
   callbackUrl: string,
   options?: Pick<GoogleSignInOptions, "keyStore" | "storage" | "nowMs">
 ): Promise<AuthSignInResult | null> {
-  const handled = await completeOAuthRedirectCallback(callbackUrl);
-  if (!handled) {
-    return null;
+  try {
+    const handled = await completeOAuthRedirectCallback(callbackUrl);
+    if (!handled) {
+      return null;
+    }
+    return await hydrateVerifiedGoogleSession(options);
+  } finally {
+    if (activeGoogleSignInCalls === 0) {
+      pendingGoogleOAuthAttempt = false;
+    }
   }
-  return hydrateVerifiedGoogleSession(options);
 }
 
 /**
  * Signs in with Google via verified Supabase OAuth (`client.auth.getUser()`),
  * opening the system browser via `expo-web-browser` when an OAuth URL is returned
- * and exchanging callback tokens/code, or delegates explicitly to `startLocalSession`
+ * and exchanging PKCE authorization codes, or delegates explicitly to `startLocalSession`
  * (`authMethod: "local"`) when Supabase is offline/unconfigured. Never provisions a
  * wallet or persists a `"google"` session unless `getUser()` returns a verified user ID.
  */
@@ -1025,50 +1059,34 @@ export async function signInWithGoogle(
   const redirectTo =
     options?.redirectTo?.trim() || (await resolveGoogleOAuthRedirectUri());
 
-  let oauthUrl: string | null = null;
+  activeGoogleSignInCalls += 1;
+  pendingGoogleOAuthAttempt = true;
   try {
-    const oauthResponse = await client.auth.signInWithOAuth({
-      provider: "google",
-      options: {
-        redirectTo,
-        skipBrowserRedirect: true
-      }
-    });
-    if (oauthResponse.error) {
-      throw new AuthError(
-        oauthResponse.error.message || "Google sign-in failed."
-      );
-    }
-    oauthUrl = oauthResponse.data?.url ?? null;
-  } catch (err) {
-    if (err instanceof AuthError) {
-      throw err;
-    }
-    throw new AuthError(toAuthErrorMessage(err, "Google sign-in failed."));
-  }
-
-  if (options?.verifyOAuthCallback) {
+    let oauthUrl: string | null = null;
     try {
-      await options.verifyOAuthCallback();
+      const oauthResponse = await client.auth.signInWithOAuth({
+        provider: "google",
+        options: {
+          redirectTo,
+          skipBrowserRedirect: true
+        }
+      });
+      if (oauthResponse.error) {
+        throw new AuthError(
+          oauthResponse.error.message || "Google sign-in failed."
+        );
+      }
+      oauthUrl = oauthResponse.data?.url ?? null;
     } catch (err) {
       if (err instanceof AuthError) {
         throw err;
       }
-      throw new AuthError(
-        toAuthErrorMessage(err, "Google sign-in callback verification failed.")
-      );
+      throw new AuthError(toAuthErrorMessage(err, "Google sign-in failed."));
     }
-  } else if (oauthUrl && oauthUrl.trim().length > 0) {
-    const browserAdapter = await resolveOAuthBrowserAdapter(
-      options?.browserAdapter
-    );
-    if (browserAdapter) {
-      let browserResult: OAuthBrowserSessionResult;
+
+    if (options?.verifyOAuthCallback) {
       try {
-        browserResult = await browserAdapter.openAuthSessionAsync(
-          oauthUrl,
-          redirectTo
-        );
+        await options.verifyOAuthCallback();
       } catch (err) {
         if (err instanceof AuthError) {
           throw err;
@@ -1076,39 +1094,70 @@ export async function signInWithGoogle(
         throw new AuthError(
           toAuthErrorMessage(
             err,
-            "Unable to open browser for Google authentication."
+            "Google sign-in callback verification failed."
           )
         );
       }
+    } else if (oauthUrl && oauthUrl.trim().length > 0) {
+      const browserAdapter = await resolveOAuthBrowserAdapter(
+        options?.browserAdapter
+      );
+      if (browserAdapter) {
+        let browserResult: OAuthBrowserSessionResult;
+        try {
+          browserResult = await browserAdapter.openAuthSessionAsync(
+            oauthUrl,
+            redirectTo
+          );
+        } catch (err) {
+          if (err instanceof AuthError) {
+            throw err;
+          }
+          throw new AuthError(
+            toAuthErrorMessage(
+              err,
+              "Unable to open browser for Google authentication."
+            )
+          );
+        }
 
-      if (
-        browserResult.type === "cancel" ||
-        browserResult.type === "dismiss"
-      ) {
-        throw new AuthError("Google sign-in was cancelled.");
-      }
+        if (
+          browserResult.type === "cancel" ||
+          browserResult.type === "dismiss"
+        ) {
+          throw new AuthError("Google sign-in was cancelled.");
+        }
 
-      if (browserResult.type !== "success" && browserResult.type !== "opened") {
-        throw new AuthError(GOOGLE_UNVERIFIED_MESSAGE);
-      }
+        if (
+          browserResult.type !== "success" &&
+          browserResult.type !== "opened"
+        ) {
+          throw new AuthError(GOOGLE_UNVERIFIED_MESSAGE);
+        }
 
-      if (
-        browserResult.type === "success" &&
-        typeof browserResult.url === "string" &&
-        browserResult.url.trim().length > 0
-      ) {
-        await completeOAuthRedirectCallback(browserResult.url, client);
+        if (
+          browserResult.type === "success" &&
+          typeof browserResult.url === "string" &&
+          browserResult.url.trim().length > 0
+        ) {
+          await completeOAuthRedirectCallback(browserResult.url, client);
+        }
       }
     }
-  }
 
-  return hydrateVerifiedGoogleSession({
-    keyStore: options?.keyStore,
-    storage: options?.storage,
-    nowMs: signedInAtMs,
-    oauthUrl,
-    supabaseClient: client
-  });
+    return await hydrateVerifiedGoogleSession({
+      keyStore: options?.keyStore,
+      storage: options?.storage,
+      nowMs: signedInAtMs,
+      oauthUrl,
+      supabaseClient: client
+    });
+  } finally {
+    activeGoogleSignInCalls = Math.max(0, activeGoogleSignInCalls - 1);
+    if (activeGoogleSignInCalls === 0) {
+      pendingGoogleOAuthAttempt = false;
+    }
+  }
 }
 
 async function openDeepLinkUrl(url: string): Promise<void> {
@@ -1705,6 +1754,8 @@ export async function signOutSession(options?: {
     }
   }
 
+  pendingGoogleOAuthAttempt = false;
+  activeGoogleSignInCalls = 0;
   inFlightOAuthExchanges.clear();
   completedOAuthExchanges.clear();
   await clearPersistedAuthSession(options?.storage);

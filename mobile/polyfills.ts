@@ -1,11 +1,10 @@
 /**
  * Entry-point side effect: guarantee a secure getRandomValues before any key is
- * generated. The implementation and its rationale live in src/runtime/cryptoShim.ts.
+ * generated, and synchronously register WalletConnect React Native compat shims
+ * (URL, crypto.getRandomValues, TextEncoder, NetInfo, Linking) before any
+ * downstream module initializes.
  */
+import "@walletconnect/react-native-compat";
 import { installCryptoShim } from "./src/runtime/cryptoShim";
 
 installCryptoShim();
-
-if (typeof navigator !== "undefined" && navigator.product === "ReactNative") {
-  void import("@walletconnect/react-native-compat").catch(() => undefined);
-}
