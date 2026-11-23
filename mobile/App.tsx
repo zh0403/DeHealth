@@ -12,9 +12,10 @@ import {
   WeightLogEntry
 } from "@dehealth/shared";
 import { Signer, Wallet } from "ethers";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Linking,
   Platform,
   Pressable,
   SafeAreaView,
@@ -42,10 +43,14 @@ import {
   getActiveDayIndex
 } from "./src/services/adaptivePlanEngine";
 import {
+  AuthError,
   AuthSignInResult,
+  clearPersistedAuthSession,
   getPersistedAuthSession,
   getWalletConnectProjectId,
+  handleIncomingOAuthRedirectUrl,
   purgeAuthSessionStorageKey,
+  restoreExternalWalletSignerOnBoot,
   signInWithGoogle,
   signInWithMetaMask,
   signInWithWalletConnect,
@@ -149,6 +154,30 @@ function biometricsToUserProfile(bio: UserBiometrics): UserProfile {
   };
 }
 
+/**
+ * Selects the signer for an on-chain claim. External wallet sessions must use
+ * their connected external signer and never fall back to the local embedded
+ * wallet, which would sign for an address it does not control.
+ */
+export function resolveClaimSigner(
+  session: AuthSessionMetadata | null,
+  externalSigner: Signer | null,
+  localWallet: Signer | null
+): Signer | undefined {
+  const isExternalSession =
+    session?.authMethod === "metamask" ||
+    session?.authMethod === "walletconnect";
+  if (isExternalSession) {
+    if (!externalSigner) {
+      throw new AuthError(
+        "External wallet signer is disconnected. Please sign in again before signing."
+      );
+    }
+    return externalSigner;
+  }
+  return localWallet ?? undefined;
+}
+
 export interface DerivedVaultMetrics {
   readonly streakCount: number;
   readonly fallbackBalanceDht: string;
@@ -209,6 +238,7 @@ export interface HydratedVaultState {
   readonly proofSignedMap: Readonly<Record<string, boolean>>;
   readonly governanceConfig: GovernanceConfig;
   readonly storedAuthSession: AuthSessionMetadata | null;
+  readonly externalSigner?: Signer | null;
   readonly activeEphemeralBuffer?: DailyEphemeralLogBuffer | null;
 }
 
@@ -220,6 +250,10 @@ export interface VaultHydrationDeps {
   readonly getDailyProofSignedMap: () => Promise<Record<string, boolean>>;
   readonly getGovernanceConfig?: () => Promise<GovernanceConfig>;
   readonly getPersistedAuthSession?: () => Promise<AuthSessionMetadata | null>;
+  readonly restoreExternalSigner?: (
+    session: AuthSessionMetadata
+  ) => Promise<Signer | null>;
+  readonly clearPersistedAuthSession?: () => Promise<void>;
   readonly rolloverStaleDailyEphemeralLogBuffer?: (
     todayDateKey?: string
   ) => Promise<EphemeralBufferRolloverResult>;
@@ -238,6 +272,8 @@ const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
   getDailyProofSignedMap,
   getGovernanceConfig,
   getPersistedAuthSession,
+  restoreExternalSigner: restoreExternalWalletSignerOnBoot,
+  clearPersistedAuthSession,
   rolloverStaleDailyEphemeralLogBuffer,
   clearStoredWallet,
   clearVaultSecret,
@@ -251,6 +287,10 @@ export async function hydrateVaultData(
 ): Promise<HydratedVaultState> {
   const resolveGov = deps.getGovernanceConfig ?? getGovernanceConfig;
   const resolveAuth = deps.getPersistedAuthSession ?? getPersistedAuthSession;
+  const resolveRestoreSigner =
+    deps.restoreExternalSigner ?? restoreExternalWalletSignerOnBoot;
+  const resolveClearAuth =
+    deps.clearPersistedAuthSession ?? clearPersistedAuthSession;
   const resolveRollover =
     deps.rolloverStaleDailyEphemeralLogBuffer ??
     rolloverStaleDailyEphemeralLogBuffer;
@@ -272,6 +312,25 @@ export async function hydrateVaultData(
   // provisioning completes so independent keystore handles never race on boot.
   const governanceConfig = await resolveGov();
   const storedAuthSession = await resolveAuth();
+  let effectiveAuthSession: AuthSessionMetadata | null = storedAuthSession;
+  let externalSigner: Signer | null = null;
+
+  if (
+    storedAuthSession &&
+    (storedAuthSession.authMethod === "metamask" ||
+      storedAuthSession.authMethod === "walletconnect")
+  ) {
+    try {
+      externalSigner = await resolveRestoreSigner(storedAuthSession);
+    } catch {
+      externalSigner = null;
+    }
+    if (!externalSigner) {
+      await resolveClearAuth();
+      effectiveAuthSession = null;
+    }
+  }
+
   const rolloverResult = await resolveRollover(formatLocalCalendarDateKey());
 
   return {
@@ -281,7 +340,8 @@ export async function hydrateVaultData(
     persistentWallet,
     proofSignedMap,
     governanceConfig,
-    storedAuthSession,
+    storedAuthSession: effectiveAuthSession,
+    externalSigner,
     activeEphemeralBuffer: rolloverResult.activeBuffer
   };
 }
@@ -579,7 +639,7 @@ export default function App(): React.ReactElement {
 
     setInitError(null);
     setWallet(persistentWallet);
-    setExternalSigner(null);
+    setExternalSigner(hydrated.externalSigner ?? null);
     setAuthSession(storedAuthSession);
     setProofSignedMap(hydratedProofMap);
     setGovernanceConfig(hydratedGovernance);
@@ -779,6 +839,72 @@ export default function App(): React.ReactElement {
     }
   };
 
+  const applyAuthenticatedResultRef = useRef<
+    (authResult: AuthSignInResult) => void
+  >(() => undefined);
+  applyAuthenticatedResultRef.current = applyAuthenticatedResult;
+
+  const showErrorNoticeRef = useRef<
+    (err: unknown, fallbackTitle: string) => void
+  >(() => undefined);
+  showErrorNoticeRef.current = showErrorNotice;
+
+  useEffect(() => {
+    let mounted = true;
+    const handledUrls = new Set<string>();
+
+    void import("expo-web-browser")
+      .then((wb) => {
+        if (typeof wb.maybeCompleteAuthSession === "function") {
+          wb.maybeCompleteAuthSession();
+        }
+      })
+      .catch(() => undefined);
+
+    const processIncomingOAuthUrl = async (
+      url: string | null | undefined
+    ): Promise<void> => {
+      if (typeof url !== "string" || url.trim().length === 0) {
+        return;
+      }
+      const trimmed = url.trim();
+      if (handledUrls.has(trimmed)) {
+        return;
+      }
+      handledUrls.add(trimmed);
+      try {
+        const result = await handleIncomingOAuthRedirectUrl(trimmed);
+        if (mounted && result) {
+          applyAuthenticatedResultRef.current(result);
+        }
+      } catch (err: unknown) {
+        if (mounted) {
+          showErrorNoticeRef.current(err, "Google Authentication Failed");
+        }
+      }
+    };
+
+    if (typeof Linking?.getInitialURL === "function") {
+      void Linking.getInitialURL()
+        .then((initialUrl) => processIncomingOAuthUrl(initialUrl))
+        .catch(() => undefined);
+    }
+
+    const subscription =
+      typeof Linking?.addEventListener === "function"
+        ? Linking.addEventListener("url", (event: { readonly url: string }) => {
+            void processIncomingOAuthUrl(event?.url);
+          })
+        : null;
+
+    return () => {
+      mounted = false;
+      if (subscription && typeof subscription.remove === "function") {
+        subscription.remove();
+      }
+    };
+  }, []);
+
   const handleSignInWithGoogle = async (): Promise<void> => {
     const authResult = isSupabaseConfigured()
       ? await signInWithGoogle()
@@ -848,8 +974,11 @@ export default function App(): React.ReactElement {
   ): Promise<void> => {
     try {
       // 1. Submit on-chain claim or fallback receipt (runs L2 gas pre-check first)
-      const signingWallet: Signer | undefined =
-        externalSigner ?? wallet ?? undefined;
+      const signingWallet = resolveClaimSigner(
+        authSession,
+        externalSigner,
+        wallet
+      );
       const claimResult = await claimStreakReward(payload, signingWallet);
       setLastTxHash(claimResult.txHash);
       setLastExplorerUrl(

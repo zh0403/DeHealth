@@ -160,6 +160,11 @@ export function makeDailyCommitmentKey(cycleId: string, dayIndex: number): strin
   return `${cycleId.trim()}:${dayIndex}`;
 }
 
+const ephemeralQueueByAdapter = new WeakMap<
+  EncryptedStorageAdapter,
+  Promise<void>
+>();
+
 /**
  * AdaptiveStorage provides typed, local-only encrypted persistence for all
  * biometric, fitness plan, weight log, and task completion records.
@@ -519,11 +524,27 @@ export class AdaptiveStorage {
     return raw;
   }
 
+  private enqueueEphemeralBufferOp<T>(op: () => Promise<T>): Promise<T> {
+    const previous =
+      ephemeralQueueByAdapter.get(this.adapter) ?? Promise.resolve();
+    const run = previous.then(op, op);
+    const tail = run.then(
+      () => undefined,
+      () => undefined
+    );
+    ephemeralQueueByAdapter.set(this.adapter, tail);
+    return run;
+  }
+
   /**
    * Validates and encrypts the daily ephemeral log buffer strictly on-device.
    */
-  async saveDailyEphemeralLogBuffer(buffer: DailyEphemeralLogBuffer): Promise<void> {
-    await this.persistEphemeralBuffer(buffer);
+  async saveDailyEphemeralLogBuffer(
+    buffer: DailyEphemeralLogBuffer
+  ): Promise<void> {
+    await this.enqueueEphemeralBufferOp(() =>
+      this.persistEphemeralBufferRaw(buffer)
+    );
   }
 
   /**
@@ -531,6 +552,133 @@ export class AdaptiveStorage {
    * or if Zod validation fails. MAC/envelope tampering errors propagate.
    */
   async getDailyEphemeralLogBuffer(): Promise<DailyEphemeralLogBuffer | null> {
+    return this.enqueueEphemeralBufferOp(() =>
+      this.readDailyEphemeralLogBufferRaw()
+    );
+  }
+
+  /**
+   * Appends a food log entry to the active day's encrypted buffer, or
+   * initializes a fresh buffer when absent or when dateKey changes.
+   * Serialized through the per-adapter FIFO promise queue so concurrent taps
+   * never drop entries.
+   */
+  async appendEphemeralFoodLog(params: {
+    readonly dateKey: string;
+    readonly cycleId: string;
+    readonly dayNumber: number;
+    readonly entry: EphemeralFoodLogEntry;
+  }): Promise<DailyEphemeralLogBuffer> {
+    return this.enqueueEphemeralBufferOp(async () => {
+      const validatedEntry = EphemeralFoodLogEntrySchema.parse(params.entry);
+      const base = await this.readOrInitDailyBufferRaw(params);
+      return this.persistEphemeralBufferRaw({
+        dateKey: params.dateKey,
+        cycleId: params.cycleId,
+        dayNumber: params.dayNumber,
+        foodLogs: [...base.foodLogs, validatedEntry],
+        exerciseTicks: base.exerciseTicks,
+        stepLogs: base.stepLogs,
+        updatedAtMs: Math.max(Date.now(), validatedEntry.loggedAtMs)
+      });
+    });
+  }
+
+  /**
+   * Upserts an exercise completion tick by exerciseId in the encrypted daily buffer,
+   * initializing a fresh buffer when absent or when dateKey changes.
+   * Serialized through the per-adapter FIFO promise queue so concurrent taps
+   * never overwrite sibling ticks.
+   */
+  async recordEphemeralExerciseTick(params: {
+    readonly dateKey: string;
+    readonly cycleId: string;
+    readonly dayNumber: number;
+    readonly tick: EphemeralExerciseTick;
+  }): Promise<DailyEphemeralLogBuffer> {
+    return this.enqueueEphemeralBufferOp(async () => {
+      const validatedTick = EphemeralExerciseTickSchema.parse(params.tick);
+      const base = await this.readOrInitDailyBufferRaw(params);
+      const existingIdx = base.exerciseTicks.findIndex(
+        (item) => item.exerciseId === validatedTick.exerciseId
+      );
+      const nextTicks = [...base.exerciseTicks];
+      if (existingIdx >= 0) {
+        nextTicks[existingIdx] = validatedTick;
+      } else {
+        nextTicks.push(validatedTick);
+      }
+      return this.persistEphemeralBufferRaw({
+        dateKey: params.dateKey,
+        cycleId: params.cycleId,
+        dayNumber: params.dayNumber,
+        foodLogs: base.foodLogs,
+        exerciseTicks: nextTicks,
+        stepLogs: base.stepLogs,
+        updatedAtMs: Math.max(Date.now(), validatedTick.updatedAtMs)
+      });
+    });
+  }
+
+  /**
+   * Appends a step entry to the active day's encrypted buffer, or initializes
+   * a fresh buffer when absent or when dateKey changes.
+   * Serialized through the per-adapter FIFO promise queue.
+   */
+  async recordEphemeralStepLog(params: {
+    readonly dateKey: string;
+    readonly cycleId: string;
+    readonly dayNumber: number;
+    readonly entry: EphemeralStepEntry;
+  }): Promise<DailyEphemeralLogBuffer> {
+    return this.enqueueEphemeralBufferOp(async () => {
+      const validatedEntry = EphemeralStepEntrySchema.parse(params.entry);
+      const base = await this.readOrInitDailyBufferRaw(params);
+      return this.persistEphemeralBufferRaw({
+        dateKey: params.dateKey,
+        cycleId: params.cycleId,
+        dayNumber: params.dayNumber,
+        foodLogs: base.foodLogs,
+        exerciseTicks: base.exerciseTicks,
+        stepLogs: [...base.stepLogs, validatedEntry],
+        updatedAtMs: Math.max(Date.now(), validatedEntry.recordedAtMs)
+      });
+    });
+  }
+
+  /**
+   * Purges ONLY the daily ephemeral raw log buffer, leaving proofSignedMap and
+   * completion receipts intact.
+   * Serialized through the per-adapter FIFO promise queue.
+   */
+  async purgeDailyEphemeralLogBuffer(): Promise<void> {
+    await this.enqueueEphemeralBufferOp(() =>
+      this.purgeDailyEphemeralLogBufferRaw()
+    );
+  }
+
+  /**
+   * Purges prior-day unsigned ephemeral buffers on local calendar rollover while
+   * retaining buffers whose dateKey matches todayDateKey.
+   * Serialized through the per-adapter FIFO promise queue.
+   */
+  async rolloverStaleDailyEphemeralLogBuffer(
+    todayDateKey: string = formatLocalCalendarDateKey()
+  ): Promise<EphemeralBufferRolloverResult> {
+    if (!LOCAL_CALENDAR_DATE_KEY_REGEX.test(todayDateKey)) {
+      throw new Error("todayDateKey must match YYYY-MM-DD");
+    }
+    return this.enqueueEphemeralBufferOp(async () => {
+      const existing = await this.readDailyEphemeralLogBufferRaw();
+      if (existing && existing.dateKey !== todayDateKey) {
+        await this.purgeDailyEphemeralLogBufferRaw();
+        return { purged: true, activeBuffer: null };
+      }
+      return { purged: false, activeBuffer: existing };
+    });
+  }
+
+  private async readDailyEphemeralLogBufferRaw(): Promise<DailyEphemeralLogBuffer | null> {
     const raw = await this.adapter.getEncryptedItem<unknown>(
       ADAPTIVE_STORAGE_KEYS.DAILY_EPHEMERAL_LOG_BUFFER
     );
@@ -541,113 +689,13 @@ export class AdaptiveStorage {
     return parsed.success ? parsed.data : null;
   }
 
-  /**
-   * Appends a food log entry to the active day's encrypted buffer, or
-   * initializes a fresh buffer when absent or when dateKey changes.
-   */
-  async appendEphemeralFoodLog(params: {
-    readonly dateKey: string;
-    readonly cycleId: string;
-    readonly dayNumber: number;
-    readonly entry: EphemeralFoodLogEntry;
-  }): Promise<DailyEphemeralLogBuffer> {
-    const validatedEntry = EphemeralFoodLogEntrySchema.parse(params.entry);
-    const base = await this.readOrInitDailyBuffer(params);
-    return this.persistEphemeralBuffer({
-      dateKey: params.dateKey,
-      cycleId: params.cycleId,
-      dayNumber: params.dayNumber,
-      foodLogs: [...base.foodLogs, validatedEntry],
-      exerciseTicks: base.exerciseTicks,
-      stepLogs: base.stepLogs,
-      updatedAtMs: Math.max(Date.now(), validatedEntry.loggedAtMs)
-    });
-  }
-
-  /**
-   * Upserts an exercise completion tick by exerciseId in the encrypted daily buffer,
-   * initializing a fresh buffer when absent or when dateKey changes.
-   */
-  async recordEphemeralExerciseTick(params: {
-    readonly dateKey: string;
-    readonly cycleId: string;
-    readonly dayNumber: number;
-    readonly tick: EphemeralExerciseTick;
-  }): Promise<DailyEphemeralLogBuffer> {
-    const validatedTick = EphemeralExerciseTickSchema.parse(params.tick);
-    const base = await this.readOrInitDailyBuffer(params);
-    const existingIdx = base.exerciseTicks.findIndex(
-      (item) => item.exerciseId === validatedTick.exerciseId
-    );
-    const nextTicks = [...base.exerciseTicks];
-    if (existingIdx >= 0) {
-      nextTicks[existingIdx] = validatedTick;
-    } else {
-      nextTicks.push(validatedTick);
-    }
-    return this.persistEphemeralBuffer({
-      dateKey: params.dateKey,
-      cycleId: params.cycleId,
-      dayNumber: params.dayNumber,
-      foodLogs: base.foodLogs,
-      exerciseTicks: nextTicks,
-      stepLogs: base.stepLogs,
-      updatedAtMs: Math.max(Date.now(), validatedTick.updatedAtMs)
-    });
-  }
-
-  /**
-   * Appends a step entry to the active day's encrypted buffer, or initializes
-   * a fresh buffer when absent or when dateKey changes.
-   */
-  async recordEphemeralStepLog(params: {
-    readonly dateKey: string;
-    readonly cycleId: string;
-    readonly dayNumber: number;
-    readonly entry: EphemeralStepEntry;
-  }): Promise<DailyEphemeralLogBuffer> {
-    const validatedEntry = EphemeralStepEntrySchema.parse(params.entry);
-    const base = await this.readOrInitDailyBuffer(params);
-    return this.persistEphemeralBuffer({
-      dateKey: params.dateKey,
-      cycleId: params.cycleId,
-      dayNumber: params.dayNumber,
-      foodLogs: base.foodLogs,
-      exerciseTicks: base.exerciseTicks,
-      stepLogs: [...base.stepLogs, validatedEntry],
-      updatedAtMs: Math.max(Date.now(), validatedEntry.recordedAtMs)
-    });
-  }
-
-  /**
-   * Purges ONLY the daily ephemeral raw log buffer, leaving proofSignedMap and
-   * completion receipts intact.
-   */
-  async purgeDailyEphemeralLogBuffer(): Promise<void> {
+  private async purgeDailyEphemeralLogBufferRaw(): Promise<void> {
     await this.adapter.removeEncryptedItem(
       ADAPTIVE_STORAGE_KEYS.DAILY_EPHEMERAL_LOG_BUFFER
     );
   }
 
-  /**
-   * Purges prior-day unsigned ephemeral buffers on local calendar rollover while
-   * retaining buffers whose dateKey matches todayDateKey.
-   */
-  async rolloverStaleDailyEphemeralLogBuffer(
-    todayDateKey: string = formatLocalCalendarDateKey()
-  ): Promise<EphemeralBufferRolloverResult> {
-    if (!LOCAL_CALENDAR_DATE_KEY_REGEX.test(todayDateKey)) {
-      throw new Error("todayDateKey must match YYYY-MM-DD");
-    }
-    const existing = await this.getDailyEphemeralLogBuffer();
-    if (existing && existing.dateKey !== todayDateKey) {
-      await this.purgeDailyEphemeralLogBuffer();
-      return { purged: true, activeBuffer: null };
-    }
-    return { purged: false, activeBuffer: existing };
-  }
-
-  private async persistEphemeralBuffer(
+  private async persistEphemeralBufferRaw(
     buffer: DailyEphemeralLogBuffer
   ): Promise<DailyEphemeralLogBuffer> {
     const validated = DailyEphemeralLogBufferSchema.parse(buffer);
@@ -658,12 +706,12 @@ export class AdaptiveStorage {
     return validated;
   }
 
-  private async readOrInitDailyBuffer(params: {
+  private async readOrInitDailyBufferRaw(params: {
     readonly dateKey: string;
     readonly cycleId: string;
     readonly dayNumber: number;
   }): Promise<DailyEphemeralLogBuffer> {
-    const existing = await this.getDailyEphemeralLogBuffer();
+    const existing = await this.readDailyEphemeralLogBufferRaw();
     if (existing && existing.dateKey === params.dateKey) {
       return existing;
     }
@@ -682,10 +730,12 @@ export class AdaptiveStorage {
    * Completely removes all adaptive storage keys, resetting local state.
    */
   async clearAllAdaptiveData(): Promise<void> {
-    const allKeys = Object.values(ADAPTIVE_STORAGE_KEYS);
-    for (const key of allKeys) {
-      await this.adapter.removeEncryptedItem(key);
-    }
+    await this.enqueueEphemeralBufferOp(async () => {
+      const allKeys = Object.values(ADAPTIVE_STORAGE_KEYS);
+      for (const key of allKeys) {
+        await this.adapter.removeEncryptedItem(key);
+      }
+    });
   }
 }
 
