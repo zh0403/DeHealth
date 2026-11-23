@@ -305,6 +305,19 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
 
   const effectiveUserAddress = (userAddress ??
     "0x0000000000000000000000000000000000000000") as Address;
+  const isExternalWallet =
+    authSession?.authMethod === "metamask" ||
+    authSession?.authMethod === "walletconnect";
+  const externalWalletProviderLabel =
+    authSession?.authMethod === "metamask" ? "MetaMask" : "WalletConnect";
+  const authMethodBadgeLabel =
+    authSession?.authMethod === "google"
+      ? "Google OAuth"
+      : authSession?.authMethod === "metamask"
+        ? "MetaMask"
+        : authSession?.authMethod === "walletconnect"
+          ? "WalletConnect"
+          : "Local Session";
 
   const handleSaveGovernanceParameters = async (
     nextConfig: GovernanceConfig
@@ -934,15 +947,21 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         )}
       </View>
 
-      {/* Embedded Testnet Wallet Card */}
+      {/* Wallet Card (External Connected or Embedded Testnet Wallet) */}
       <View style={styles.card}>
         <View style={styles.cardHeaderRow}>
-          <Text style={styles.label}>Embedded Testnet Wallet</Text>
+          <Text style={styles.label}>
+            {isExternalWallet
+              ? "Connected External Wallet"
+              : "Embedded Testnet Wallet"}
+          </Text>
           <Text style={styles.walletBadgeTag}>Arbitrum Sepolia</Text>
         </View>
 
         <Text style={styles.walletDescription}>
-          Non-custodial key persisted on-device in secure storage. Fund with Arbitrum Sepolia ETH to submit cryptographic claims on-chain.
+          {isExternalWallet
+            ? `Connected via ${externalWalletProviderLabel} on Arbitrum Sepolia. Signing stays inside your external wallet.`
+            : "Non-custodial key persisted on-device in secure storage. Fund with Arbitrum Sepolia ETH to submit cryptographic claims on-chain."}
         </Text>
 
         <View style={styles.walletAddressBox}>
@@ -974,30 +993,32 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
               <Text style={styles.walletActionBtnText}>📋 Copy Address</Text>
             </Pressable>
 
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Export Private Key"
-              style={({ pressed }) => [
-                styles.walletSecondaryBtn,
-                pressed ? styles.btnPressed : null
-              ]}
-              disabled={isExportingKey}
-              onPress={() => {
-                void handleToggleExportPrivateKey();
-              }}
-            >
-              <Text style={styles.walletSecondaryBtnText}>
-                {isExportingKey
-                  ? "Decrypting..."
-                  : isPrivateKeyRevealed
-                    ? "Hide Private Key"
-                    : "🔑 Export Private Key"}
-              </Text>
-            </Pressable>
+            {!isExternalWallet ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Export Private Key"
+                style={({ pressed }) => [
+                  styles.walletSecondaryBtn,
+                  pressed ? styles.btnPressed : null
+                ]}
+                disabled={isExportingKey}
+                onPress={() => {
+                  void handleToggleExportPrivateKey();
+                }}
+              >
+                <Text style={styles.walletSecondaryBtnText}>
+                  {isExportingKey
+                    ? "Decrypting..."
+                    : isPrivateKeyRevealed
+                      ? "Hide Private Key"
+                      : "🔑 Export Private Key"}
+                </Text>
+              </Pressable>
+            ) : null}
           </View>
         </View>
 
-        {isPrivateKeyRevealed && exportedPrivateKey ? (
+        {!isExternalWallet && isPrivateKeyRevealed && exportedPrivateKey ? (
           <View style={styles.privateKeyWarningBox}>
             <Text style={styles.warningTitle}>⚠️ SECURITY WARNING</Text>
             <Text style={styles.warningText}>
@@ -1081,18 +1102,14 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         <View style={styles.card}>
           <View style={styles.cardHeaderRow}>
             <Text style={styles.label}>Account Session</Text>
-            <Text style={styles.proofBadgeTag}>
-              {authSession?.authMethod === "google"
-                ? "Google OAuth"
-                : "Embedded Wallet"}
-            </Text>
+            <Text style={styles.proofBadgeTag}>{authMethodBadgeLabel}</Text>
           </View>
           <Text style={styles.walletDescription}>
             Signed in as{" "}
             {authSession?.displayLabel ??
               (userAddress
                 ? `${userAddress.slice(0, 6)}\u2026${userAddress.slice(-4)}`
-                : "Embedded Wallet")}
+                : "Local Session")}
             . Signing out returns to Login without deleting your encrypted
             biometric vault or embedded wallet.
           </Text>

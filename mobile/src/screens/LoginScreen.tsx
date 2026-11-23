@@ -1,38 +1,13 @@
 import { Address } from "@dehealth/shared";
 import React, { useRef, useState } from "react";
-import {
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  TextInput,
-  View
-} from "react-native";
-import { isValidPrivateKey } from "../storage/walletStorage";
+import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 
 const ZERO_ADDRESS_REGEX = /^0x0{40}$/i;
-const HEX_64_NO_PREFIX_REGEX = /^[0-9a-fA-F]{64}$/;
-const HEX_64_UPPER_PREFIX_REGEX = /^0X[0-9a-fA-F]{64}$/;
-
-/**
- * Trims a user-entered private key and ensures a canonical lowercase `0x`
- * prefix when 64 raw hex characters are supplied.
- */
-export function normalizeWalletPrivateKey(raw: string): string {
-  const trimmed = raw.trim();
-  if (HEX_64_NO_PREFIX_REGEX.test(trimmed)) {
-    return `0x${trimmed}`;
-  }
-  if (HEX_64_UPPER_PREFIX_REGEX.test(trimmed)) {
-    return `0x${trimmed.slice(2)}`;
-  }
-  return trimmed;
-}
 
 function formatShortAddress(address: string): string {
   const trimmed = address.trim();
   if (trimmed.length >= 10) {
-    return `${trimmed.slice(0, 6)}…${trimmed.slice(-4)}`;
+    return `${trimmed.slice(0, 6)}\u2026${trimmed.slice(-4)}`;
   }
   return trimmed;
 }
@@ -61,28 +36,28 @@ function toErrorMessage(error: unknown): string {
 
 export interface LoginScreenProps {
   readonly onSignInWithGoogle: () => Promise<void> | void;
-  readonly onContinueWithWallet: (privateKey?: string) => Promise<void> | void;
+  readonly onSignInWithMetaMask: () => Promise<void> | void;
+  readonly onSignInWithWalletConnect: () => Promise<void> | void;
   readonly isSupabaseConfigured?: boolean;
+  readonly isWalletConnectConfigured?: boolean;
   readonly existingWalletAddress?: Address | null;
   readonly onError?: (error: unknown) => void;
 }
 
-type PendingAuthMethod = "google" | "wallet" | null;
+type PendingAuthMethod = "google" | "metamask" | "walletconnect" | null;
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({
   onSignInWithGoogle,
-  onContinueWithWallet,
+  onSignInWithMetaMask,
+  onSignInWithWalletConnect,
   isSupabaseConfigured = false,
+  isWalletConnectConfigured = false,
   existingWalletAddress = null,
   onError
 }) => {
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [pendingMethod, setPendingMethod] = useState<PendingAuthMethod>(null);
-  const [isImportingWallet, setIsImportingWallet] = useState<boolean>(false);
   const isSubmittingRef = useRef<boolean>(false);
-
-  const [isImportExpanded, setIsImportExpanded] = useState<boolean>(false);
-  const [keyInput, setKeyInput] = useState<string>("");
   const [inlineError, setInlineError] = useState<string | null>(null);
 
   const hasExistingWallet =
@@ -92,8 +67,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
   const runAuthSubmission = async (
     method: Exclude<PendingAuthMethod, null>,
-    action: () => Promise<void> | void,
-    importingKey: boolean = false
+    action: () => Promise<void> | void
   ): Promise<void> => {
     if (isSubmittingRef.current || isSubmitting) {
       return;
@@ -101,7 +75,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     isSubmittingRef.current = true;
     setIsSubmitting(true);
     setPendingMethod(method);
-    setIsImportingWallet(importingKey);
     setInlineError(null);
 
     try {
@@ -113,7 +86,6 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       isSubmittingRef.current = false;
       setIsSubmitting(false);
       setPendingMethod(null);
-      setIsImportingWallet(false);
     }
   };
 
@@ -121,27 +93,20 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     void runAuthSubmission("google", onSignInWithGoogle);
   };
 
-  const handleContinueWallet = (): void => {
-    void runAuthSubmission("wallet", () => onContinueWithWallet());
+  const handleMetaMaskSignIn = (): void => {
+    void runAuthSubmission("metamask", onSignInWithMetaMask);
   };
 
-  const handleImportWallet = (): void => {
-    if (isSubmittingRef.current || isSubmitting) {
-      return;
-    }
-    const normalized = normalizeWalletPrivateKey(keyInput);
-    if (!isValidPrivateKey(normalized)) {
-      setInlineError(
-        "Invalid private key. Enter a 64-character hex key (with or without 0x prefix)."
-      );
-      return;
-    }
-    void runAuthSubmission(
-      "wallet",
-      () => onContinueWithWallet(normalized),
-      true
-    );
+  const handleWalletConnectSignIn = (): void => {
+    void runAuthSubmission("walletconnect", onSignInWithWalletConnect);
   };
+
+  const googleButtonLabel = isSupabaseConfigured
+    ? "Sign in with Google"
+    : "Start Local Session";
+  const googlePendingLabel = isSupabaseConfigured
+    ? "Signing in with Google..."
+    : "Starting Local Session...";
 
   return (
     <ScrollView
@@ -171,19 +136,30 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         </View>
       ) : null}
 
-      {/* Path 1: Google Sign-In */}
+      {/* Path 1: Google OAuth / Local Embedded Wallet */}
       <View style={styles.authCard}>
-        <Text style={styles.cardEyebrow}>PATH 1 • ACCOUNT SIGN-IN</Text>
-        <Text style={styles.cardTitle}>Sign in with Google</Text>
+        <Text style={styles.cardEyebrow}>PATH 1 • ACCOUNT OR LOCAL SESSION</Text>
+        <Text style={styles.cardTitle}>
+          {isSupabaseConfigured ? "Sign in with Google" : "Local Sovereign Session"}
+        </Text>
         <Text style={styles.cardDescription}>
           {isSupabaseConfigured
             ? "Authenticate via Google OAuth with automatic non-custodial L2 wallet provisioning on-device."
-            : "Automatic non-custodial L2 wallet provisioning with local offline session support while cloud auth is unconfigured."}
+            : "Supabase OAuth is unconfigured. Start an offline encrypted session backed by your on-device Arbitrum Sepolia wallet."}
         </Text>
+
+        {hasExistingWallet && existingWalletAddress ? (
+          <View testID="login-local-wallet-badge" style={styles.walletBadge}>
+            <Text style={styles.walletBadgeLabel}>Local Wallet:</Text>
+            <Text style={styles.walletBadgeValue}>
+              {formatShortAddress(existingWalletAddress)}
+            </Text>
+          </View>
+        ) : null}
 
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Sign in with Google"
+          accessibilityLabel={googleButtonLabel}
           accessibilityState={{ disabled: isSubmitting }}
           testID="login-google-button"
           disabled={isSubmitting}
@@ -195,125 +171,88 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           onPress={handleGoogleSignIn}
         >
           <Text style={styles.primaryButtonText}>
-            {pendingMethod === "google"
-              ? "Signing in with Google..."
-              : "Sign in with Google"}
+            {pendingMethod === "google" ? googlePendingLabel : googleButtonLabel}
           </Text>
         </Pressable>
       </View>
 
-      {/* Path 2: Non-Custodial Wallet */}
+      {/* Path 2: MetaMask */}
       <View style={styles.authCard}>
-        <Text style={styles.cardEyebrow}>PATH 2 • NON-CUSTODIAL L2 WALLET</Text>
-        <Text style={styles.cardTitle}>Arbitrum Sepolia Wallet</Text>
+        <Text style={styles.cardEyebrow}>PATH 2 • BROWSER / MOBILE WALLET</Text>
+        <Text style={styles.cardTitle}>MetaMask</Text>
         <Text style={styles.cardDescription}>
-          {hasExistingWallet && existingWalletAddress
-            ? `Detected local vault wallet ${formatShortAddress(existingWalletAddress)}. Continue directly without cloud sign-in.`
-            : "Create or unlock your local encrypted Arbitrum Sepolia signing wallet directly on-device."}
+          Connect directly with MetaMask (EIP-1193) to sign daily EIP-712
+          check-in proofs without generating an embedded key.
         </Text>
-
-        {hasExistingWallet && existingWalletAddress ? (
-          <View style={styles.walletBadge}>
-            <Text style={styles.walletBadgeLabel}>Local Wallet:</Text>
-            <Text style={styles.walletBadgeValue}>
-              {formatShortAddress(existingWalletAddress)}
-            </Text>
-          </View>
-        ) : null}
 
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Continue with Wallet"
+          accessibilityLabel="Sign in with MetaMask"
           accessibilityState={{ disabled: isSubmitting }}
-          testID="login-wallet-button"
+          testID="login-metamask-button"
           disabled={isSubmitting}
           style={({ pressed }) => [
-            styles.secondaryButton,
+            styles.metamaskButton,
             isSubmitting ? styles.buttonDisabled : null,
             pressed ? styles.buttonPressed : null
           ]}
-          onPress={handleContinueWallet}
+          onPress={handleMetaMaskSignIn}
         >
-          <Text style={styles.secondaryButtonText}>
-            {pendingMethod === "wallet" && !isImportingWallet
-              ? "Unlocking Wallet..."
-              : "Continue with Wallet"}
+          <Text style={styles.metamaskButtonText}>
+            {pendingMethod === "metamask"
+              ? "Connecting MetaMask..."
+              : "Sign in with MetaMask"}
           </Text>
         </Pressable>
+      </View>
 
-        {/* Collapsible Private Key Import */}
+      {/* Path 3: WalletConnect v2 */}
+      <View style={styles.authCard}>
+        <Text style={styles.cardEyebrow}>PATH 3 • WALLETCONNECT V2</Text>
+        <Text style={styles.cardTitle}>WalletConnect</Text>
+        <Text style={styles.cardDescription}>
+          Pair an external mobile or hardware wallet over WalletConnect v2 for
+          non-custodial Arbitrum Sepolia EIP-712 signing.
+        </Text>
+        <Text
+          testID="login-walletconnect-status"
+          style={[
+            styles.statusSubtitle,
+            isWalletConnectConfigured
+              ? styles.statusConfigured
+              : styles.statusUnconfigured
+          ]}
+        >
+          {isWalletConnectConfigured
+            ? "WalletConnect v2 Project ID configured and ready."
+            : "WalletConnect v2 Project ID not configured (set EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID)."}
+        </Text>
+
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel="Import Private Key"
-          accessibilityState={{
-            expanded: isImportExpanded,
-            disabled: isSubmitting
-          }}
-          testID="toggle-import-key-button"
+          accessibilityLabel="WalletConnect"
+          accessibilityState={{ disabled: isSubmitting }}
+          testID="login-walletconnect-button"
           disabled={isSubmitting}
           style={({ pressed }) => [
-            styles.toggleImportButton,
+            styles.walletConnectButton,
+            isSubmitting ? styles.buttonDisabled : null,
             pressed ? styles.buttonPressed : null
           ]}
-          onPress={() => {
-            setIsImportExpanded((prev) => !prev);
-            setInlineError(null);
-          }}
+          onPress={handleWalletConnectSignIn}
         >
-          <Text style={styles.toggleImportButtonText}>
-            {isImportExpanded ? "Hide Private Key Import" : "Import Private Key"}
+          <Text style={styles.walletConnectButtonText}>
+            {pendingMethod === "walletconnect"
+              ? "Connecting WalletConnect..."
+              : "WalletConnect"}
           </Text>
         </Pressable>
-
-        {isImportExpanded ? (
-          <View style={styles.importPanel}>
-            <Text style={styles.importLabel}>
-              Ethereum / Arbitrum Sepolia Private Key (32-byte hex)
-            </Text>
-            <TextInput
-              accessibilityLabel="Wallet Private Key Input"
-              testID="import-private-key-input"
-              value={keyInput}
-              onChangeText={(value) => {
-                setKeyInput(value);
-                if (inlineError) {
-                  setInlineError(null);
-                }
-              }}
-              placeholder="0x... or 64 hex characters"
-              placeholderTextColor="#64748B"
-              secureTextEntry
-              autoCapitalize="none"
-              autoCorrect={false}
-              editable={!isSubmitting}
-              style={styles.keyInput}
-            />
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Import & Continue"
-              accessibilityState={{ disabled: isSubmitting }}
-              testID="login-import-wallet-button"
-              disabled={isSubmitting}
-              style={({ pressed }) => [
-                styles.importSubmitButton,
-                isSubmitting ? styles.buttonDisabled : null,
-                pressed ? styles.buttonPressed : null
-              ]}
-              onPress={handleImportWallet}
-            >
-              <Text style={styles.importSubmitButtonText}>
-                {pendingMethod === "wallet" && isImportingWallet
-                  ? "Importing Wallet..."
-                  : "Import & Continue"}
-              </Text>
-            </Pressable>
-          </View>
-        ) : null}
       </View>
 
       <Text style={styles.footerNote}>
-        Private keys never leave encrypted hardware/OS storage. Zero raw
-        biometrics, meals, weights, or step counts are ever uploaded.
+        Private keys never leave encrypted hardware/OS storage or your external
+        wallet. Zero raw biometrics, meals, weights, or step counts are ever
+        uploaded.
       </Text>
     </ScrollView>
   );
@@ -397,6 +336,18 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     marginBottom: 14
   },
+  statusSubtitle: {
+    fontSize: 11,
+    fontWeight: "600",
+    lineHeight: 16,
+    marginBottom: 12
+  },
+  statusConfigured: {
+    color: "#10B981"
+  },
+  statusUnconfigured: {
+    color: "#FBBF24"
+  },
   walletBadge: {
     flexDirection: "row",
     alignItems: "center",
@@ -432,62 +383,27 @@ const styles = StyleSheet.create({
     fontWeight: "800",
     color: "#082F49"
   },
-  secondaryButton: {
+  metamaskButton: {
+    backgroundColor: "#F59E0B",
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: "center"
+  },
+  metamaskButtonText: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#451A03"
+  },
+  walletConnectButton: {
     backgroundColor: "#10B981",
     paddingVertical: 14,
     borderRadius: 12,
-    alignItems: "center",
-    marginBottom: 10
+    alignItems: "center"
   },
-  secondaryButtonText: {
+  walletConnectButtonText: {
     fontSize: 14,
     fontWeight: "800",
     color: "#052E16"
-  },
-  toggleImportButton: {
-    paddingVertical: 8,
-    alignItems: "center"
-  },
-  toggleImportButtonText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#38BDF8"
-  },
-  importPanel: {
-    marginTop: 10,
-    paddingTop: 12,
-    borderTopWidth: 1,
-    borderTopColor: "#1E293B"
-  },
-  importLabel: {
-    fontSize: 12,
-    fontWeight: "600",
-    color: "#CBD5E1",
-    marginBottom: 8
-  },
-  keyInput: {
-    backgroundColor: "#161F30",
-    borderColor: "#334155",
-    borderWidth: 1,
-    borderRadius: 10,
-    padding: 12,
-    color: "#F8FAFC",
-    fontSize: 13,
-    fontFamily: "monospace",
-    marginBottom: 10
-  },
-  importSubmitButton: {
-    backgroundColor: "#1E293B",
-    borderWidth: 1,
-    borderColor: "#38BDF8",
-    paddingVertical: 12,
-    borderRadius: 10,
-    alignItems: "center"
-  },
-  importSubmitButtonText: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#38BDF8"
   },
   footerNote: {
     fontSize: 11,

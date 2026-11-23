@@ -11,7 +11,7 @@ import {
   UserProfile,
   WeightLogEntry
 } from "@dehealth/shared";
-import { Wallet } from "ethers";
+import { Signer, Wallet } from "ethers";
 import React, { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
@@ -43,11 +43,14 @@ import {
 } from "./src/services/adaptivePlanEngine";
 import {
   AuthSignInResult,
-  continueWithWallet,
   getPersistedAuthSession,
+  getWalletConnectProjectId,
   purgeAuthSessionStorageKey,
   signInWithGoogle,
-  signOutSession
+  signInWithMetaMask,
+  signInWithWalletConnect,
+  signOutSession,
+  startLocalSession
 } from "./src/services/authService";
 import {
   claimStreakReward,
@@ -67,6 +70,9 @@ import {
 } from "./src/services/supabaseService";
 import { evaluateDailyTarget } from "./src/services/profileEngine";
 import {
+  DailyEphemeralLogBuffer,
+  EphemeralBufferRolloverResult,
+  formatLocalCalendarDateKey,
   getActivePlanCycle,
   getDailyProofSignedMap,
   getPlanHistory,
@@ -74,6 +80,8 @@ import {
   getWeightLogs,
   makeDailyProofSignedKey,
   purgeAdaptiveStorageKeys,
+  purgeDailyEphemeralLogBuffer,
+  rolloverStaleDailyEphemeralLogBuffer,
   saveActivePlanCycle,
   saveDailyProofSigned,
   savePlanHistory,
@@ -201,6 +209,7 @@ export interface HydratedVaultState {
   readonly proofSignedMap: Readonly<Record<string, boolean>>;
   readonly governanceConfig: GovernanceConfig;
   readonly storedAuthSession: AuthSessionMetadata | null;
+  readonly activeEphemeralBuffer?: DailyEphemeralLogBuffer | null;
 }
 
 export interface VaultHydrationDeps {
@@ -211,6 +220,9 @@ export interface VaultHydrationDeps {
   readonly getDailyProofSignedMap: () => Promise<Record<string, boolean>>;
   readonly getGovernanceConfig?: () => Promise<GovernanceConfig>;
   readonly getPersistedAuthSession?: () => Promise<AuthSessionMetadata | null>;
+  readonly rolloverStaleDailyEphemeralLogBuffer?: (
+    todayDateKey?: string
+  ) => Promise<EphemeralBufferRolloverResult>;
   readonly clearStoredWallet: () => Promise<void>;
   readonly clearVaultSecret: () => Promise<void>;
   readonly purgeAdaptiveStorageKeys: () => Promise<void>;
@@ -226,6 +238,7 @@ const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
   getDailyProofSignedMap,
   getGovernanceConfig,
   getPersistedAuthSession,
+  rolloverStaleDailyEphemeralLogBuffer,
   clearStoredWallet,
   clearVaultSecret,
   purgeAdaptiveStorageKeys,
@@ -238,6 +251,9 @@ export async function hydrateVaultData(
 ): Promise<HydratedVaultState> {
   const resolveGov = deps.getGovernanceConfig ?? getGovernanceConfig;
   const resolveAuth = deps.getPersistedAuthSession ?? getPersistedAuthSession;
+  const resolveRollover =
+    deps.rolloverStaleDailyEphemeralLogBuffer ??
+    rolloverStaleDailyEphemeralLogBuffer;
   const [
     storedBio,
     storedCycle,
@@ -252,10 +268,11 @@ export async function hydrateVaultData(
     deps.getDailyProofSignedMap()
   ]);
 
-  // Hydrate governance and auth session after primary vault secret provisioning
-  // completes so independent platform keystore handles never race on first boot.
+  // Hydrate governance, auth session, and daily rollover after primary vault
+  // provisioning completes so independent keystore handles never race on boot.
   const governanceConfig = await resolveGov();
   const storedAuthSession = await resolveAuth();
+  const rolloverResult = await resolveRollover(formatLocalCalendarDateKey());
 
   return {
     storedBio,
@@ -264,7 +281,8 @@ export async function hydrateVaultData(
     persistentWallet,
     proofSignedMap,
     governanceConfig,
-    storedAuthSession
+    storedAuthSession,
+    activeEphemeralBuffer: rolloverResult.activeBuffer
   };
 }
 
@@ -481,6 +499,7 @@ export default function App(): React.ReactElement {
   }, []);
 
   const [wallet, setWallet] = useState<Wallet | null>(null);
+  const [externalSigner, setExternalSigner] = useState<Signer | null>(null);
   const [authSession, setAuthSession] = useState<AuthSessionMetadata | null>(
     null
   );
@@ -494,12 +513,22 @@ export default function App(): React.ReactElement {
     DEFAULT_GOVERNANCE_CONFIG
   );
 
+  const activeDateKey = useMemo<string>(
+    () => formatLocalCalendarDateKey(nowMs),
+    [nowMs]
+  );
+
+  const activeWalletAddress = (
+    authSession?.walletAddress ??
+    (wallet ? wallet.address : "0x0000000000000000000000000000000000000000")
+  ) as Address;
+
   useEffect(() => {
     if (!wallet) {
       return;
     }
     let mounted = true;
-    const senderPseudonym = `athlete_${wallet.address.slice(2, 8).toLowerCase()}`;
+    const senderPseudonym = `athlete_${activeWalletAddress.slice(2, 8).toLowerCase()}`;
     void fetchCheeredFeedIdsForUser(senderPseudonym)
       .then((cheeredMap) => {
         if (mounted) {
@@ -510,7 +539,16 @@ export default function App(): React.ReactElement {
     return () => {
       mounted = false;
     };
-  }, [wallet, authSession]);
+  }, [wallet, authSession, activeWalletAddress]);
+
+  useEffect(() => {
+    if (!wallet) {
+      return;
+    }
+    void rolloverStaleDailyEphemeralLogBuffer(activeDateKey).catch(
+      () => undefined
+    );
+  }, [wallet, activeDateKey]);
 
   const applyHydratedState = (
     hydrated: HydratedVaultState,
@@ -541,6 +579,7 @@ export default function App(): React.ReactElement {
 
     setInitError(null);
     setWallet(persistentWallet);
+    setExternalSigner(null);
     setAuthSession(storedAuthSession);
     setProofSignedMap(hydratedProofMap);
     setGovernanceConfig(hydratedGovernance);
@@ -550,7 +589,8 @@ export default function App(): React.ReactElement {
     setTokenBalanceDht(derived.fallbackBalanceDht);
     setLastLogTimestampMs(derived.lastLogTimestampMs);
 
-    const addr = persistentWallet.address as Address;
+    const addr = (storedAuthSession?.walletAddress ??
+      persistentWallet.address) as Address;
     void fetchOnChainNonce(addr, 0n)
       .then((nonce) => {
         if (isMounted()) setCurrentNonce(nonce);
@@ -615,6 +655,7 @@ export default function App(): React.ReactElement {
     try {
       const recovered = await resetVaultAndRecover();
       setAuthSession(null);
+      setExternalSigner(null);
       setCheeredFeedIds({});
       setLastProofHash(null);
       setLastTxHash(null);
@@ -634,10 +675,14 @@ export default function App(): React.ReactElement {
     }
   };
 
-  const userAddress = (wallet ? wallet.address : "0x0000000000000000000000000000000000000000") as Address;
+  const embeddedWalletAddress = (
+    wallet
+      ? wallet.address
+      : "0x0000000000000000000000000000000000000000"
+  ) as Address;
 
   const showErrorNotice = (err: unknown, fallbackTitle: string): void => {
-    setErrorNotice(toErrorNoticePayload(err, fallbackTitle, userAddress));
+    setErrorNotice(toErrorNoticePayload(err, fallbackTitle, activeWalletAddress));
   };
 
   const clearErrorNotice = (): void => {
@@ -702,13 +747,21 @@ export default function App(): React.ReactElement {
   };
 
   const applyAuthenticatedResult = (authResult: AuthSignInResult): void => {
-    const previousAddress = wallet?.address.toLowerCase() ?? null;
-    const nextAddress = authResult.wallet.address.toLowerCase();
-    setWallet(authResult.wallet);
+    const previousAddress = activeWalletAddress.toLowerCase();
+    const nextAddress = authResult.walletAddress.toLowerCase();
+    if (authResult.wallet) {
+      setWallet(authResult.wallet);
+    }
+    setExternalSigner(
+      authResult.session.authMethod === "metamask" ||
+        authResult.session.authMethod === "walletconnect"
+        ? authResult.signer
+        : null
+    );
     setAuthSession(authResult.session);
 
     if (previousAddress !== nextAddress) {
-      const nextAddr = authResult.wallet.address as Address;
+      const nextAddr = authResult.walletAddress;
       const derived = deriveLiveMetricsFromVault(
         activeCycle,
         proofSignedMap,
@@ -727,22 +780,26 @@ export default function App(): React.ReactElement {
   };
 
   const handleSignInWithGoogle = async (): Promise<void> => {
-    const authResult = await signInWithGoogle();
+    const authResult = isSupabaseConfigured()
+      ? await signInWithGoogle()
+      : await startLocalSession();
     applyAuthenticatedResult(authResult);
   };
 
-  const handleContinueWithWallet = async (
-    privateKey?: string
-  ): Promise<void> => {
-    const authResult = await continueWithWallet(
-      privateKey ? { privateKey } : undefined
-    );
+  const handleSignInWithMetaMask = async (): Promise<void> => {
+    const authResult = await signInWithMetaMask();
+    applyAuthenticatedResult(authResult);
+  };
+
+  const handleSignInWithWalletConnect = async (): Promise<void> => {
+    const authResult = await signInWithWalletConnect();
     applyAuthenticatedResult(authResult);
   };
 
   const handleSignOut = async (): Promise<void> => {
     await signOutSession();
     setAuthSession(null);
+    setExternalSigner(null);
   };
 
   const handleLogWeightEntry = (entry: WeightLogEntry): void => {
@@ -791,7 +848,9 @@ export default function App(): React.ReactElement {
   ): Promise<void> => {
     try {
       // 1. Submit on-chain claim or fallback receipt (runs L2 gas pre-check first)
-      const claimResult = await claimStreakReward(payload, wallet ?? undefined);
+      const signingWallet: Signer | undefined =
+        externalSigner ?? wallet ?? undefined;
+      const claimResult = await claimStreakReward(payload, signingWallet);
       setLastTxHash(claimResult.txHash);
       setLastExplorerUrl(
         claimResult.mode === "live" ? claimResult.explorerUrl : null
@@ -809,6 +868,7 @@ export default function App(): React.ReactElement {
       void saveDailyProofSigned(activeCycle.id, activeDayIndex, true).catch(
         () => undefined
       );
+      await purgeDailyEphemeralLogBuffer().catch(() => undefined);
 
       const nextStreak = Number(payload.proof.streakCount);
       const expectedBalance = (Number.parseFloat(tokenBalanceDht) + 10).toFixed(
@@ -816,7 +876,7 @@ export default function App(): React.ReactElement {
       );
 
       // 2. Publish milestone to Supabase (strict data sovereignty + EIP-712 proof gate)
-      const userPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
+      const userPseudonym = `athlete_${activeWalletAddress.slice(2, 8).toLowerCase()}`;
       const verifyingContract = getRewardGateAddress() || DEMO_VERIFYING_CONTRACT;
       const milestoneResult = await publishProofMilestone(
         {
@@ -844,13 +904,13 @@ export default function App(): React.ReactElement {
 
       // 3. Update nonce and DHT token balance from L2 service
       const updatedNonce = await fetchOnChainNonce(
-        userAddress,
+        activeWalletAddress,
         currentNonce + 1n
       );
       setCurrentNonce(updatedNonce);
 
       const updatedBalance = await fetchTokenBalance(
-        userAddress,
+        activeWalletAddress,
         expectedBalance
       );
       setTokenBalanceDht(updatedBalance);
@@ -868,7 +928,7 @@ export default function App(): React.ReactElement {
       ...prev,
       [feedId]: (prev[feedId] ?? 0) + 1
     }));
-    const senderPseudonym = `athlete_${userAddress.slice(2, 8).toLowerCase()}`;
+    const senderPseudonym = `athlete_${activeWalletAddress.slice(2, 8).toLowerCase()}`;
     try {
       await sendPeerCheer(feedId, senderPseudonym);
       setCheeredFeedIds((prev) => ({
@@ -921,15 +981,19 @@ export default function App(): React.ReactElement {
     );
   }
 
+  const activeSigner: Signer = externalSigner ?? wallet;
+
   return (
     <SafeAreaView style={styles.viewport}>
       <View style={styles.phoneFrame}>
         {!authSession ? (
           <LoginScreen
             onSignInWithGoogle={handleSignInWithGoogle}
-            onContinueWithWallet={handleContinueWithWallet}
+            onSignInWithMetaMask={handleSignInWithMetaMask}
+            onSignInWithWalletConnect={handleSignInWithWalletConnect}
             isSupabaseConfigured={isSupabaseConfigured()}
-            existingWalletAddress={userAddress}
+            isWalletConnectConfigured={getWalletConnectProjectId() !== null}
+            existingWalletAddress={embeddedWalletAddress}
             onError={(err) => {
               showErrorNotice(err, "Authentication Failed");
             }}
@@ -946,7 +1010,7 @@ export default function App(): React.ReactElement {
           <>
             {/* Persistent Gamification Top Header */}
             <StreakFlameHeader
-              userAddress={userAddress}
+              userAddress={activeWalletAddress}
               streakCount={streakCount}
               tokenBalanceDht={tokenBalanceDht}
               isFatigueScaled={targetAssessment.isFatigueScaled}
@@ -958,11 +1022,11 @@ export default function App(): React.ReactElement {
             <View style={styles.screenArea}>
               {activeTab === "checkin" ? (
                 <MicroCheckInScreen
-                  userAddress={userAddress}
+                  userAddress={activeWalletAddress}
                   verifyingContract={getRewardGateAddress() || DEMO_VERIFYING_CONTRACT}
                   currentStreak={streakCount}
                   currentNonce={currentNonce}
-                  signer={wallet}
+                  signer={activeSigner}
                   userProfile={userProfile}
                   dailyPlan={todayPlan}
                   cycleId={activeCycle.id}
@@ -971,6 +1035,7 @@ export default function App(): React.ReactElement {
                   dailyStepGoal={governanceConfig.dailyStepGoal}
                   inactivityThresholdHours={governanceConfig.inactivityThresholdHours}
                   fatigueScalingMultiplier={governanceConfig.fatigueScalingMultiplier}
+                  currentDateKey={activeDateKey}
                   onUpdateDailyPlan={handleUpdateDailyPlan}
                   onDispatchSignedClaim={handleDispatchSignedClaim}
                   onError={(err) => {
@@ -984,7 +1049,7 @@ export default function App(): React.ReactElement {
 
               {activeTab === "dashboard" ? (
                 <DashboardScreen
-                  userAddress={userAddress}
+                  userAddress={activeWalletAddress}
                   onExportPrivateKey={exportWalletPrivateKey}
                   streakCount={streakCount}
                   tokenBalanceDht={tokenBalanceDht}
