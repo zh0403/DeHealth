@@ -5,3 +5,7 @@
 import { installCryptoShim } from "./src/runtime/cryptoShim";
 
 installCryptoShim();
+
+if (typeof navigator !== "undefined" && navigator.product === "ReactNative") {
+  void import("@walletconnect/react-native-compat").catch(() => undefined);
+}
