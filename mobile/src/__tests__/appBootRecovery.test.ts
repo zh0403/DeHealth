@@ -96,17 +96,23 @@ import {
 import {
   AUTH_SESSION_STORAGE_KEY,
   AuthSessionStorage,
-  continueWithWallet,
   copyTextToClipboard,
   DuplicateCheerError,
   ErrorNoticeModal,
+  formatLocalCalendarDateKey,
   initializeAuthSessionStorage,
   InsufficientGasError,
   LoginScreen,
+  normalizeSenderPseudonym,
   PlanPreviewModal,
+  purgeDailyEphemeralLogBuffer,
   resetAuthSessionStorage,
+  rolloverStaleDailyEphemeralLogBuffer,
   signInWithGoogle,
+  signInWithMetaMask,
+  signInWithWalletConnect,
   signOutSession,
+  startLocalSession,
   toErrorNoticePayload
 } from "../index";
 import { generate14DayPlan } from "../services/adaptivePlanEngine";
@@ -174,6 +180,8 @@ function makeDeps(
       (await ensureGovStorage()).getGovernanceConfig(),
     getPersistedAuthSession: async () =>
       (await ensureAuthStorage()).getPersistedAuthSession(),
+    rolloverStaleDailyEphemeralLogBuffer: async (todayDateKey?: string) =>
+      (await ensureStorage()).rolloverStaleDailyEphemeralLogBuffer(todayDateKey),
     clearStoredWallet: async () => clearStoredWallet(keyStore),
     clearVaultSecret: async () => clearVaultSecret(keyStore),
     purgeAdaptiveStorageKeys: async () => {
@@ -414,14 +422,19 @@ describe("App boot hydration error surface and vault reset recovery", () => {
       expect(typeof InsufficientGasError).toBe("function");
     });
 
-    it("exports the new modules from mobile/src/index.ts without collisions", () => {
+    it("exports the auth, clipboard and buffer modules from mobile/src/index.ts without collisions", () => {
       expect(typeof copyTextToClipboard).toBe("function");
       expect(typeof signInWithGoogle).toBe("function");
-      expect(typeof continueWithWallet).toBe("function");
+      expect(typeof startLocalSession).toBe("function");
+      expect(typeof signInWithMetaMask).toBe("function");
+      expect(typeof signInWithWalletConnect).toBe("function");
       expect(typeof signOutSession).toBe("function");
       expect(typeof LoginScreen).toBe("function");
       expect(typeof PlanPreviewModal).toBe("function");
       expect(typeof DuplicateCheerError).toBe("function");
+      expect(typeof normalizeSenderPseudonym).toBe("function");
+      expect(typeof rolloverStaleDailyEphemeralLogBuffer).toBe("function");
+      expect(typeof purgeDailyEphemeralLogBuffer).toBe("function");
     });
   });
 
@@ -436,9 +449,9 @@ describe("App boot hydration error surface and vault reset recovery", () => {
       await adaptiveStorage.saveUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
 
       const session: AuthSessionMetadata = {
-        authMethod: "wallet",
-        accountId: `wallet:${wallet.address.toLowerCase()}`,
-        displayLabel: `${wallet.address.slice(0, 6)}\u2026${wallet.address.slice(-4)}`,
+        authMethod: "local",
+        accountId: `local:${wallet.address.toLowerCase()}`,
+        displayLabel: `Local Session (${wallet.address.slice(0, 6)}\u2026${wallet.address.slice(-4)})`,
         walletAddress: wallet.address as Address,
         signedInAtMs: 1_700_000_000_000
       };
@@ -457,6 +470,29 @@ describe("App boot hydration error surface and vault reset recovery", () => {
       expect(afterSignOut.storedAuthSession).toBeNull();
       expect(afterSignOut.storedBio).toEqual(DEFAULT_BASELINE_BIOMETRICS);
       expect(afterSignOut.persistentWallet.address).toBe(wallet.address);
+
+      // Stale prior-day ephemeral buffer auto-purges on hydrateVaultData rollover
+      const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now());
+      await adaptiveStorage.appendEphemeralFoodLog({
+        dateKey: "2020-01-01",
+        cycleId: cycle.id,
+        dayNumber: 1,
+        entry: {
+          id: "stale_meal_1",
+          presetId: "preset_chicken_breast",
+          name: "Chicken Breast",
+          grams: 100,
+          caloriesKcal: 165,
+          proteinGrams: 31,
+          carbsGrams: 0,
+          fatGrams: 3.6,
+          loggedAtMs: 1_577_836_800_000
+        }
+      });
+      const afterRollover = await hydrateVaultData(deps);
+      expect(afterRollover.activeEphemeralBuffer).toBeNull();
+      expect(await adaptiveStorage.getDailyEphemeralLogBuffer()).toBeNull();
+      expect(typeof formatLocalCalendarDateKey()).toBe("string");
 
       // Full resetVaultAndRecover wipes everything including auth session
       await authStorage.savePersistedAuthSession(session);

@@ -242,10 +242,7 @@ import {
   PlanPreviewModal
 } from "../components/PlanPreviewModal";
 import { AnonymizedFeedScreen } from "../screens/AnonymizedFeedScreen";
-import {
-  LoginScreen,
-  normalizeWalletPrivateKey
-} from "../screens/LoginScreen";
+import { LoginScreen } from "../screens/LoginScreen";
 import {
   formatShortWalletAddress,
   MicroCheckInScreen
@@ -520,65 +517,74 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
   });
 
   // ==========================================================================
-  // 2. LoginScreen & normalizeWalletPrivateKey
+  // 2. LoginScreen (3-Way Auth: Google/Local, MetaMask, WalletConnect; Zero PK Import)
   // ==========================================================================
   describe("LoginScreen", () => {
-    it("normalizeWalletPrivateKey trims and prepends 0x to raw 64-char hex keys", () => {
-      const raw64 = "ab".repeat(32);
-      expect(normalizeWalletPrivateKey(`  ${raw64}  `)).toBe(`0x${raw64}`);
-      expect(normalizeWalletPrivateKey(`0x${raw64}`)).toBe(`0x${raw64}`);
-      expect(normalizeWalletPrivateKey(`0X${raw64}`)).toBe(`0x${raw64}`);
-      expect(normalizeWalletPrivateKey("  invalid-key  ")).toBe("invalid-key");
-    });
-
-    it("renders Google + Wallet auth options, sovereignty pill, and optional existing wallet badge", () => {
+    it("renders Google/Local, MetaMask, WalletConnect options without manual private key import UI", () => {
       const existingAddr = "0x1234567890abcdef1234567890abcdef1234abcd" as Address;
-      const markup = renderToStaticMarkup(
+      const fallbackMarkup = renderToStaticMarkup(
         React.createElement(LoginScreen, {
           onSignInWithGoogle: vi.fn(),
-          onContinueWithWallet: vi.fn(),
+          onSignInWithMetaMask: vi.fn(),
+          onSignInWithWalletConnect: vi.fn(),
           isSupabaseConfigured: false,
+          isWalletConnectConfigured: false,
           existingWalletAddress: existingAddr
         })
       );
 
-      expect(markup).toContain("DeHealth Protocol");
-      expect(markup).toContain("100% On-Device Biometric Vault");
-      expect(markup).toContain("Sign in with Google");
-      expect(markup).toContain("Continue with Wallet");
-      expect(markup).toContain("Import Private Key");
-      expect(markup).toContain("0x1234…abcd");
-      expect(markup).toContain("local offline session support");
+      expect(fallbackMarkup).toContain("DeHealth Protocol");
+      expect(fallbackMarkup).toContain("100% On-Device Biometric Vault");
+      expect(fallbackMarkup).toContain("Start Local Session");
+      expect(fallbackMarkup).toContain("Sign in with MetaMask");
+      expect(fallbackMarkup).toContain("WalletConnect");
+      expect(fallbackMarkup).toContain("0x1234…abcd");
+      expect(fallbackMarkup).not.toContain("Import Private Key");
+      expect(fallbackMarkup).not.toContain("Import &amp; Continue");
 
-      // Zero address is hidden
-      const zeroMarkup = renderToStaticMarkup(
+      // Live Supabase + WalletConnect configured labels & zero address hidden
+      const liveMarkup = renderToStaticMarkup(
         React.createElement(LoginScreen, {
           onSignInWithGoogle: vi.fn(),
-          onContinueWithWallet: vi.fn(),
+          onSignInWithMetaMask: vi.fn(),
+          onSignInWithWalletConnect: vi.fn(),
           isSupabaseConfigured: true,
+          isWalletConnectConfigured: true,
           existingWalletAddress:
             "0x0000000000000000000000000000000000000000" as Address
         })
       );
-      expect(zeroMarkup).not.toContain("Local Wallet:");
-      expect(zeroMarkup).toContain("Google OAuth");
+      expect(liveMarkup).not.toContain("Local Wallet:");
+      expect(liveMarkup).toContain("Sign in with Google");
+      expect(liveMarkup).toContain("Sign in with MetaMask");
+      expect(liveMarkup).toContain("WalletConnect");
+      expect(liveMarkup).toContain(
+        "WalletConnect v2 Project ID configured and ready."
+      );
     });
 
-    it("blocks double-taps, resets loading state in finally on error, and surfaces inline error + onError", async () => {
+    it("blocks double-taps, resets loading state in finally on error, and surfaces inline error + onError across Google/Local", async () => {
       const googleDeferred = createDeferred<void>();
       const onSignInWithGoogle = vi
         .fn()
         .mockImplementation(() => googleDeferred.promise);
-      const onContinueWithWallet = vi.fn().mockResolvedValue(undefined);
+      const onSignInWithMetaMask = vi.fn().mockResolvedValue(undefined);
+      const onSignInWithWalletConnect = vi.fn().mockResolvedValue(undefined);
       const onError = vi.fn();
 
       const props = {
         onSignInWithGoogle,
-        onContinueWithWallet,
+        onSignInWithMetaMask,
+        onSignInWithWalletConnect,
+        isSupabaseConfigured: true,
+        isWalletConnectConfigured: true,
         onError
       };
 
       let tree = renderWithHarness(LoginScreen, props);
+      expect(findByTestId(tree, "toggle-import-key-button")).toBeNull();
+      expect(findByTestId(tree, "import-private-key-input")).toBeNull();
+
       const googleBtn = findByTestId(tree, "login-google-button");
       expect(googleBtn).not.toBeNull();
       expect(googleBtn!.disabled).toBe(false);
@@ -590,7 +596,8 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
 
       tree = renderWithHarness(LoginScreen, props);
       expect(findByTestId(tree, "login-google-button")!.disabled).toBe(true);
-      expect(findByTestId(tree, "login-wallet-button")!.disabled).toBe(true);
+      expect(findByTestId(tree, "login-metamask-button")!.disabled).toBe(true);
+      expect(findByTestId(tree, "login-walletconnect-button")!.disabled).toBe(true);
       expect(hasText(tree, "Signing in with Google...")).toBe(true);
 
       const authErr = new Error("OAuth popup cancelled");
@@ -600,63 +607,46 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
       tree = renderWithHarness(LoginScreen, props);
       expect(onError).toHaveBeenCalledWith(authErr);
       expect(findByTestId(tree, "login-google-button")!.disabled).toBe(false);
-      expect(findByTestId(tree, "login-wallet-button")!.disabled).toBe(false);
+      expect(findByTestId(tree, "login-metamask-button")!.disabled).toBe(false);
+      expect(findByTestId(tree, "login-walletconnect-button")!.disabled).toBe(false);
       expect(hasText(tree, "OAuth popup cancelled")).toBe(true);
     });
 
-    it("supports collapsible private key import with validation, 64-hex normalization, and wallet submission", async () => {
-      const onSignInWithGoogle = vi.fn();
-      const onContinueWithWallet = vi.fn().mockResolvedValue(undefined);
+    it("connects via MetaMask and WalletConnect buttons and resets spinners on failure", async () => {
+      const mmDeferred = createDeferred<void>();
+      const wcErr = new Error("WalletConnect Project ID missing");
+      const onSignInWithGoogle = vi.fn().mockResolvedValue(undefined);
+      const onSignInWithMetaMask = vi.fn().mockImplementation(() => mmDeferred.promise);
+      const onSignInWithWalletConnect = vi.fn().mockRejectedValue(wcErr);
       const onError = vi.fn();
 
       const props = {
         onSignInWithGoogle,
-        onContinueWithWallet,
+        onSignInWithMetaMask,
+        onSignInWithWalletConnect,
         onError
       };
 
       let tree = renderWithHarness(LoginScreen, props);
-      expect(findByTestId(tree, "import-private-key-input")).toBeNull();
-
-      // Expand import panel
-      const toggleBtn = findByTestId(tree, "toggle-import-key-button");
-      (toggleBtn!.onPress as () => void)();
+      (findByTestId(tree, "login-metamask-button")!.onPress as () => void)();
       tree = renderWithHarness(LoginScreen, props);
-      expect(findByTestId(tree, "import-private-key-input")).not.toBeNull();
+      expect(hasText(tree, "Connecting MetaMask...")).toBe(true);
+      expect(findByTestId(tree, "login-walletconnect-button")!.disabled).toBe(true);
 
-      // Invalid private key triggers inline error without invoking onContinueWithWallet
-      const input = findByTestId(tree, "import-private-key-input");
-      (input!.onChangeText as (v: string) => void)("not-a-valid-hex-key");
-      tree = renderWithHarness(LoginScreen, props);
-      (findByTestId(tree, "login-import-wallet-button")!.onPress as () => void)();
-      tree = renderWithHarness(LoginScreen, props);
-
-      expect(onContinueWithWallet).not.toHaveBeenCalled();
-      expect(hasText(tree, "Invalid private key")).toBe(true);
-      expect(findByTestId(tree, "login-import-wallet-button")!.disabled).toBe(
-        false
-      );
-
-      // Valid 64-hex key without 0x prefix gets normalized and forwarded
-      const raw64 = "11".repeat(32);
-      (
-        findByTestId(tree, "import-private-key-input")!.onChangeText as (
-          v: string
-        ) => void
-      )(raw64);
-      tree = renderWithHarness(LoginScreen, props);
-      (findByTestId(tree, "login-import-wallet-button")!.onPress as () => void)();
+      mmDeferred.resolve(undefined);
       await flushMicrotasks();
+      expect(onSignInWithMetaMask).toHaveBeenCalledTimes(1);
 
-      expect(onContinueWithWallet).toHaveBeenCalledTimes(1);
-      expect(onContinueWithWallet).toHaveBeenCalledWith(`0x${raw64}`);
-
-      // Continue with existing/new wallet button works without privateKey arg
       tree = renderWithHarness(LoginScreen, props);
-      (findByTestId(tree, "login-wallet-button")!.onPress as () => void)();
+      expect(findByTestId(tree, "login-walletconnect-button")!.disabled).toBe(false);
+
+      (findByTestId(tree, "login-walletconnect-button")!.onPress as () => void)();
       await flushMicrotasks();
-      expect(onContinueWithWallet).toHaveBeenCalledTimes(2);
-      expect(onContinueWithWallet).toHaveBeenLastCalledWith();
+      tree = renderWithHarness(LoginScreen, props);
+      expect(onSignInWithWalletConnect).toHaveBeenCalledTimes(1);
+      expect(onError).toHaveBeenCalledWith(wcErr);
+      expect(hasText(tree, "WalletConnect Project ID missing")).toBe(true);
+      expect(findByTestId(tree, "login-walletconnect-button")!.disabled).toBe(false);
     });
   });
 

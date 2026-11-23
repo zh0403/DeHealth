@@ -427,8 +427,8 @@ describe("Phase 2.0 E2E Tier 3 & Tier 4 Test Suite", () => {
       expect(history![0]!.status).toBe("reviewed");
     });
 
-    it("T3-7: 'Skip for Now' Onboarding Fallback (F8) -> Default Baseline Biometrics -> Anytime Weigh-In (F12) -> Custom Plan Regeneration (F2)", async () => {
-      // Step 1: User skips onboarding -> DEFAULT_BASELINE_BIOMETRICS committed
+    it("T3-7: Mandatory Onboarding Completion (F8) -> Baseline Plan -> Anytime Weigh-In (F12) -> Custom Plan Regeneration (F2)", async () => {
+      // Step 1: User completes mandatory onboarding -> baseline biometrics committed
       await adapter.setEncryptedItem(
         STORAGE_KEYS.USER_BIOMETRICS,
         DEFAULT_BASELINE_BIOMETRICS
@@ -815,8 +815,8 @@ describe("Phase 2.0 E2E Tier 3 & Tier 4 Test Suite", () => {
       expect(day1.completed).toBe(false);
     });
 
-    it("Scenario T4-2: 'Skip for Now' Onboarding Fallback & Later Anytime Weigh-In Journey", async () => {
-      // 1. User skips onboarding -> Baseline defaults applied
+    it("Scenario T4-2: Initial Onboarding Plan -> Later Anytime Weigh-In & Goal Shift Journey", async () => {
+      // 1. User completes initial onboarding -> baseline biometrics committed
       await adapter.setEncryptedItem(
         STORAGE_KEYS.USER_BIOMETRICS,
         DEFAULT_BASELINE_BIOMETRICS

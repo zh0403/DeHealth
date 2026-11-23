@@ -21,6 +21,7 @@ import {
   isDuplicateCheerError,
   isSupabaseConfigured,
   MAX_RECURSION_DEPTH,
+  normalizeSenderPseudonym,
   PROHIBITED_BIOMETRIC_KEYS,
   publishProofMilestone,
   resetFeedVerificationStateForTesting,
@@ -1349,10 +1350,220 @@ describe("Milestone 2 R3: Supabase Service Unit Test Suite", () => {
       expect(isDuplicateCheerError({ code: "42P01" })).toBe(false);
 
       expect(hasLocalPeerCheered("", "anyone")).toBe(false);
+      expect(hasLocalPeerCheered(FEED_A, "   ")).toBe(false);
       expect(getCheeredFeedIdsForSender("   ")).toEqual({});
 
       resetFeedVerificationStateForTesting();
       expect(getCheeredFeedIdsForSender("hybrid_user")).toEqual({});
+    });
+
+    it("prevents concurrent double-tap sendPeerCheer with synchronous in-flight lock and only 1 insert (S1)", async () => {
+      let resolveSingle!: (value: { data: unknown; error: null }) => void;
+      const deferredSingle = new Promise<{ data: unknown; error: null }>((resolve) => {
+        resolveSingle = resolve;
+      });
+      const singleMock = vi.fn().mockReturnValue(deferredSingle);
+      const selectMock = vi.fn().mockReturnValue({ single: singleMock });
+      const insertMock = vi.fn().mockReturnValue({ select: selectMock });
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const firstCall = sendPeerCheer(FEED_A, "alice");
+      const secondCall = sendPeerCheer(FEED_A, "alice");
+
+      // Second call must reject synchronously via in-flight lock without issuing a 2nd insert
+      expect(insertMock).toHaveBeenCalledTimes(1);
+      await expect(secondCall).rejects.toThrow(DuplicateCheerError);
+
+      resolveSingle({
+        data: {
+          id: "cheer-concurrent-1",
+          feed_id: FEED_A,
+          sender_pseudonym: "alice",
+          created_at: "2026-11-21T05:00:00Z"
+        },
+        error: null
+      });
+
+      const [firstSettled, secondSettled] = await Promise.allSettled([
+        firstCall,
+        secondCall
+      ]);
+      expect(firstSettled).toEqual({
+        status: "fulfilled",
+        value: { success: true, mode: "live" }
+      });
+      expect(secondSettled.status).toBe("rejected");
+      if (secondSettled.status === "rejected") {
+        expect(secondSettled.reason).toBeInstanceOf(DuplicateCheerError);
+      }
+      expect(insertMock).toHaveBeenCalledTimes(1);
+      expect(hasLocalPeerCheered(FEED_A, "alice")).toBe(true);
+    });
+
+    it("clears inFlightCheerKeys on resetFeedVerificationStateForTesting and resetLocalFeedStore (S1)", async () => {
+      let resolveFirst!: (value: { data: unknown; error: null }) => void;
+      const deferredFirst = new Promise<{ data: unknown; error: null }>((resolve) => {
+        resolveFirst = resolve;
+      });
+      const singleMock = vi
+        .fn()
+        .mockReturnValueOnce(deferredFirst)
+        .mockResolvedValueOnce({
+          data: {
+            id: "cheer-after-reset",
+            feed_id: FEED_A,
+            sender_pseudonym: "reset_user",
+            created_at: "2026-11-21T05:00:30Z"
+          },
+          error: null
+        });
+      const selectMock = vi.fn().mockReturnValue({ single: singleMock });
+      const insertMock = vi.fn().mockReturnValue({ select: selectMock });
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const pendingCall = sendPeerCheer(FEED_A, "reset_user");
+      expect(insertMock).toHaveBeenCalledTimes(1);
+
+      resetFeedVerificationStateForTesting();
+      const afterReset = await sendPeerCheer(FEED_A, "reset_user");
+      expect(afterReset).toEqual({ success: true, mode: "live" });
+      expect(insertMock).toHaveBeenCalledTimes(2);
+
+      // Cleanly settle the earlier pending promise so no open handles remain
+      resolveFirst({
+        data: {
+          id: "cheer-stale",
+          feed_id: FEED_A,
+          sender_pseudonym: "reset_user",
+          created_at: "2026-11-21T05:00:00Z"
+        },
+        error: null
+      });
+      await pendingCall;
+
+      resetLocalFeedStore();
+      expect(hasLocalPeerCheered(FEED_A, "reset_user")).toBe(false);
+    });
+
+    it("rolls back reservation on non-23505 server error or thrown network error so live retry succeeds (S1)", async () => {
+      const singleMock = vi
+        .fn()
+        .mockResolvedValueOnce({
+          data: null,
+          error: { message: "503 Service Unavailable" }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            id: "cheer-retry-server",
+            feed_id: FEED_A,
+            sender_pseudonym: "retry_server_user",
+            created_at: "2026-11-21T05:01:00Z"
+          },
+          error: null
+        })
+        .mockRejectedValueOnce(new Error("Socket hang up"))
+        .mockResolvedValueOnce({
+          data: {
+            id: "cheer-retry-throw",
+            feed_id: FEED_B,
+            sender_pseudonym: "retry_throw_user",
+            created_at: "2026-11-21T05:02:00Z"
+          },
+          error: null
+        });
+
+      const selectMock = vi.fn().mockReturnValue({ single: singleMock });
+      const insertMock = vi.fn().mockReturnValue({ select: selectMock });
+      const fromMock = vi.fn().mockReturnValue({ insert: insertMock });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      // 1. Non-23505 server error falls back locally AND rolls back dedup reservation
+      const failedServerResult = await sendPeerCheer(FEED_A, "retry_server_user");
+      expect(failedServerResult).toEqual({ success: true, mode: "local-fallback" });
+      expect(hasLocalPeerCheered(FEED_A, "retry_server_user")).toBe(false);
+      expect(getCheeredFeedIdsForSender("retry_server_user")).toEqual({});
+
+      // Subsequent live retry proceeds and succeeds
+      const retriedServerResult = await sendPeerCheer(FEED_A, "retry_server_user");
+      expect(retriedServerResult).toEqual({ success: true, mode: "live" });
+      expect(hasLocalPeerCheered(FEED_A, "retry_server_user")).toBe(true);
+
+      // 2. Thrown network error falls back locally AND rolls back dedup reservation
+      const thrownResult = await sendPeerCheer(FEED_B, "retry_throw_user");
+      expect(thrownResult).toEqual({ success: true, mode: "local-fallback" });
+      expect(hasLocalPeerCheered(FEED_B, "retry_throw_user")).toBe(false);
+      expect(getCheeredFeedIdsForSender("retry_throw_user")).toEqual({});
+
+      // Subsequent live retry proceeds and succeeds
+      const retriedThrowResult = await sendPeerCheer(FEED_B, "retry_throw_user");
+      expect(retriedThrowResult).toEqual({ success: true, mode: "live" });
+      expect(hasLocalPeerCheered(FEED_B, "retry_throw_user")).toBe(true);
+      expect(insertMock).toHaveBeenCalledTimes(4);
+    });
+
+    it("normalizes sender pseudonym consistently across insert, dedup, and fetchCheeredFeedIdsForUser (C1)", async () => {
+      expect(normalizeSenderPseudonym("  Iron_Supporter  ")).toBe("iron_supporter");
+
+      const singleMock = vi.fn().mockResolvedValue({
+        data: {
+          id: "cheer-norm-1",
+          feed_id: FEED_A,
+          sender_pseudonym: "iron_supporter",
+          created_at: "2026-11-21T05:03:00Z"
+        },
+        error: null
+      });
+      const insertSelectMock = vi.fn().mockReturnValue({ single: singleMock });
+      const insertMock = vi.fn().mockReturnValue({ select: insertSelectMock });
+
+      const eqMock = vi.fn().mockResolvedValue({
+        data: [{ feed_id: FEED_B }],
+        error: null
+      });
+      const querySelectMock = vi.fn().mockReturnValue({ eq: eqMock });
+
+      const fromMock = vi.fn().mockReturnValue({
+        insert: insertMock,
+        select: querySelectMock
+      });
+      setSupabaseClient({ from: fromMock } as unknown as SupabaseClient);
+
+      const liveResult = await sendPeerCheer(FEED_A, "  Iron_Supporter  ");
+      expect(liveResult).toEqual({ success: true, mode: "live" });
+      expect(insertMock).toHaveBeenCalledWith({
+        feed_id: FEED_A,
+        sender_pseudonym: "iron_supporter"
+      });
+
+      // Duplicate with uppercase rejects with DuplicateCheerError and normalized pseudonym
+      let caught: unknown;
+      try {
+        await sendPeerCheer(FEED_A, "IRON_SUPPORTER");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(DuplicateCheerError);
+      expect((caught as DuplicateCheerError).senderPseudonym).toBe("iron_supporter");
+      expect(insertMock).toHaveBeenCalledTimes(1);
+
+      // Local lookup helpers match regardless of case or surrounding whitespace
+      expect(hasLocalPeerCheered(FEED_A, "IRON_SUPPORTER")).toBe(true);
+      expect(hasLocalPeerCheered(FEED_A, "  iron_supporter ")).toBe(true);
+      expect(getCheeredFeedIdsForSender("  IRON_SUPPORTER ")).toEqual({
+        [FEED_A]: true
+      });
+
+      // fetchCheeredFeedIdsForUser queries normalized lowercase pseudonym and merges entries
+      const synced = await fetchCheeredFeedIdsForUser("  IRON_SUPPORTER ");
+      expect(eqMock).toHaveBeenCalledWith("sender_pseudonym", "iron_supporter");
+      expect(synced).toEqual({
+        [FEED_A]: true,
+        [FEED_B]: true
+      });
+      expect(hasLocalPeerCheered(FEED_B, "  iron_supporter ")).toBe(true);
+      expect(hasLocalPeerCheered(FEED_B, "IRON_SUPPORTER")).toBe(true);
     });
   });
 });

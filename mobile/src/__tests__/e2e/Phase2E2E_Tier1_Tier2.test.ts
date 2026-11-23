@@ -650,9 +650,9 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
         expect(currentStep).toBe("CONFIRMATION");
       });
 
-      it("F8-T1-2: 'Skip for Now' action initializes DEFAULT_BASELINE_BIOMETRICS baseline metrics", () => {
-        const skippedProfile: UserBiometrics = { ...DEFAULT_BASELINE_BIOMETRICS };
-        expect(UserBiometricsSchema.parse(skippedProfile)).toEqual(DEFAULT_BASELINE_BIOMETRICS);
+      it("F8-T1-2: mandatory onboarding validates baseline UserBiometrics schema fields before plan start", () => {
+        const baselineProfile: UserBiometrics = { ...DEFAULT_BASELINE_BIOMETRICS };
+        expect(UserBiometricsSchema.parse(baselineProfile)).toEqual(DEFAULT_BASELINE_BIOMETRICS);
       });
 
       it("F8-T1-3: successfully validates customized user biometrics submitted through wizard", () => {
@@ -1498,10 +1498,10 @@ describe("Phase 2.0 E2E Test Suite - Tier 1 & Tier 2", () => {
         expect(calculateBmr(parsed)).toBe(1780);
       });
 
-      it("F8-T2-2: rapid consecutive 'Skip for Now' clicks produce identical idempotent state", () => {
-        const click1 = UserBiometricsSchema.parse(DEFAULT_BASELINE_BIOMETRICS);
-        const click2 = UserBiometricsSchema.parse(DEFAULT_BASELINE_BIOMETRICS);
-        expect(click1).toEqual(click2);
+      it("F8-T2-2: repeated validation of submitted onboarding biometrics produces identical idempotent state", () => {
+        const submit1 = UserBiometricsSchema.parse(DEFAULT_BASELINE_BIOMETRICS);
+        const submit2 = UserBiometricsSchema.parse(DEFAULT_BASELINE_BIOMETRICS);
+        expect(submit1).toEqual(submit2);
       });
 
       it("F8-T2-3: weight log note with exactly 500 characters passes validation", () => {

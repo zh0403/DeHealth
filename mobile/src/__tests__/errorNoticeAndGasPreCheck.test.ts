@@ -920,6 +920,7 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
         initialStepCount: 0,
         initialStepSource: "manual-fallback",
         initialPedometerAvailable: false,
+        initialCheckInMode: "detailed",
         onDispatchSignedClaim: vi.fn().mockResolvedValue(undefined),
         onError
       };
@@ -980,6 +981,7 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
         initialStepCount: 1500,
         initialStepSource: "manual-fallback",
         initialPedometerAvailable: false,
+        initialCheckInMode: "detailed",
         onDispatchSignedClaim,
         onError
       };

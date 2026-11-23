@@ -1,34 +1,61 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import {
   Address,
+  AUTH_METHODS,
   AuthSessionMetadata,
-  DEFAULT_BASELINE_BIOMETRICS
+  Bytes32,
+  createDeHealthDomain,
+  DEFAULT_BASELINE_BIOMETRICS,
+  WORKOUT_PROOF_EIP712_TYPES,
+  WorkoutProof
 } from "@dehealth/shared";
 import { SupabaseClient } from "@supabase/supabase-js";
-import { Wallet } from "ethers";
+import {
+  BaseWallet,
+  JsonRpcProvider,
+  TypedDataEncoder,
+  TypedDataField,
+  Wallet
+} from "ethers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AUTH_SESSION_STORAGE_KEY,
   AuthError,
   AuthSessionStorage,
   clearPersistedAuthSession,
-  continueWithWallet,
+  createEip1193Signer,
+  Eip1193Provider,
   formatShortAddress,
   getAuthSessionStorage,
   getPersistedAuthSession,
+  getWalletConnectProjectId,
   initializeAuthSessionStorage,
   purgeAuthSessionStorageKey,
   resetAuthSessionStorage,
+  resetMetaMaskAdapterForTesting,
+  resetWalletConnectAdapterForTesting,
   savePersistedAuthSession,
   setAuthSessionStorage,
+  setMetaMaskAdapterForTesting,
+  setWalletConnectAdapterForTesting,
   signInWithGoogle,
-  signOutSession
+  signInWithMetaMask,
+  signInWithWalletConnect,
+  signOutSession,
+  startLocalSession
 } from "../services/authService";
+import {
+  signWorkoutProof,
+  verifyWorkoutProofSignature
+} from "../services/cryptoService";
 import {
   DataSovereigntyViolationError,
   setSupabaseClient
 } from "../services/supabaseService";
-import { AdaptiveStorage, ADAPTIVE_STORAGE_KEYS } from "../storage/adaptiveStorage";
+import {
+  ADAPTIVE_STORAGE_KEYS,
+  AdaptiveStorage
+} from "../storage/adaptiveStorage";
 import {
   EncryptedStorageAdapter,
   KeyValueStorageBackend
@@ -48,8 +75,7 @@ import {
   getOrCreatePersistentWallet,
   getStoredWallet,
   resetWalletStorageForTesting,
-  WALLET_PRIVATE_KEY_STORAGE_KEY,
-  WalletStorageError
+  WALLET_PRIVATE_KEY_STORAGE_KEY
 } from "../storage/walletStorage";
 
 class MemoryBackend implements KeyValueStorageBackend {
@@ -68,14 +94,91 @@ class MemoryBackend implements KeyValueStorageBackend {
   }
 }
 
-describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
+interface GlobalWithWalletMocks {
+  ethereum?: unknown;
+  window?: {
+    ethereum?: unknown;
+  };
+}
+
+function createWalletBackedEip1193Provider(
+  backingWallet: BaseWallet,
+  capturedPayloads: string[]
+): Eip1193Provider {
+  return {
+    isMetaMask: true,
+    async request({ method, params }): Promise<unknown> {
+      if (method === "eth_requestAccounts") {
+        return [backingWallet.address];
+      }
+      if (method === "personal_sign") {
+        const hexMessage = params?.[0];
+        if (typeof hexMessage !== "string") {
+          throw new Error("Missing message hex");
+        }
+        return backingWallet.signMessage(hexMessage);
+      }
+      if (method === "eth_signTypedData_v4") {
+        const signerAddr = params?.[0];
+        const rawJson = params?.[1];
+        if (
+          typeof signerAddr !== "string" ||
+          signerAddr.toLowerCase() !== backingWallet.address.toLowerCase() ||
+          typeof rawJson !== "string"
+        ) {
+          throw new Error("Invalid eth_signTypedData_v4 parameters");
+        }
+        capturedPayloads.push(rawJson);
+        const parsed = JSON.parse(rawJson) as {
+          readonly domain: Record<string, unknown>;
+          readonly types: Record<string, Array<TypedDataField>>;
+          readonly message: Record<string, unknown>;
+        };
+        const typesWithoutDomain: Record<string, Array<TypedDataField>> = {};
+        for (const [key, fields] of Object.entries(parsed.types)) {
+          if (key !== "EIP712Domain") {
+            typesWithoutDomain[key] = fields;
+          }
+        }
+        return backingWallet.signTypedData(
+          parsed.domain,
+          typesWithoutDomain,
+          parsed.message
+        );
+      }
+      throw new Error(`Unsupported method: ${method}`);
+    }
+  };
+}
+
+describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Storage", () => {
   const testSecret = "0x" + "cc".repeat(32);
+  const sampleContractAddress =
+    "0x1111111111111111111111111111111111111111" as Address;
+  const sampleTelemetryHash = ("0x" + "ab".repeat(32)) as Bytes32;
+
+  let originalWcProjectId: string | undefined;
+  let hadOwnEthereum = false;
+  let originalEthereum: unknown;
+  let hadOwnWindow = false;
+  let originalWindow: unknown;
 
   beforeEach(() => {
     vi.restoreAllMocks();
     setSupabaseClient(undefined);
     resetAuthSessionStorage();
     resetWalletStorageForTesting();
+    resetMetaMaskAdapterForTesting();
+    resetWalletConnectAdapterForTesting();
+
+    originalWcProjectId = process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
+    delete process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
+
+    const g = globalThis as GlobalWithWalletMocks;
+    hadOwnEthereum = Object.prototype.hasOwnProperty.call(g, "ethereum");
+    originalEthereum = g.ethereum;
+    hadOwnWindow = Object.prototype.hasOwnProperty.call(g, "window");
+    originalWindow = g.window;
   });
 
   afterEach(() => {
@@ -83,16 +186,46 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
     setSupabaseClient(undefined);
     resetAuthSessionStorage();
     resetWalletStorageForTesting();
+    resetMetaMaskAdapterForTesting();
+    resetWalletConnectAdapterForTesting();
+
+    if (originalWcProjectId === undefined) {
+      delete process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
+    } else {
+      process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = originalWcProjectId;
+    }
+
+    const g = globalThis as GlobalWithWalletMocks;
+    if (hadOwnEthereum) {
+      g.ethereum = originalEthereum;
+    } else {
+      delete g.ethereum;
+    }
+    if (hadOwnWindow) {
+      g.window = originalWindow as { ethereum?: unknown } | undefined;
+    } else {
+      delete g.window;
+    }
   });
 
-  describe("formatShortAddress", () => {
+  describe("formatShortAddress & getWalletConnectProjectId", () => {
     it("formats addresses >= 10 chars with ellipsis and trims shorter strings", () => {
-      expect(formatShortAddress("0x1234567890abcdef1234567890abcdef1234abcd")).toBe(
-        "0x1234\u2026abcd"
-      );
+      expect(
+        formatShortAddress("0x1234567890abcdef1234567890abcdef1234abcd")
+      ).toBe("0x1234\u2026abcd");
       expect(formatShortAddress("  0x12345678  ")).toBe("0x1234\u20265678");
       expect(formatShortAddress("  0x123  ")).toBe("0x123");
       expect(formatShortAddress("")).toBe("");
+    });
+
+    it("resolves EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID cleanly and returns null when blank", () => {
+      expect(getWalletConnectProjectId()).toBeNull();
+
+      process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = "   ";
+      expect(getWalletConnectProjectId()).toBeNull();
+
+      process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = "  wc-proj-123  ";
+      expect(getWalletConnectProjectId()).toBe("wc-proj-123");
     });
   });
 
@@ -104,7 +237,7 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       ).toThrow(VaultKeyUnavailableError);
     });
 
-    it("encrypts, persists, reloads, clears, and purges AuthSessionMetadata cleanly", async () => {
+    it("encrypts, persists, reloads, clears, and purges AuthSessionMetadata for all 4 AUTH_METHODS", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const storage = await initializeAuthSessionStorage(keyStore, backend);
@@ -112,31 +245,36 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       expect(await getPersistedAuthSession()).toBeNull();
 
       const wallet = await getOrCreatePersistentWallet(keyStore);
-      const session: AuthSessionMetadata = {
-        authMethod: "google",
-        accountId: "user_google_123",
-        displayLabel: "runner@dehealth.local",
-        walletAddress: wallet.address as Address,
-        signedInAtMs: 1_763_600_000_000
-      };
+      for (const method of AUTH_METHODS) {
+        const session: AuthSessionMetadata = {
+          authMethod: method,
+          accountId: `${method}:user-123`,
+          displayLabel: `${method} athlete`,
+          walletAddress: wallet.address as Address,
+          signedInAtMs: 1_763_600_000_000
+        };
+        const saved = await savePersistedAuthSession(session);
+        expect(saved).toEqual(session);
 
-      const saved = await savePersistedAuthSession(session);
-      expect(saved).toEqual(session);
+        const rawEnvelope = backend.items.get(AUTH_SESSION_STORAGE_KEY);
+        expect(rawEnvelope).toBeDefined();
+        expect(rawEnvelope).not.toContain(`${method} athlete`);
 
-      // Verify raw persisted payload is encrypted (never plaintext)
-      const rawEnvelope = backend.items.get(AUTH_SESSION_STORAGE_KEY);
-      expect(rawEnvelope).toBeDefined();
-      expect(rawEnvelope).not.toContain("runner@dehealth.local");
-
-      const loaded = await getPersistedAuthSession();
-      expect(loaded).toEqual(session);
+        expect(await getPersistedAuthSession()).toEqual(session);
+      }
 
       await clearPersistedAuthSession();
       expect(await getPersistedAuthSession()).toBeNull();
       expect(backend.items.has(AUTH_SESSION_STORAGE_KEY)).toBe(false);
 
-      // Purge works without requiring vault secret
-      await savePersistedAuthSession(session);
+      const finalSession: AuthSessionMetadata = {
+        authMethod: "local",
+        accountId: `local:${wallet.address.toLowerCase()}`,
+        displayLabel: `Local Session (${formatShortAddress(wallet.address)})`,
+        walletAddress: wallet.address as Address,
+        signedInAtMs: 1_763_600_000_001
+      };
+      await savePersistedAuthSession(finalSession);
       expect(backend.items.has(AUTH_SESSION_STORAGE_KEY)).toBe(true);
       await purgeAuthSessionStorageKey(backend);
       expect(backend.items.has(AUTH_SESSION_STORAGE_KEY)).toBe(false);
@@ -150,22 +288,22 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
 
       const wallet = Wallet.createRandom();
       const taintedSession = {
-        authMethod: "wallet",
-        accountId: `wallet:${wallet.address.toLowerCase()}`,
+        authMethod: "local",
+        accountId: `local:${wallet.address.toLowerCase()}`,
         displayLabel: formatShortAddress(wallet.address),
         walletAddress: wallet.address as Address,
         signedInAtMs: 1_763_600_000_000,
         weightKg: 74.2
       } as unknown as AuthSessionMetadata;
 
-      await expect(savePersistedAuthSession(taintedSession, storage)).rejects.toThrow(
-        DataSovereigntyViolationError
-      );
+      await expect(
+        savePersistedAuthSession(taintedSession, storage)
+      ).rejects.toThrow(DataSovereigntyViolationError);
       expect(backend.items.has(AUTH_SESSION_STORAGE_KEY)).toBe(false);
 
       const invalidSchemaSession: AuthSessionMetadata = {
-        authMethod: "wallet",
-        accountId: "wallet:bad",
+        authMethod: "local",
+        accountId: "local:bad",
         displayLabel: "Bad Wallet",
         walletAddress: "not-an-evm-address" as Address,
         signedInAtMs: 1_763_600_000_000
@@ -191,8 +329,8 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
 
       const validWallet = Wallet.createRandom();
       await storage.savePersistedAuthSession({
-        authMethod: "wallet",
-        accountId: `wallet:${validWallet.address.toLowerCase()}`,
+        authMethod: "local",
+        accountId: `local:${validWallet.address.toLowerCase()}`,
         displayLabel: formatShortAddress(validWallet.address),
         walletAddress: validWallet.address as Address,
         signedInAtMs: 1_763_600_000_000
@@ -243,28 +381,93 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
     });
   });
 
-  describe("signInWithGoogle", () => {
-    it("completes live Supabase OAuth, auto-provisions embedded wallet, and persists strictly non-biometric session", async () => {
+  describe("startLocalSession", () => {
+    it("creates/reuses embedded wallet, persists authMethod 'local', and provides working EIP-712 signer", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const storage = await initializeAuthSessionStorage(keyStore, backend);
 
-      const signInWithOAuthMock = vi.fn().mockResolvedValue({
-        data: {
-          provider: "google",
-          url: "https://accounts.google.com/o/oauth2/v2/auth?mock=1"
-        },
-        error: null
+      const first = await startLocalSession({
+        keyStore,
+        storage,
+        nowMs: 10_000
       });
-      const getUserMock = vi.fn().mockResolvedValue({
-        data: {
-          user: {
-            id: "supa-user-uuid-99",
-            email: "athlete@dehealth.xyz",
-            user_metadata: { full_name: "DeHealth Athlete" }
-          }
-        },
-        error: null
+
+      expect(first.mode).toBe("local-fallback");
+      expect(first.oauthUrl).toBeNull();
+      expect(first.wallet).toBeInstanceOf(Wallet);
+      expect(first.signer).toBe(first.wallet);
+      expect(first.walletAddress).toBe(first.wallet!.address);
+      expect(first.session).toEqual({
+        authMethod: "local",
+        accountId: `local:${first.walletAddress.toLowerCase()}`,
+        displayLabel: `Local Session (${formatShortAddress(first.walletAddress)})`,
+        walletAddress: first.walletAddress,
+        signedInAtMs: 10_000
+      });
+      expect(await getPersistedAuthSession(storage)).toEqual(first.session);
+
+      // Sign a real WorkoutProof with the returned local signer
+      const proof: WorkoutProof = {
+        user: first.walletAddress,
+        telemetryHash: sampleTelemetryHash,
+        streakCount: 3n,
+        nonce: 0n,
+        deadline: 1_900_000_000n
+      };
+      const signed = await signWorkoutProof(
+        first.signer!,
+        proof,
+        sampleContractAddress
+      );
+      expect(verifyWorkoutProofSignature(signed, sampleContractAddress)).toBe(
+        true
+      );
+
+      // Custom label trimmed & reusing identical wallet
+      const second = await startLocalSession({
+        keyStore,
+        storage,
+        localDisplayLabel: "  My Local Vault  ",
+        nowMs: 20_000
+      });
+      expect(second.walletAddress).toBe(first.walletAddress);
+      expect(second.session.displayLabel).toBe("My Local Vault");
+    });
+  });
+
+  describe("signInWithGoogle (1A verified OAuth & explicit local delegation)", () => {
+    it("completes verified live Supabase OAuth, invokes verifyOAuthCallback, provisions wallet, and persists 'google' session", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const storage = await initializeAuthSessionStorage(keyStore, backend);
+
+      const callOrder: string[] = [];
+      const signInWithOAuthMock = vi.fn().mockImplementation(async () => {
+        callOrder.push("signInWithOAuth");
+        return {
+          data: {
+            provider: "google",
+            url: "https://accounts.google.com/o/oauth2/v2/auth?mock=1"
+          },
+          error: null
+        };
+      });
+      const verifyOAuthCallbackMock = vi.fn().mockImplementation(async () => {
+        callOrder.push("verifyOAuthCallback");
+      });
+      const getUserMock = vi.fn().mockImplementation(async () => {
+        callOrder.push("getUser");
+        return {
+          data: {
+            user: {
+              id: "supa-user-uuid-99",
+              email: "athlete@dehealth.xyz",
+              user_metadata: { full_name: "DeHealth Athlete" }
+            }
+          },
+          error: null
+        };
       });
 
       setSupabaseClient({
@@ -278,9 +481,15 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
         keyStore,
         storage,
         redirectTo: "dehealth://auth-callback",
+        verifyOAuthCallback: verifyOAuthCallbackMock,
         nowMs: 1_763_600_123_456
       });
 
+      expect(callOrder).toEqual([
+        "signInWithOAuth",
+        "verifyOAuthCallback",
+        "getUser"
+      ]);
       expect(signInWithOAuthMock).toHaveBeenCalledWith({
         provider: "google",
         options: { redirectTo: "dehealth://auth-callback" }
@@ -290,25 +499,28 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
         "https://accounts.google.com/o/oauth2/v2/auth?mock=1"
       );
       expect(result.wallet).toBeInstanceOf(Wallet);
+      expect(result.signer).toBe(result.wallet);
+      expect(result.walletAddress).toBe(result.wallet!.address);
       expect(result.session).toEqual({
         authMethod: "google",
         accountId: "supa-user-uuid-99",
         displayLabel: "athlete@dehealth.xyz",
-        walletAddress: result.wallet.address as Address,
+        walletAddress: result.walletAddress,
         signedInAtMs: 1_763_600_123_456
       });
 
-      // Embedded wallet persisted and persisted session matches
-      expect((await getStoredWallet(keyStore))?.address).toBe(result.wallet.address);
+      expect((await getStoredWallet(keyStore))?.address).toBe(
+        result.walletAddress
+      );
       expect(await getPersistedAuthSession(storage)).toEqual(result.session);
     });
 
-    it("falls back safely to user_metadata.full_name or deterministic wallet-based Google label when getUser is partial or throws", async () => {
+    it("falls back to user_metadata.full_name or Google short address ONLY when verified user.id is present", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const storage = await initializeAuthSessionStorage(keyStore, backend);
 
-      // Case 1: user_metadata.full_name without email
+      // Case 1: full_name without email
       setSupabaseClient({
         auth: {
           signInWithOAuth: vi.fn().mockResolvedValue({
@@ -328,31 +540,155 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       } as unknown as SupabaseClient);
 
       const res1 = await signInWithGoogle({ keyStore, storage, nowMs: 1000 });
+      expect(res1.session.authMethod).toBe("google");
       expect(res1.session.displayLabel).toBe("Alex Pulse");
       expect(res1.session.accountId).toBe("supa-meta-user");
 
-      // Case 2: getUser throws (redirect not completed yet) -> non-fatal deterministic fallback
+      // Case 2: verified user.id without email or full_name
       setSupabaseClient({
         auth: {
           signInWithOAuth: vi.fn().mockResolvedValue({
             data: { provider: "google", url: "https://oauth.example/2" },
             error: null
           }),
-          getUser: vi.fn().mockRejectedValue(new Error("Auth session missing"))
+          getUser: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: "supa-id-only",
+                user_metadata: {}
+              }
+            },
+            error: null
+          })
         }
       } as unknown as SupabaseClient);
 
       const res2 = await signInWithGoogle({ keyStore, storage, nowMs: 2000 });
-      expect(res2.wallet.address).toBe(res1.wallet.address);
-      expect(res2.session.accountId).toBe(
-        `google_${res2.wallet.address.slice(2, 10).toLowerCase()}`
-      );
+      expect(res2.walletAddress).toBe(res1.walletAddress);
+      expect(res2.session.accountId).toBe("supa-id-only");
       expect(res2.session.displayLabel).toBe(
-        `Google (${formatShortAddress(res2.wallet.address)})`
+        `Google (${formatShortAddress(res2.walletAddress)})`
       );
     });
 
-    it("throws AuthError when live Supabase OAuth returns an error without provisioning a wallet", async () => {
+    it("fails closed when live Google OAuth is unverified (getUser missing/null/blank/error/throws) without creating wallet or session (1A)", async () => {
+      const scenarios: Array<{
+        readonly label: string;
+        readonly auth: Record<string, unknown>;
+        readonly verifyOAuthCallback?: () => Promise<void>;
+        readonly expectedMessage?: RegExp;
+      }> = [
+        {
+          label: "getUser method missing",
+          auth: {
+            signInWithOAuth: vi.fn().mockResolvedValue({
+              data: { provider: "google", url: "https://oauth.example/a" },
+              error: null
+            })
+          }
+        },
+        {
+          label: "getUser returns null user",
+          auth: {
+            signInWithOAuth: vi.fn().mockResolvedValue({
+              data: { provider: "google", url: "https://oauth.example/b" },
+              error: null
+            }),
+            getUser: vi.fn().mockResolvedValue({
+              data: { user: null },
+              error: null
+            })
+          }
+        },
+        {
+          label: "getUser returns blank user.id",
+          auth: {
+            signInWithOAuth: vi.fn().mockResolvedValue({
+              data: { provider: "google", url: "https://oauth.example/c" },
+              error: null
+            }),
+            getUser: vi.fn().mockResolvedValue({
+              data: { user: { id: "   " } },
+              error: null
+            })
+          }
+        },
+        {
+          label: "getUser returns error object",
+          auth: {
+            signInWithOAuth: vi.fn().mockResolvedValue({
+              data: { provider: "google", url: "https://oauth.example/d" },
+              error: null
+            }),
+            getUser: vi.fn().mockResolvedValue({
+              data: { user: { id: "supa-1" } },
+              error: { message: "JWT expired" }
+            })
+          }
+        },
+        {
+          label: "getUser throws",
+          auth: {
+            signInWithOAuth: vi.fn().mockResolvedValue({
+              data: { provider: "google", url: "https://oauth.example/e" },
+              error: null
+            }),
+            getUser: vi.fn().mockRejectedValue(new Error("Auth session missing"))
+          }
+        },
+        {
+          label: "verifyOAuthCallback throws",
+          auth: {
+            signInWithOAuth: vi.fn().mockResolvedValue({
+              data: { provider: "google", url: "https://oauth.example/f" },
+              error: null
+            }),
+            getUser: vi.fn()
+          },
+          verifyOAuthCallback: async () => {
+            throw new Error("Browser popup dismissed");
+          },
+          expectedMessage: /Browser popup dismissed/
+        }
+      ];
+
+      for (const scenario of scenarios) {
+        const keyStore = new InMemoryKeyStore();
+        const backend = new MemoryBackend();
+        const storage = await initializeAuthSessionStorage(keyStore, backend);
+        setSupabaseClient({ auth: scenario.auth } as unknown as SupabaseClient);
+
+        const promise = signInWithGoogle({
+          keyStore,
+          storage,
+          verifyOAuthCallback: scenario.verifyOAuthCallback
+        });
+
+        await expect(promise, scenario.label).rejects.toThrow(AuthError);
+        if (scenario.expectedMessage) {
+          await expect(
+            signInWithGoogle({
+              keyStore,
+              storage,
+              verifyOAuthCallback: scenario.verifyOAuthCallback
+            })
+          ).rejects.toThrow(scenario.expectedMessage);
+        } else {
+          await expect(
+            signInWithGoogle({
+              keyStore,
+              storage,
+              verifyOAuthCallback: scenario.verifyOAuthCallback
+            })
+          ).rejects.toThrow(/Google sign-in was not verified/);
+        }
+        expect(await getStoredWallet(keyStore), scenario.label).toBeNull();
+        expect(await getPersistedAuthSession(storage), scenario.label).toBeNull();
+        resetAuthSessionStorage();
+      }
+    });
+
+    it("throws AuthError when live Supabase signInWithOAuth fails without provisioning a wallet", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const storage = await initializeAuthSessionStorage(keyStore, backend);
@@ -375,7 +711,6 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       expect(await getStoredWallet(keyStore)).toBeNull();
       expect(await getPersistedAuthSession(storage)).toBeNull();
 
-      // Rejected OAuth call also surfaces AuthError
       setSupabaseClient({
         auth: {
           signInWithOAuth: vi
@@ -388,7 +723,7 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       );
     });
 
-    it("uses deterministic local Google fallback when Supabase is unconfigured", async () => {
+    it("delegates to startLocalSession (authMethod 'local') when Supabase is unconfigured", async () => {
       setSupabaseClient(null);
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
@@ -397,105 +732,470 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       const first = await signInWithGoogle({
         keyStore,
         storage,
-        localGoogleHint: "  Local Google Demo  ",
+        localGoogleHint: "  Offline Sovereign Demo  ",
         nowMs: 5000
       });
 
       expect(first.mode).toBe("local-fallback");
       expect(first.oauthUrl).toBeNull();
+      expect(first.wallet).toBeInstanceOf(Wallet);
+      expect(first.signer).toBe(first.wallet);
       expect(first.session).toEqual({
-        authMethod: "google",
-        accountId: `google_local_${first.wallet.address.slice(2, 10).toLowerCase()}`,
-        displayLabel: "Local Google Demo",
-        walletAddress: first.wallet.address as Address,
+        authMethod: "local",
+        accountId: `local:${first.walletAddress.toLowerCase()}`,
+        displayLabel: "Offline Sovereign Demo",
+        walletAddress: first.walletAddress,
         signedInAtMs: 5000
       });
 
-      // Default displayLabel when localGoogleHint omitted (and uses initialized singleton when storage omitted)
       const second = await signInWithGoogle({
         keyStore,
         nowMs: 6000
       });
-      expect(second.wallet.address).toBe(first.wallet.address);
-      expect(second.session.accountId).toBe(first.session.accountId);
+      expect(second.walletAddress).toBe(first.walletAddress);
+      expect(second.session.authMethod).toBe("local");
       expect(second.session.displayLabel).toBe(
-        `Google (${formatShortAddress(second.wallet.address)})`
+        `Local Session (${formatShortAddress(second.walletAddress)})`
       );
       expect(await getPersistedAuthSession()).toEqual(second.session);
     });
   });
 
-  describe("continueWithWallet", () => {
-    it("creates or reuses persistent embedded wallet and persists wallet session metadata", async () => {
-      const keyStore = new InMemoryKeyStore();
-      const backend = new MemoryBackend();
-      const storage = await initializeAuthSessionStorage(keyStore, backend);
-
-      const first = await continueWithWallet({
-        keyStore,
-        storage,
-        nowMs: 10_000
-      });
-      expect(first.mode).toBe("local-fallback");
-      expect(first.session).toEqual({
-        authMethod: "wallet",
-        accountId: `wallet:${first.wallet.address.toLowerCase()}`,
-        displayLabel: formatShortAddress(first.wallet.address),
-        walletAddress: first.wallet.address as Address,
-        signedInAtMs: 10_000
-      });
-
-      // Second call reuses the exact same embedded wallet
-      const second = await continueWithWallet({
-        keyStore,
-        storage,
-        nowMs: 20_000
-      });
-      expect(second.wallet.address).toBe(first.wallet.address);
-      expect(await getPersistedAuthSession(storage)).toEqual(second.session);
+  describe("createEip1193Signer", () => {
+    it("rejects invalid or zero addresses", () => {
+      const dummyProvider: Eip1193Provider = {
+        request: vi.fn()
+      };
+      expect(() =>
+        createEip1193Signer("not-an-address" as Address, dummyProvider)
+      ).toThrow(AuthError);
+      expect(() =>
+        createEip1193Signer(
+          "0x0000000000000000000000000000000000000000" as Address,
+          dummyProvider
+        )
+      ).toThrow(AuthError);
     });
 
-    it("imports an explicit private key (with or without 0x) and rejects invalid keys without overwriting", async () => {
+    it("implements getAddress, connect, signMessage, signTransaction, and bigint-safe EIP-712 signTypedData", async () => {
+      const backingWallet = Wallet.createRandom();
+      const capturedPayloads: string[] = [];
+      const eipProvider = createWalletBackedEip1193Provider(
+        backingWallet,
+        capturedPayloads
+      );
+      const signer = createEip1193Signer(
+        backingWallet.address as Address,
+        eipProvider
+      );
+
+      expect(await signer.getAddress()).toBe(backingWallet.address);
+      expect(signer.provider).toBeNull();
+
+      const rpcProvider = new JsonRpcProvider("http://127.0.0.1:8545");
+      const connectedSigner = signer.connect(rpcProvider);
+      expect(connectedSigner.provider).toBe(rpcProvider);
+      expect(await connectedSigner.getAddress()).toBe(backingWallet.address);
+
+      await expect(signer.signTransaction({})).rejects.toThrow(AuthError);
+
+      const textSig = await signer.signMessage("DeHealth check-in");
+      expect(typeof textSig).toBe("string");
+      const bytesSig = await signer.signMessage(new Uint8Array([1, 2, 3]));
+      expect(typeof bytesSig).toBe("string");
+
+      // Sign a WorkoutProof containing bigints and verify with verifyWorkoutProofSignature
+      const proof: WorkoutProof = {
+        user: backingWallet.address as Address,
+        telemetryHash: sampleTelemetryHash,
+        streakCount: 9n,
+        nonce: 4n,
+        deadline: 1_900_000_123n
+      };
+      const signedClaim = await signWorkoutProof(
+        connectedSigner,
+        proof,
+        sampleContractAddress
+      );
+      expect(
+        verifyWorkoutProofSignature(signedClaim, sampleContractAddress)
+      ).toBe(true);
+      expect(capturedPayloads).toHaveLength(1);
+
+      const serializedPayload = JSON.parse(capturedPayloads[0]!) as {
+        readonly primaryType: string;
+        readonly message: Record<string, string>;
+      };
+      expect(serializedPayload.primaryType).toBe("WorkoutProof");
+      expect(serializedPayload.message.streakCount).toBe("9");
+      expect(serializedPayload.message.nonce).toBe("4");
+      expect(serializedPayload.message.deadline).toBe("1900000123");
+
+      // Explicitly verify bigint replacer when TypedDataEncoder.getPayload returns raw bigint fields
+      const requestSpy = vi.fn().mockResolvedValue("0x" + "11".repeat(65));
+      const bigintSigner = createEip1193Signer(
+        backingWallet.address as Address,
+        { request: requestSpy }
+      );
+      const payloadSpy = vi
+        .spyOn(TypedDataEncoder, "getPayload")
+        .mockReturnValueOnce({
+          domain: { chainId: 421614n },
+          message: { streakCount: 12n, nested: { deadline: 999n } }
+        });
+      const domain = createDeHealthDomain(sampleContractAddress);
+      const mutableTypes: Record<string, Array<TypedDataField>> = {
+        WorkoutProof: WORKOUT_PROOF_EIP712_TYPES.WorkoutProof.map((f) => ({
+          ...f
+        }))
+      };
+      await bigintSigner.signTypedData(
+        domain,
+        mutableTypes,
+        proof as unknown as Record<string, unknown>
+      );
+      payloadSpy.mockRestore();
+
+      expect(requestSpy).toHaveBeenCalledWith({
+        method: "eth_signTypedData_v4",
+        params: [
+          backingWallet.address,
+          JSON.stringify({
+            domain: { chainId: "421614" },
+            message: { streakCount: "12", nested: { deadline: "999" } }
+          })
+        ]
+      });
+    });
+
+    it("wraps provider rejections and empty signatures into AuthError", async () => {
+      const addr = Wallet.createRandom().address as Address;
+      const rejectingProvider: Eip1193Provider = {
+        async request() {
+          throw { message: "User denied signature" };
+        }
+      };
+      const rejectSigner = createEip1193Signer(addr, rejectingProvider);
+      await expect(rejectSigner.signMessage("hello")).rejects.toThrow(
+        /User denied signature/
+      );
+      await expect(
+        rejectSigner.signTypedData(
+          createDeHealthDomain(sampleContractAddress),
+          {
+            WorkoutProof: WORKOUT_PROOF_EIP712_TYPES.WorkoutProof.map((f) => ({
+              ...f
+            }))
+          },
+          {
+            user: addr,
+            telemetryHash: sampleTelemetryHash,
+            streakCount: 1n,
+            nonce: 0n,
+            deadline: 1_900_000_000n
+          }
+        )
+      ).rejects.toThrow(/User denied signature/);
+
+      const emptyProvider: Eip1193Provider = {
+        async request() {
+          return "   ";
+        }
+      };
+      const emptySigner = createEip1193Signer(addr, emptyProvider);
+      await expect(emptySigner.signMessage("hello")).rejects.toThrow(AuthError);
+      await expect(
+        emptySigner.signTypedData(
+          createDeHealthDomain(sampleContractAddress),
+          {
+            WorkoutProof: WORKOUT_PROOF_EIP712_TYPES.WorkoutProof.map((f) => ({
+              ...f
+            }))
+          },
+          {
+            user: addr,
+            telemetryHash: sampleTelemetryHash,
+            streakCount: 1n,
+            nonce: 0n,
+            deadline: 1_900_000_000n
+          }
+        )
+      ).rejects.toThrow(AuthError);
+    });
+  });
+
+  describe("signInWithMetaMask", () => {
+    it("connects via globalThis.ethereum, persists 'metamask' session, and signs EIP-712 typed data", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const storage = await initializeAuthSessionStorage(keyStore, backend);
 
-      const target = Wallet.createRandom();
-      const imported = await continueWithWallet({
-        privateKey: `  ${target.privateKey.slice(2)}  `,
-        keyStore,
+      const metamaskWallet = Wallet.createRandom();
+      const capturedPayloads: string[] = [];
+      const provider = createWalletBackedEip1193Provider(
+        metamaskWallet,
+        capturedPayloads
+      );
+      (globalThis as GlobalWithWalletMocks).ethereum = provider;
+
+      const result = await signInWithMetaMask({
         storage,
         nowMs: 30_000
       });
 
-      expect(imported.wallet.address).toBe(target.address);
-      expect(imported.wallet.privateKey).toBe(target.privateKey);
-      expect(imported.session).toEqual({
-        authMethod: "wallet",
-        accountId: `wallet:${target.address.toLowerCase()}`,
-        displayLabel: formatShortAddress(target.address),
-        walletAddress: target.address as Address,
+      expect(result.mode).toBe("live");
+      expect(result.oauthUrl).toBeNull();
+      expect(result.wallet).toBeNull();
+      expect(result.walletAddress).toBe(metamaskWallet.address);
+      expect(result.signer).not.toBeNull();
+      expect(await result.signer!.getAddress()).toBe(metamaskWallet.address);
+      expect(result.session).toEqual({
+        authMethod: "metamask",
+        accountId: metamaskWallet.address,
+        displayLabel: `MetaMask (${formatShortAddress(metamaskWallet.address)})`,
+        walletAddress: metamaskWallet.address as Address,
         signedInAtMs: 30_000
       });
+      expect(await getPersistedAuthSession(storage)).toEqual(result.session);
 
-      // Invalid private key fails closed without disturbing stored wallet or session
-      await expect(
-        continueWithWallet({
-          privateKey: "0xinvalid_key",
-          keyStore,
-          storage
-        })
-      ).rejects.toThrow(WalletStorageError);
-
-      expect((await getStoredWallet(keyStore))?.address).toBe(target.address);
-      expect((await getPersistedAuthSession(storage))?.walletAddress).toBe(
-        target.address
+      const proof: WorkoutProof = {
+        user: result.walletAddress,
+        telemetryHash: sampleTelemetryHash,
+        streakCount: 5n,
+        nonce: 2n,
+        deadline: 1_950_000_000n
+      };
+      const signed = await signWorkoutProof(
+        result.signer!,
+        proof,
+        sampleContractAddress
       );
+      expect(verifyWorkoutProofSignature(signed, sampleContractAddress)).toBe(
+        true
+      );
+      expect(capturedPayloads).toHaveLength(1);
+    });
+
+    it("supports window.ethereum fallback and injected MetaMaskAdapter (with or without provider)", async () => {
+      const backend = new MemoryBackend();
+      const storage = new AuthSessionStorage(testSecret, backend);
+
+      // window.ethereum discovery when globalThis.ethereum is absent
+      const winWallet = Wallet.createRandom();
+      delete (globalThis as GlobalWithWalletMocks).ethereum;
+      (globalThis as GlobalWithWalletMocks).window = {
+        ethereum: createWalletBackedEip1193Provider(winWallet, [])
+      };
+      const winRes = await signInWithMetaMask({ storage, nowMs: 31_000 });
+      expect(winRes.walletAddress).toBe(winWallet.address);
+      expect(winRes.session.authMethod).toBe("metamask");
+
+      // Injected testing adapter without provider returns signer: null
+      const adapterAddr = Wallet.createRandom().address as Address;
+      setMetaMaskAdapterForTesting({
+        connect: vi.fn().mockResolvedValue({ address: adapterAddr })
+      });
+      const adapterRes = await signInWithMetaMask({ storage, nowMs: 32_000 });
+      expect(adapterRes.walletAddress).toBe(adapterAddr);
+      expect(adapterRes.signer).toBeNull();
+      expect(adapterRes.session.authMethod).toBe("metamask");
+
+      // Explicit options.adapter overrides testing adapter
+      const overrideAddr = Wallet.createRandom().address as Address;
+      const overrideRes = await signInWithMetaMask({
+        storage,
+        nowMs: 33_000,
+        adapter: {
+          connect: vi.fn().mockResolvedValue({ address: overrideAddr })
+        }
+      });
+      expect(overrideRes.walletAddress).toBe(overrideAddr);
+    });
+
+    it("throws AuthError when MetaMask is unavailable, rejected, or returns invalid/zero address without saving session", async () => {
+      const backend = new MemoryBackend();
+      const storage = new AuthSessionStorage(testSecret, backend);
+
+      delete (globalThis as GlobalWithWalletMocks).ethereum;
+      delete (globalThis as GlobalWithWalletMocks).window;
+
+      await expect(signInWithMetaMask({ storage })).rejects.toThrow(
+        /MetaMask provider is unavailable/
+      );
+
+      // User rejects eth_requestAccounts
+      (globalThis as GlobalWithWalletMocks).ethereum = {
+        request: vi.fn().mockRejectedValue("User rejected the request")
+      };
+      await expect(signInWithMetaMask({ storage })).rejects.toThrow(
+        /User rejected the request/
+      );
+
+      // Empty array / non-string / invalid address / zero address
+      for (const accountsReturn of [
+        [],
+        ["not-an-evm-address"],
+        ["0x0000000000000000000000000000000000000000"]
+      ]) {
+        (globalThis as GlobalWithWalletMocks).ethereum = {
+          request: vi.fn().mockResolvedValue(accountsReturn)
+        };
+        await expect(signInWithMetaMask({ storage })).rejects.toThrow(
+          /MetaMask did not return a valid EVM wallet address/
+        );
+      }
+
+      // Adapter error & invalid address
+      await expect(
+        signInWithMetaMask({
+          storage,
+          adapter: {
+            connect: vi.fn().mockRejectedValue(new Error("Bridge timeout"))
+          }
+        })
+      ).rejects.toThrow(/Bridge timeout/);
+
+      await expect(
+        signInWithMetaMask({
+          storage,
+          adapter: {
+            connect: vi.fn().mockResolvedValue({
+              address: "0x0000000000000000000000000000000000000000"
+            })
+          }
+        })
+      ).rejects.toThrow(AuthError);
+
+      expect(await getPersistedAuthSession(storage)).toBeNull();
     });
   });
 
-  describe("signOutSession data preservation", () => {
-    it("clears ONLY auth session while preserving wallet key, vault secret, biometrics, and governance config", async () => {
+  describe("signInWithWalletConnect", () => {
+    it("connects when EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID is set + adapter succeeds, persists 'walletconnect' session, and signs EIP-712 typed data", async () => {
+      const backend = new MemoryBackend();
+      const storage = new AuthSessionStorage(testSecret, backend);
+      process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = "wc-project-999";
+
+      const wcWallet = Wallet.createRandom();
+      const capturedPayloads: string[] = [];
+      const wcProvider = createWalletBackedEip1193Provider(
+        wcWallet,
+        capturedPayloads
+      );
+      const connectMock = vi.fn().mockResolvedValue({
+        address: wcWallet.address,
+        provider: wcProvider
+      });
+      setWalletConnectAdapterForTesting({
+        connect: connectMock
+      });
+
+      const result = await signInWithWalletConnect({
+        storage,
+        nowMs: 40_000
+      });
+
+      expect(connectMock).toHaveBeenCalledWith("wc-project-999");
+      expect(result.mode).toBe("live");
+      expect(result.oauthUrl).toBeNull();
+      expect(result.wallet).toBeNull();
+      expect(result.walletAddress).toBe(wcWallet.address);
+      expect(result.signer).not.toBeNull();
+      expect(result.session).toEqual({
+        authMethod: "walletconnect",
+        accountId: wcWallet.address,
+        displayLabel: `WalletConnect (${formatShortAddress(wcWallet.address)})`,
+        walletAddress: wcWallet.address as Address,
+        signedInAtMs: 40_000
+      });
+      expect(await getPersistedAuthSession(storage)).toEqual(result.session);
+
+      const proof: WorkoutProof = {
+        user: result.walletAddress,
+        telemetryHash: sampleTelemetryHash,
+        streakCount: 14n,
+        nonce: 7n,
+        deadline: 1_960_000_000n
+      };
+      const signed = await signWorkoutProof(
+        result.signer!,
+        proof,
+        sampleContractAddress
+      );
+      expect(verifyWorkoutProofSignature(signed, sampleContractAddress)).toBe(
+        true
+      );
+      expect(capturedPayloads).toHaveLength(1);
+
+      // Adapter without EIP-1193 provider returns signer: null
+      const noProviderAddr = Wallet.createRandom().address as Address;
+      const noProviderRes = await signInWithWalletConnect({
+        storage,
+        projectId: "explicit-wc-id",
+        adapter: {
+          connect: vi.fn().mockResolvedValue({ address: noProviderAddr })
+        }
+      });
+      expect(noProviderRes.walletAddress).toBe(noProviderAddr);
+      expect(noProviderRes.signer).toBeNull();
+    });
+
+    it("throws AuthError when Project ID is unset, adapter unavailable, rejected, or returns invalid/zero address", async () => {
+      const backend = new MemoryBackend();
+      const storage = new AuthSessionStorage(testSecret, backend);
+
+      // Unset project ID
+      delete process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
+      await expect(signInWithWalletConnect({ storage })).rejects.toThrow(
+        /WalletConnect Project ID is not configured/
+      );
+
+      // Configured project ID but no adapter
+      process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = "wc-project-123";
+      await expect(signInWithWalletConnect({ storage })).rejects.toThrow(
+        /WalletConnect v2 provider is unavailable/
+      );
+
+      // Adapter rejects with Error and AuthError
+      await expect(
+        signInWithWalletConnect({
+          storage,
+          adapter: {
+            connect: vi.fn().mockRejectedValue(new Error("Relay declined"))
+          }
+        })
+      ).rejects.toThrow(/Relay declined/);
+      await expect(
+        signInWithWalletConnect({
+          storage,
+          adapter: {
+            connect: vi.fn().mockRejectedValue(new AuthError("QR expired"))
+          }
+        })
+      ).rejects.toThrow(/QR expired/);
+
+      // Invalid / zero address
+      for (const badAddress of [
+        "bad-address",
+        "0x0000000000000000000000000000000000000000"
+      ]) {
+        await expect(
+          signInWithWalletConnect({
+            storage,
+            projectId: "explicit-project-id",
+            adapter: {
+              connect: vi.fn().mockResolvedValue({ address: badAddress })
+            }
+          })
+        ).rejects.toThrow(/WalletConnect did not return a valid EVM wallet address/);
+      }
+
+      expect(await getPersistedAuthSession(storage)).toBeNull();
+    });
+  });
+
+  describe("signOutSession data preservation & WalletConnect disconnect", () => {
+    it("disconnects WalletConnect & Supabase non-fatally and clears ONLY auth session while preserving wallet key, vault secret, biometrics, and governance config", async () => {
       const keyStore = new InMemoryKeyStore();
       const backend = new MemoryBackend();
       const secret = await provisionVaultSecret(keyStore);
@@ -508,19 +1208,30 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       const governance = new GovernanceStorage(secret, backend);
       await governance.saveGovernanceConfig(DEFAULT_GOVERNANCE_CONFIG);
 
-      const signOutMock = vi.fn().mockRejectedValue(new Error("Offline signout"));
+      const disconnectMock = vi
+        .fn()
+        .mockRejectedValue(new Error("Relay already closed"));
+      setWalletConnectAdapterForTesting({
+        connect: vi.fn(),
+        disconnect: disconnectMock
+      });
+
+      const signOutMock = vi
+        .fn()
+        .mockRejectedValue(new Error("Offline signout"));
       setSupabaseClient({
         auth: { signOut: signOutMock }
       } as unknown as SupabaseClient);
 
-      const signedIn = await continueWithWallet({
+      const signedIn = await startLocalSession({
         keyStore,
         storage,
-        nowMs: 40_000
+        nowMs: 50_000
       });
       expect(await getPersistedAuthSession(storage)).toEqual(signedIn.session);
 
       await signOutSession({ storage });
+      expect(disconnectMock).toHaveBeenCalledTimes(1);
       expect(signOutMock).toHaveBeenCalledTimes(1);
 
       // Session is cleared
@@ -530,13 +1241,17 @@ describe("Auth Service, Wallet Identity & Encrypted Session Storage", () => {
       // Wallet, vault secret, biometrics, and governance config are completely preserved
       expect(await keyStore.getItem(VAULT_SECRET_STORAGE_KEY)).toBe(secret);
       expect(await keyStore.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
-        signedIn.wallet.privateKey
+        signedIn.wallet!.privateKey
       );
       expect((await getStoredWallet(keyStore))?.address).toBe(
-        signedIn.wallet.address
+        signedIn.walletAddress
       );
-      expect(backend.items.has(ADAPTIVE_STORAGE_KEYS.USER_BIOMETRICS)).toBe(true);
-      expect(await adaptive.getUserBiometrics()).toEqual(DEFAULT_BASELINE_BIOMETRICS);
+      expect(backend.items.has(ADAPTIVE_STORAGE_KEYS.USER_BIOMETRICS)).toBe(
+        true
+      );
+      expect(await adaptive.getUserBiometrics()).toEqual(
+        DEFAULT_BASELINE_BIOMETRICS
+      );
       expect(backend.items.has(GOVERNANCE_STORAGE_KEY)).toBe(true);
       expect(await governance.getGovernanceConfig()).toEqual(
         DEFAULT_GOVERNANCE_CONFIG

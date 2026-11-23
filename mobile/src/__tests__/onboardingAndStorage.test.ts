@@ -702,10 +702,18 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
       });
     });
 
-    describe("'Skip for Now' Action Handler", () => {
-      it("bypasses inputs, initializes DEFAULT_BASELINE_BIOMETRICS, generates plan, and triggers callback", async () => {
-        const onCompleteMock = vi.fn();
+    describe("Mandatory Onboarding Completion & Deterministic Plan Generation", () => {
+      it("requires valid biometrics and initializes encrypted baseline biometrics & 14-day plan", async () => {
+        const invalidValidation = validateOnboardingInputs({
+          ageStr: "",
+          weightStr: "",
+          heightStr: "",
+          weeklyWorkoutFrequency: 3
+        });
+        expect(invalidValidation.isValid).toBe(false);
+        expect(invalidValidation.biometrics).toBeUndefined();
 
+        const onCompleteMock = vi.fn();
         const bio = DEFAULT_BASELINE_BIOMETRICS;
         const plan = generate14DayPlan(bio, Date.now(), null);
         await saveUserBiometrics(bio);
@@ -721,7 +729,7 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
         expect(savedPlan?.targetDailyCalories).toBe(plan.targetDailyCalories);
       });
 
-      it("skip action produces idempotent baseline state on multiple calls", async () => {
+      it("produces idempotent baseline plan output for identical baseline biometrics and start timestamp", () => {
         const plan1 = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, 1700000000000, null);
         const plan2 = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, 1700000000000, null);
 
