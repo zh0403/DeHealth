@@ -1,6 +1,8 @@
 import { Address } from "@dehealth/shared";
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
+import { formatShortAddress } from "../services/authService";
+import { copyWalletAddressToClipboard } from "./ErrorNoticeModal";
 
 export interface StreakFlameHeaderProps {
   readonly userAddress: Address;
@@ -9,6 +11,7 @@ export interface StreakFlameHeaderProps {
   readonly isFatigueScaled: boolean;
   readonly fitnessTier?: string;
   readonly onOpenPerksDrawer?: () => void;
+  readonly onCopyWalletAddress?: (address: string) => Promise<void> | void;
 }
 
 export const StreakFlameHeader: React.FC<StreakFlameHeaderProps> = ({
@@ -17,11 +20,59 @@ export const StreakFlameHeader: React.FC<StreakFlameHeaderProps> = ({
   tokenBalanceDht,
   isFatigueScaled,
   fitnessTier,
-  onOpenPerksDrawer
+  onOpenPerksDrawer,
+  onCopyWalletAddress
 }) => {
+  const [isAddressCopied, setIsAddressCopied] = useState<boolean>(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isMountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+        copyTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopyWalletAddress = async (): Promise<void> => {
+    const copied = await copyWalletAddressToClipboard(userAddress);
+    let customCopied = false;
+    if (onCopyWalletAddress) {
+      try {
+        await Promise.resolve(onCopyWalletAddress(userAddress));
+        customCopied = true;
+      } catch {
+        customCopied = false;
+      }
+    }
+
+    if (!isMountedRef.current) {
+      return;
+    }
+
+    if (copied || customCopied) {
+      setIsAddressCopied(true);
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = setTimeout(() => {
+        if (isMountedRef.current) {
+          setIsAddressCopied(false);
+        }
+        copyTimerRef.current = null;
+      }, 2500);
+    } else {
+      setIsAddressCopied(false);
+    }
+  };
+
   return (
     <View style={styles.headerContainer}>
-      {/* Top Bar: Brand, DHT Token Capsule & Wallet Chip */}
+      {/* Top Bar: Brand, DHT Token Capsule & 1-Tap Copyable Wallet Pill */}
       <View style={styles.topRow}>
         <View style={styles.brandGroup}>
           <Text style={styles.brandIcon}>⚡</Text>
@@ -44,10 +95,32 @@ export const StreakFlameHeader: React.FC<StreakFlameHeaderProps> = ({
             <Text style={styles.perkArrow}>›</Text>
           </Pressable>
 
-          {/* User Address Chip */}
-          <Text style={styles.walletChip} numberOfLines={1} ellipsizeMode="middle">
-            {userAddress}
-          </Text>
+          {/* 1-Tap Copyable Wallet Address Pill */}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Copy Wallet Address"
+            testID="header-wallet-copy-pill"
+            style={({ pressed }) => [
+              styles.walletCopyPill,
+              isAddressCopied ? styles.walletCopyPillCopied : null,
+              pressed ? styles.walletCopyPillPressed : null
+            ]}
+            onPress={() => {
+              void handleCopyWalletAddress();
+            }}
+          >
+            <Text style={styles.walletCopyAddressText}>
+              {formatShortAddress(userAddress)}
+            </Text>
+            <Text
+              style={[
+                styles.walletCopyBadgeText,
+                isAddressCopied ? styles.walletCopyBadgeCopiedText : null
+              ]}
+            >
+              {isAddressCopied ? "Copied ✓" : "Copy"}
+            </Text>
+          </Pressable>
         </View>
       </View>
 
@@ -152,16 +225,37 @@ const styles = StyleSheet.create({
     fontWeight: "700",
     marginLeft: 1
   },
-  walletChip: {
-    maxWidth: 96,
-    fontSize: 11,
-    fontFamily: "monospace",
-    color: "#94A3B8",
+  walletCopyPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
     backgroundColor: "#161F30",
-    paddingHorizontal: 7,
+    paddingHorizontal: 8,
     paddingVertical: 4,
     borderRadius: 999,
-    overflow: "hidden"
+    borderWidth: 1,
+    borderColor: "#1E293B"
+  },
+  walletCopyPillCopied: {
+    borderColor: "#10B981",
+    backgroundColor: "#052E16"
+  },
+  walletCopyPillPressed: {
+    opacity: 0.78
+  },
+  walletCopyAddressText: {
+    fontSize: 11,
+    fontFamily: "monospace",
+    fontWeight: "700",
+    color: "#38BDF8"
+  },
+  walletCopyBadgeText: {
+    fontSize: 10,
+    fontWeight: "800",
+    color: "#94A3B8"
+  },
+  walletCopyBadgeCopiedText: {
+    color: "#34D399"
   },
   gamificationRow: {
     flexDirection: "row",

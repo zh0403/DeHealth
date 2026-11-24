@@ -9,9 +9,13 @@ import {
   AbstractSigner,
   hexlify,
   Provider,
+  resolveAddress,
+  Signature,
   Signer,
+  toBeHex,
   toUtf8Bytes,
   TransactionRequest,
+  TransactionResponse,
   TypedDataDomain,
   TypedDataEncoder,
   TypedDataField,
@@ -160,6 +164,7 @@ export interface GoogleSignInOptions {
   readonly localDisplayLabel?: string;
   readonly verifyOAuthCallback?: () => Promise<void>;
   readonly browserAdapter?: OAuthBrowserAdapter | null;
+  readonly dismissGraceMs?: number;
   readonly nowMs?: number;
 }
 
@@ -183,6 +188,9 @@ let customWalletConnectAdapter: WalletConnectAdapter | null | undefined =
 let customOAuthBrowserAdapter: OAuthBrowserAdapter | null | undefined = undefined;
 let customUniversalProviderFactory: UniversalProviderFactory | null | undefined =
   undefined;
+let customUniversalProviderModuleLoader:
+  | (() => Promise<unknown>)
+  | undefined = undefined;
 let customDeepLinkOpener: DeepLinkOpener | undefined = undefined;
 let activeUniversalProvider: UniversalProviderLike | null = null;
 let activeUniversalProviderProjectId: string | null = null;
@@ -239,6 +247,8 @@ export function resetOAuthBrowserAdapterForTesting(): void {
   customOAuthBrowserAdapter = undefined;
   pendingGoogleOAuthAttempt = false;
   activeGoogleSignInCalls = 0;
+  oauthCallbackGeneration = 0;
+  oauthCallbackActivityWaiters.clear();
   inFlightOAuthExchanges.clear();
   completedOAuthExchanges.clear();
 }
@@ -261,6 +271,22 @@ export function resetUniversalProviderFactoryForTesting(): void {
   customUniversalProviderFactory = undefined;
   activeUniversalProvider = null;
   activeUniversalProviderProjectId = null;
+}
+
+/**
+ * Injects a custom module loader for `@walletconnect/universal-provider` tests.
+ */
+export function setUniversalProviderModuleLoaderForTesting(
+  loader: (() => Promise<unknown>) | undefined
+): void {
+  customUniversalProviderModuleLoader = loader;
+}
+
+/**
+ * Restores default `@walletconnect/universal-provider` module resolution.
+ */
+export function resetUniversalProviderModuleLoaderForTesting(): void {
+  customUniversalProviderModuleLoader = undefined;
 }
 
 /**
@@ -402,6 +428,140 @@ class Eip1193TypedDataSigner extends AbstractSigner {
     throw new AuthError(
       "External EIP-1193 wallets do not support raw offline signTransaction."
     );
+  }
+
+  override async sendTransaction(
+    tx: TransactionRequest
+  ): Promise<TransactionResponse> {
+    const resolvedTo =
+      typeof tx.to === "string"
+        ? tx.to
+        : tx.to !== undefined && tx.to !== null
+          ? await resolveAddress(tx.to, this.provider)
+          : undefined;
+    const txData =
+      typeof tx.data === "string" && tx.data.trim().length > 0
+        ? tx.data.trim()
+        : undefined;
+
+    const rpcTxParams: Record<string, string> = {
+      from: this.walletAddress
+    };
+    if (resolvedTo) {
+      rpcTxParams.to = resolvedTo;
+    }
+    if (txData) {
+      rpcTxParams.data = txData;
+    }
+    if (tx.value !== undefined && tx.value !== null) {
+      rpcTxParams.value = toBeHex(tx.value);
+    }
+    if (tx.gasLimit !== undefined && tx.gasLimit !== null) {
+      rpcTxParams.gas = toBeHex(tx.gasLimit);
+    }
+    if (tx.gasPrice !== undefined && tx.gasPrice !== null) {
+      rpcTxParams.gasPrice = toBeHex(tx.gasPrice);
+    }
+    if (tx.maxFeePerGas !== undefined && tx.maxFeePerGas !== null) {
+      rpcTxParams.maxFeePerGas = toBeHex(tx.maxFeePerGas);
+    }
+    if (
+      tx.maxPriorityFeePerGas !== undefined &&
+      tx.maxPriorityFeePerGas !== null
+    ) {
+      rpcTxParams.maxPriorityFeePerGas = toBeHex(tx.maxPriorityFeePerGas);
+    }
+    if (tx.nonce !== undefined && tx.nonce !== null) {
+      rpcTxParams.nonce = toBeHex(tx.nonce);
+    }
+    if (tx.chainId !== undefined && tx.chainId !== null) {
+      rpcTxParams.chainId = toBeHex(tx.chainId);
+    }
+
+    let rawHash: unknown;
+    try {
+      rawHash = await this.eip1193Provider.request({
+        method: "eth_sendTransaction",
+        params: [rpcTxParams]
+      });
+    } catch (err) {
+      if (err instanceof AuthError) {
+        throw err;
+      }
+      throw new AuthError(
+        toAuthErrorMessage(
+          err,
+          "External wallet transaction submission was rejected."
+        )
+      );
+    }
+
+    if (
+      typeof rawHash !== "string" ||
+      !/^0x[0-9a-fA-F]{64}$/.test(rawHash.trim())
+    ) {
+      throw new AuthError(
+        "External wallet did not return a valid transaction hash."
+      );
+    }
+    const txHash = rawHash.trim();
+
+    const attachedProvider = this.provider;
+    const responseProvider =
+      attachedProvider ??
+      ({
+        waitForTransaction: async () => null
+      } as unknown as Provider);
+
+    const response = new TransactionResponse(
+      {
+        hash: txHash,
+        blockNumber: null,
+        blockHash: null,
+        index: 0,
+        type: tx.type ?? 2,
+        to: resolvedTo ?? null,
+        from: this.walletAddress,
+        nonce: typeof tx.nonce === "number" ? tx.nonce : 0,
+        gasLimit: tx.gasLimit != null ? BigInt(tx.gasLimit) : 0n,
+        gasPrice: tx.gasPrice != null ? BigInt(tx.gasPrice) : 0n,
+        maxPriorityFeePerGas:
+          tx.maxPriorityFeePerGas != null
+            ? BigInt(tx.maxPriorityFeePerGas)
+            : null,
+        maxFeePerGas:
+          tx.maxFeePerGas != null ? BigInt(tx.maxFeePerGas) : null,
+        maxFeePerBlobGas: null,
+        data: txData ?? "0x",
+        value: tx.value != null ? BigInt(tx.value) : 0n,
+        chainId: tx.chainId != null ? BigInt(tx.chainId) : 421614n,
+        signature: Signature.from({
+          r: `0x${"00".repeat(32)}`,
+          s: `0x${"00".repeat(32)}`,
+          v: 27
+        }),
+        accessList: null,
+        authorizationList: null
+      },
+      responseProvider
+    );
+
+    if (attachedProvider) {
+      response.wait = async (confirms?: number, timeout?: number) => {
+        if (typeof attachedProvider.waitForTransaction === "function") {
+          return attachedProvider.waitForTransaction(
+            txHash,
+            confirms ?? 1,
+            timeout
+          );
+        }
+        return null;
+      };
+    } else {
+      response.wait = async () => null;
+    }
+
+    return response;
   }
 
   async signMessage(message: string | Uint8Array): Promise<string> {
@@ -617,6 +777,8 @@ export function resetAuthSessionStorage(): void {
   authInitPromise = null;
   pendingGoogleOAuthAttempt = false;
   activeGoogleSignInCalls = 0;
+  oauthCallbackGeneration = 0;
+  oauthCallbackActivityWaiters.clear();
   inFlightOAuthExchanges.clear();
   completedOAuthExchanges.clear();
 }
@@ -703,6 +865,7 @@ export async function startLocalSession(
 }
 
 const DEFAULT_OAUTH_REDIRECT_URI = "dehealth://auth-callback";
+const DEFAULT_OAUTH_DISMISS_GRACE_MS = 1_500;
 const ARBITRUM_SEPOLIA_CAIP2 = "eip155:421614";
 const BOOT_RESTORE_TIMEOUT_MS = 2_500;
 const DEHEALTH_WALLETCONNECT_METADATA = {
@@ -739,31 +902,63 @@ async function resolveOAuthBrowserAdapter(
   }
   try {
     const mod: unknown = await import("expo-web-browser");
-    return isOAuthBrowserAdapterLike(mod) ? mod : null;
+    if (isOAuthBrowserAdapterLike(mod)) {
+      return mod;
+    }
+  } catch {
+    // Fall through to CommonJS require for Metro bundler environments
+  }
+  try {
+    if (typeof require === "function") {
+      const cjsMod: unknown = require("expo-web-browser");
+      return isOAuthBrowserAdapterLike(cjsMod) ? cjsMod : null;
+    }
   } catch {
     return null;
   }
+  return null;
 }
 
 /**
  * Resolves the platform OAuth redirect URI using `expo-auth-session` with custom
- * scheme `"dehealth"` (`dehealth://auth-callback` on native fallback).
+ * scheme `"dehealth"`, normalizing standalone/dev builds to `dehealth://auth-callback`
+ * and Expo Go URLs without trailing slash mismatches.
  */
 export async function resolveGoogleOAuthRedirectUri(): Promise<string> {
+  interface AuthSessionModuleShape {
+    readonly makeRedirectUri?: (options?: {
+      readonly scheme?: string;
+      readonly path?: string;
+      readonly native?: string;
+    }) => string;
+  }
+
+  let authSessionMod: AuthSessionModuleShape | null = null;
   try {
-    const authSessionMod = (await import("expo-auth-session")) as {
-      makeRedirectUri?: (options?: {
-        readonly scheme?: string;
-        readonly path?: string;
-      }) => string;
-    };
-    if (typeof authSessionMod.makeRedirectUri === "function") {
+    authSessionMod = (await import("expo-auth-session")) as AuthSessionModuleShape;
+  } catch {
+    try {
+      if (typeof require === "function") {
+        authSessionMod = require("expo-auth-session") as AuthSessionModuleShape;
+      }
+    } catch {
+      authSessionMod = null;
+    }
+  }
+
+  try {
+    if (authSessionMod && typeof authSessionMod.makeRedirectUri === "function") {
       const uri = authSessionMod.makeRedirectUri({
         scheme: "dehealth",
-        path: "auth-callback"
+        path: "auth-callback",
+        native: DEFAULT_OAUTH_REDIRECT_URI
       });
       if (typeof uri === "string" && uri.trim().length > 0) {
-        return uri.trim();
+        const trimmed = uri.trim().replace(/\/+$/, "");
+        if (trimmed.startsWith("dehealth:///")) {
+          return `dehealth://${trimmed.slice("dehealth:///".length)}`;
+        }
+        return trimmed;
       }
     }
   } catch {
@@ -823,8 +1018,16 @@ function parseOAuthCallbackParams(
 
 const inFlightOAuthExchanges = new Map<string, Promise<boolean>>();
 const completedOAuthExchanges = new Set<string>();
+const oauthCallbackActivityWaiters = new Set<() => void>();
+let oauthCallbackGeneration = 0;
 let pendingGoogleOAuthAttempt = false;
 let activeGoogleSignInCalls = 0;
+
+function notifyOAuthCallbackActivity(): void {
+  for (const notify of Array.from(oauthCallbackActivityWaiters)) {
+    notify();
+  }
+}
 
 /**
  * Returns true while a user-initiated Google OAuth flow is awaiting redirect
@@ -937,6 +1140,8 @@ export async function completeOAuthRedirectCallback(
       );
     }
     completedOAuthExchanges.add(dedupKey);
+    oauthCallbackGeneration += 1;
+    notifyOAuthCallbackActivity();
     return true;
   })();
 
@@ -945,7 +1150,73 @@ export async function completeOAuthRedirectCallback(
     return await runExchange;
   } finally {
     inFlightOAuthExchanges.delete(dedupKey);
+    notifyOAuthCallbackActivity();
   }
+}
+
+async function waitForOAuthDismissRecovery(
+  client: NonNullable<ReturnType<typeof getSupabaseClient>>,
+  baselineCallbackGeneration: number,
+  graceMs: number
+): Promise<boolean> {
+  const awaitInFlight = async (): Promise<void> => {
+    if (inFlightOAuthExchanges.size === 0) {
+      return;
+    }
+    const settled = await Promise.allSettled(
+      Array.from(inFlightOAuthExchanges.values())
+    );
+    for (const item of settled) {
+      if (item.status === "rejected") {
+        throw item.reason;
+      }
+    }
+  };
+
+  await awaitInFlight();
+  if (oauthCallbackGeneration > baselineCallbackGeneration) {
+    return true;
+  }
+
+  if (graceMs > 0) {
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = (): void => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        oauthCallbackActivityWaiters.delete(onActivity);
+        resolve();
+      };
+      const onActivity = (): void => {
+        finish();
+      };
+      oauthCallbackActivityWaiters.add(onActivity);
+      const timer = setTimeout(finish, graceMs);
+    });
+  }
+
+  await awaitInFlight();
+  if (oauthCallbackGeneration > baselineCallbackGeneration) {
+    return true;
+  }
+
+  if (typeof client.auth?.getUser === "function") {
+    try {
+      const userCheck = await client.auth.getUser();
+      if (
+        !userCheck?.error &&
+        userCheck?.data?.user &&
+        typeof userCheck.data.user.id === "string" &&
+        userCheck.data.user.id.trim().length > 0
+      ) {
+        return true;
+      }
+    } catch {
+      // No verified user yet; caller will treat as cancelled
+    }
+  }
+  return false;
 }
 
 /**
@@ -1118,6 +1389,7 @@ export async function signInWithGoogle(
         options?.browserAdapter
       );
       if (browserAdapter) {
+        const baselineCallbackGen = oauthCallbackGeneration;
         let browserResult: OAuthBrowserSessionResult;
         try {
           browserResult = await browserAdapter.openAuthSessionAsync(
@@ -1136,14 +1408,20 @@ export async function signInWithGoogle(
           );
         }
 
-        if (
-          browserResult.type === "cancel" ||
-          browserResult.type === "dismiss"
-        ) {
+        if (browserResult.type === "cancel") {
           throw new AuthError("Google sign-in was cancelled.");
         }
 
-        if (
+        if (browserResult.type === "dismiss") {
+          const recovered = await waitForOAuthDismissRecovery(
+            client,
+            baselineCallbackGen,
+            options?.dismissGraceMs ?? DEFAULT_OAUTH_DISMISS_GRACE_MS
+          );
+          if (!recovered) {
+            throw new AuthError("Google sign-in was cancelled.");
+          }
+        } else if (
           browserResult.type !== "success" &&
           browserResult.type !== "opened"
         ) {
@@ -1200,6 +1478,73 @@ export function buildMetaMaskWalletConnectDeepLink(wcUri: string): string {
   return `https://metamask.app.link/wc?uri=${encodeURIComponent(wcUri)}`;
 }
 
+interface UniversalProviderModuleShape {
+  readonly init?: (
+    opts: UniversalProviderInitOptions
+  ) => Promise<UniversalProviderLike>;
+  readonly default?: {
+    readonly init?: (
+      opts: UniversalProviderInitOptions
+    ) => Promise<UniversalProviderLike>;
+  };
+  readonly UniversalProvider?: {
+    readonly init?: (
+      opts: UniversalProviderInitOptions
+    ) => Promise<UniversalProviderLike>;
+  };
+}
+
+async function loadUniversalProviderModule(): Promise<UniversalProviderModuleShape> {
+  if (customUniversalProviderModuleLoader !== undefined) {
+    return (await customUniversalProviderModuleLoader()) as UniversalProviderModuleShape;
+  }
+
+  let importErr: unknown = null;
+  try {
+    const imported = (await import(
+      "@walletconnect/universal-provider"
+    )) as UniversalProviderModuleShape;
+    if (
+      typeof (
+        imported?.UniversalProvider?.init ??
+        imported?.default?.init ??
+        imported?.init
+      ) === "function"
+    ) {
+      return imported;
+    }
+  } catch (err) {
+    importErr = err;
+  }
+
+  try {
+    if (typeof require === "function") {
+      return require(
+        "@walletconnect/universal-provider"
+      ) as UniversalProviderModuleShape;
+    }
+  } catch (reqErr) {
+    throw new AuthError(
+      `WalletConnect v2 module failed to load: ${toAuthErrorMessage(
+        reqErr ?? importErr,
+        "Unable to load @walletconnect/universal-provider."
+      )}`
+    );
+  }
+
+  if (importErr !== null) {
+    throw new AuthError(
+      `WalletConnect v2 module failed to load: ${toAuthErrorMessage(
+        importErr,
+        "Unable to load @walletconnect/universal-provider."
+      )}`
+    );
+  }
+  throw new AuthError(
+    "WalletConnect v2 module is missing UniversalProvider.init."
+  );
+}
+
 async function createOrReuseUniversalProvider(
   projectId: string
 ): Promise<UniversalProviderLike | null> {
@@ -1227,27 +1572,26 @@ async function createOrReuseUniversalProvider(
     try {
       await import("@walletconnect/react-native-compat");
     } catch {
-      // Non-fatal if shims already installed via polyfills
+      try {
+        if (typeof require === "function") {
+          require("@walletconnect/react-native-compat");
+        }
+      } catch {
+        // Non-fatal if shims already installed via polyfills
+      }
     }
   }
 
+  const mod = await loadUniversalProviderModule();
+  const initFn =
+    mod?.UniversalProvider?.init ?? mod?.default?.init ?? mod?.init;
+  if (typeof initFn !== "function") {
+    throw new AuthError(
+      "WalletConnect v2 module failed to load: UniversalProvider.init is unavailable."
+    );
+  }
+
   try {
-    const mod = (await import("@walletconnect/universal-provider")) as {
-      readonly default?: {
-        readonly init?: (
-          opts: UniversalProviderInitOptions
-        ) => Promise<UniversalProviderLike>;
-      };
-      readonly UniversalProvider?: {
-        readonly init?: (
-          opts: UniversalProviderInitOptions
-        ) => Promise<UniversalProviderLike>;
-      };
-    };
-    const initFn = mod.UniversalProvider?.init ?? mod.default?.init;
-    if (typeof initFn !== "function") {
-      return null;
-    }
     const instance = await initFn({
       projectId,
       metadata: DEHEALTH_WALLETCONNECT_METADATA
@@ -1255,8 +1599,16 @@ async function createOrReuseUniversalProvider(
     activeUniversalProvider = instance;
     activeUniversalProviderProjectId = projectId;
     return instance;
-  } catch {
-    return null;
+  } catch (err) {
+    if (err instanceof AuthError) {
+      throw err;
+    }
+    throw new AuthError(
+      `WalletConnect v2 initialization failed: ${toAuthErrorMessage(
+        err,
+        "Unable to initialize WalletConnect v2 session provider."
+      )}`
+    );
   }
 }
 
@@ -1771,6 +2123,8 @@ export async function signOutSession(options?: {
 
   pendingGoogleOAuthAttempt = false;
   activeGoogleSignInCalls = 0;
+  oauthCallbackGeneration = 0;
+  oauthCallbackActivityWaiters.clear();
   inFlightOAuthExchanges.clear();
   completedOAuthExchanges.clear();
   await clearPersistedAuthSession(options?.storage);

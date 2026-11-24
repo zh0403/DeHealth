@@ -434,7 +434,8 @@ function isValidSigner(signer: Signer | null | undefined): signer is Signer {
     signer !== null &&
     signer !== undefined &&
     typeof signer.getAddress === "function" &&
-    typeof signer.signTypedData === "function"
+    typeof signer.signTypedData === "function" &&
+    typeof signer.sendTransaction === "function"
   );
 }
 
