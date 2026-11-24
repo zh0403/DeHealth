@@ -39,7 +39,9 @@ import {
   resetMetaMaskAdapterForTesting,
   resetOAuthBrowserAdapterForTesting,
   resetUniversalProviderFactoryForTesting,
+  resetUniversalProviderModuleLoaderForTesting,
   resetWalletConnectAdapterForTesting,
+  resolveGoogleOAuthRedirectUri,
   restoreExternalWalletSignerOnBoot,
   savePersistedAuthSession,
   setAuthSessionStorage,
@@ -48,6 +50,7 @@ import {
   setOAuthBrowserAdapterForTesting,
   setPendingGoogleOAuthAttemptForTesting,
   setUniversalProviderFactoryForTesting,
+  setUniversalProviderModuleLoaderForTesting,
   setWalletConnectAdapterForTesting,
   signInWithGoogle,
   signInWithMetaMask,
@@ -184,6 +187,7 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
     resetWalletConnectAdapterForTesting();
     resetOAuthBrowserAdapterForTesting();
     resetUniversalProviderFactoryForTesting();
+    resetUniversalProviderModuleLoaderForTesting();
     resetDeepLinkOpenerForTesting();
 
     originalWcProjectId = process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID;
@@ -205,6 +209,7 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
     resetWalletConnectAdapterForTesting();
     resetOAuthBrowserAdapterForTesting();
     resetUniversalProviderFactoryForTesting();
+    resetUniversalProviderModuleLoaderForTesting();
     resetDeepLinkOpenerForTesting();
 
     if (originalWcProjectId === undefined) {
@@ -969,6 +974,169 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       expect(await getStoredWallet(keyStore)).toBeNull();
       expect(await getPersistedAuthSession(storage)).toBeNull();
     });
+
+    it("recovers cleanly when Android WebBrowser dismisses during an in-flight or briefly delayed Linking PKCE callback, and resolves clean redirect URIs", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const storage = await initializeAuthSessionStorage(keyStore, backend);
+
+      expect(await resolveGoogleOAuthRedirectUri()).toBe(
+        "dehealth://auth-callback"
+      );
+
+      const exchangeCodeForSessionMock = vi.fn().mockResolvedValue({
+        data: { session: { access_token: "grace-pkce-at" } },
+        error: null
+      });
+      setSupabaseClient({
+        auth: {
+          signInWithOAuth: vi.fn().mockResolvedValue({
+            data: {
+              provider: "google",
+              url: "https://accounts.google.com/o/oauth2/v2/auth?dismiss-race=1"
+            },
+            error: null
+          }),
+          exchangeCodeForSession: exchangeCodeForSessionMock,
+          getUser: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: "supa-dismiss-race-1",
+                email: "android@dehealth.xyz"
+              }
+            },
+            error: null
+          })
+        }
+      } as unknown as SupabaseClient);
+
+      setOAuthBrowserAdapterForTesting({
+        openAuthSessionAsync: vi.fn().mockImplementation(async () => {
+          setTimeout(() => {
+            void handleIncomingOAuthRedirectUrl(
+              "dehealth://auth-callback?code=android-race-code",
+              { keyStore, storage, nowMs: 85_000 }
+            );
+          }, 15);
+          return { type: "dismiss" };
+        })
+      });
+
+      const recovered = await signInWithGoogle({
+        keyStore,
+        storage,
+        dismissGraceMs: 500,
+        nowMs: 85_000
+      });
+      expect(exchangeCodeForSessionMock).toHaveBeenCalledWith(
+        "android-race-code"
+      );
+      expect(recovered.session.authMethod).toBe("google");
+      expect(recovered.session.accountId).toBe("supa-dismiss-race-1");
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
+
+      // Genuine dismiss without any callback fails closed after grace period
+      setOAuthBrowserAdapterForTesting({
+        openAuthSessionAsync: vi.fn().mockResolvedValue({ type: "dismiss" })
+      });
+      setSupabaseClient({
+        auth: {
+          signInWithOAuth: vi.fn().mockResolvedValue({
+            data: {
+              provider: "google",
+              url: "https://accounts.google.com/o/oauth2/v2/auth?dismiss-empty=1"
+            },
+            error: null
+          }),
+          getUser: vi.fn().mockResolvedValue({
+            data: { user: null },
+            error: null
+          })
+        }
+      } as unknown as SupabaseClient);
+
+      await expect(
+        signInWithGoogle({
+          keyStore,
+          storage,
+          dismissGraceMs: 25
+        })
+      ).rejects.toThrow(/Google sign-in was cancelled/);
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
+    });
+  });
+
+  describe("OAuth dismiss recovery edge cases", () => {
+    function googleClient(overrides: {
+      exchange?: ReturnType<typeof vi.fn>;
+      getUser: ReturnType<typeof vi.fn>;
+    }): SupabaseClient {
+      return {
+        auth: {
+          signInWithOAuth: vi.fn().mockResolvedValue({
+            data: { provider: "google", url: "https://accounts.google.com/o/oauth2/v2/auth?edge=1" },
+            error: null
+          }),
+          exchangeCodeForSession:
+            overrides.exchange ??
+            vi.fn().mockResolvedValue({ data: {}, error: null }),
+          getUser: overrides.getUser
+        }
+      } as unknown as SupabaseClient;
+    }
+
+    it("surfaces a failing in-flight exchange instead of reporting a cancel", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const storage = await initializeAuthSessionStorage(keyStore, new MemoryBackend());
+      let rejectExchange!: (reason: unknown) => void;
+      const exchange = vi.fn().mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectExchange = reject;
+          })
+      );
+      setSupabaseClient(
+        googleClient({
+          exchange,
+          getUser: vi.fn().mockResolvedValue({ data: { user: null }, error: null })
+        })
+      );
+      setOAuthBrowserAdapterForTesting({
+        openAuthSessionAsync: vi.fn().mockImplementation(async () => {
+          void handleIncomingOAuthRedirectUrl(
+            "dehealth://auth-callback?code=failing-flight",
+            { keyStore, storage }
+          ).catch(() => undefined);
+          setTimeout(() => rejectExchange(new Error("exchange backend down")), 20);
+          return { type: "dismiss" };
+        })
+      });
+
+      await expect(
+        signInWithGoogle({ keyStore, storage, dismissGraceMs: 200 })
+      ).rejects.toThrow(/exchange backend down/);
+      expect(hasPendingGoogleOAuthAttempt()).toBe(false);
+    });
+
+    it("does not treat a dismiss as success when the user lookup reports an error", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const storage = await initializeAuthSessionStorage(keyStore, new MemoryBackend());
+      setSupabaseClient(
+        googleClient({
+          getUser: vi.fn().mockResolvedValue({
+            data: { user: { id: "stale-user" } },
+            error: { message: "jwt expired" }
+          })
+        })
+      );
+      setOAuthBrowserAdapterForTesting({
+        openAuthSessionAsync: vi.fn().mockResolvedValue({ type: "dismiss" })
+      });
+
+      await expect(
+        signInWithGoogle({ keyStore, storage, dismissGraceMs: 10 })
+      ).rejects.toThrow(/Google sign-in was cancelled/);
+    });
   });
 
   describe("createEip1193Signer", () => {
@@ -1076,6 +1244,111 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
           })
         ]
       });
+    });
+
+    it("submits transactions via eth_sendTransaction and supports wait() with and without attached RPC provider", async () => {
+      const senderAddr = Wallet.createRandom().address as Address;
+      const targetAddr = "0x3333333333333333333333333333333333333333" as Address;
+      const expectedTxHash = ("0x" + "de".repeat(32)) as Bytes32;
+      const fakeReceipt = { hash: expectedTxHash, status: 1 };
+
+      const requestSpy = vi.fn().mockResolvedValue(expectedTxHash);
+      const baseSigner = createEip1193Signer(senderAddr, {
+        request: requestSpy
+      });
+
+      // Unattached provider sendTransaction dispatches eth_sendTransaction with hex-encoded bigint fields
+      const unattachedTx = await baseSigner.sendTransaction({
+        to: targetAddr,
+        data: "0x1234",
+        value: 1000n,
+        gasLimit: 85_000n,
+        gasPrice: 100_000_000n,
+        nonce: 4,
+        chainId: 421614
+      });
+      expect(unattachedTx.hash).toBe(expectedTxHash);
+      expect(await unattachedTx.wait()).toBeNull();
+      expect(requestSpy).toHaveBeenCalledWith({
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from: senderAddr,
+            to: targetAddr,
+            data: "0x1234",
+            value: "0x03e8",
+            gas: "0x014c08",
+            gasPrice: "0x05f5e100",
+            nonce: "0x04",
+            chainId: "0x066eee"
+          }
+        ]
+      });
+
+      // Attached provider delegates .wait() to provider.waitForTransaction
+      const waitForTransaction = vi.fn().mockResolvedValue(fakeReceipt);
+      const connected = baseSigner.connect({
+        waitForTransaction
+      } as unknown as JsonRpcProvider);
+      const liveTx = await connected.sendTransaction({
+        to: targetAddr,
+        data: "0xdeadbeef"
+      });
+      expect(liveTx.hash).toBe(expectedTxHash);
+      expect(await liveTx.wait(1)).toEqual(fakeReceipt);
+      expect(waitForTransaction).toHaveBeenCalledWith(
+        expectedTxHash,
+        1,
+        undefined
+      );
+
+      // Invalid txHash or rejection wraps cleanly in AuthError
+      const badHashSigner = createEip1193Signer(senderAddr, {
+        request: vi.fn().mockResolvedValue("not-a-hash")
+      });
+      await expect(
+        badHashSigner.sendTransaction({ to: targetAddr })
+      ).rejects.toThrow(/valid transaction hash/);
+
+      const rejectedSigner = createEip1193Signer(senderAddr, {
+        request: vi.fn().mockRejectedValue({ message: "MetaMask Tx Rejected" })
+      });
+      await expect(
+        rejectedSigner.sendTransaction({ to: targetAddr })
+      ).rejects.toThrow(/MetaMask Tx Rejected/);
+    });
+
+    it("rejects malformed transaction hashes and hex-encodes EIP-1559 fee fields", async () => {
+      const senderAddr = Wallet.createRandom().address as Address;
+      const targetAddr = "0x3333333333333333333333333333333333333333" as Address;
+
+      for (const badHash of [
+        "0x1234",
+        "0x" + "zz".repeat(32),
+        "0x" + "ab".repeat(33)
+      ]) {
+        const signer = createEip1193Signer(senderAddr, {
+          request: vi.fn().mockResolvedValue(badHash)
+        });
+        await expect(
+          signer.sendTransaction({ to: targetAddr })
+        ).rejects.toThrow(/valid transaction hash/);
+      }
+
+      const okHash = "0x" + "ab".repeat(32);
+      const requestSpy = vi.fn().mockResolvedValue(okHash);
+      const feeSigner = createEip1193Signer(senderAddr, { request: requestSpy });
+      const tx = await feeSigner.sendTransaction({
+        to: targetAddr,
+        maxFeePerGas: 2_000_000_000n,
+        maxPriorityFeePerGas: 1_000_000_000n
+      });
+      expect(tx.hash).toBe(okHash);
+      const sent = requestSpy.mock.calls[0]![0] as {
+        params: Array<Record<string, string>>;
+      };
+      expect(sent.params[0]!.maxFeePerGas).toBe("0x77359400");
+      expect(sent.params[0]!.maxPriorityFeePerGas).toBe("0x3b9aca00");
     });
 
     it("wraps provider rejections and empty signatures into AuthError", async () => {
@@ -1521,6 +1794,55 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       expect(
         await restoreExternalWalletSignerOnBoot(mmRes.session)
       ).toBeNull();
+    });
+
+    it("loads UniversalProvider modules cleanly and surfaces specific initialization errors instead of generic unavailability", async () => {
+      const backend = new MemoryBackend();
+      const storage = new AuthSessionStorage(testSecret, backend);
+      process.env.EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID = "wc-mod-test-id";
+
+      const remoteWallet = Wallet.createRandom();
+      const listeners = new Map<string, (payload: string) => void>();
+      const mockProv: UniversalProviderLike = {
+        session: {
+          namespaces: {
+            eip155: { accounts: [`eip155:421614:${remoteWallet.address}`] }
+          }
+        },
+        on: (ev, cb) => {
+          listeners.set(ev, cb);
+        },
+        connect: vi.fn().mockResolvedValue(undefined),
+        request: vi.fn()
+      };
+      setDeepLinkOpenerForTesting(async () => undefined);
+
+      // Direct module init works cleanly
+      setUniversalProviderModuleLoaderForTesting(async () => ({
+        UniversalProvider: {
+          init: vi.fn().mockResolvedValue(mockProv)
+        }
+      }));
+      const okRes = await signInWithWalletConnect({ storage, nowMs: 90_000 });
+      expect(okRes.walletAddress).toBe(remoteWallet.address);
+
+      // Specific init() error is surfaced verbatim inside AuthError
+      resetUniversalProviderFactoryForTesting();
+      setUniversalProviderModuleLoaderForTesting(async () => ({
+        default: {
+          init: vi.fn().mockRejectedValue(new Error("Invalid Project ID 3000"))
+        }
+      }));
+      await expect(signInWithWalletConnect({ storage })).rejects.toThrow(
+        /WalletConnect v2 initialization failed: Invalid Project ID 3000/
+      );
+
+      // Missing init export surfaces descriptive AuthError
+      resetUniversalProviderFactoryForTesting();
+      setUniversalProviderModuleLoaderForTesting(async () => ({}));
+      await expect(signInWithWalletConnect({ storage })).rejects.toThrow(
+        /UniversalProvider\.init is unavailable/
+      );
     });
   });
 

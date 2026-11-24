@@ -1,6 +1,7 @@
 import { Address, Bytes32, SignedWorkoutClaimPayload, WorkoutProof } from "@dehealth/shared";
 import { Provider, Signer, Wallet, parseEther } from "ethers";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createEip1193Signer } from "../services/authService";
 import { signWorkoutProof } from "../services/cryptoService";
 import {
   ARBISCAN_SEPOLIA_BASE_URL,
@@ -354,6 +355,13 @@ describe("Milestone 3 R4: L2 Contract Service Unit Test Suite", () => {
       await expect(
         claimStreakReward(payload, {} as unknown as Signer)
       ).rejects.toThrow(
+        "L2 contract submission requires a valid signer when Arbitrum Sepolia is configured."
+      );
+      const signOnlySigner = {
+        getAddress: async () => testWallet.address,
+        signTypedData: async () => "0x"
+      } as unknown as Signer;
+      await expect(claimStreakReward(payload, signOnlySigner)).rejects.toThrow(
         "L2 contract submission requires a valid signer when Arbitrum Sepolia is configured."
       );
     });
@@ -731,6 +739,128 @@ describe("Milestone 3 R4: L2 Contract Service Unit Test Suite", () => {
       );
       expect(liveRes.mode).toBe("live");
       expect(claimMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("submits live claimStreakReward through real ethers Contract using an external EIP-1193 signer eth_sendTransaction", async () => {
+      const externalWallet = new Wallet(TEST_PRIVATE_KEY);
+      const expectedTxHash =
+        "0xfeed1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab";
+      const sentRpcPayloads: Array<{
+        readonly method: string;
+        readonly params?: readonly unknown[];
+      }> = [];
+
+      const eip1193Signer = createEip1193Signer(
+        externalWallet.address as Address,
+        {
+          request: async ({ method, params }) => {
+            if (method === "eth_signTypedData_v4") {
+              const jsonPayload = params?.[1];
+              if (typeof jsonPayload !== "string") {
+                throw new Error("Missing typed data payload");
+              }
+              const parsed = JSON.parse(jsonPayload) as {
+                readonly domain: Record<string, unknown>;
+                readonly types: Record<string, Array<{ name: string; type: string }>>;
+                readonly message: Record<string, unknown>;
+              };
+              const typesWithoutDomain: Record<
+                string,
+                Array<{ name: string; type: string }>
+              > = {};
+              for (const [key, fields] of Object.entries(parsed.types)) {
+                if (key !== "EIP712Domain") {
+                  typesWithoutDomain[key] = fields;
+                }
+              }
+              return externalWallet.signTypedData(
+                parsed.domain,
+                typesWithoutDomain,
+                parsed.message
+              );
+            }
+            if (method === "eth_sendTransaction") {
+              sentRpcPayloads.push({ method, params });
+              return expectedTxHash;
+            }
+            throw new Error(`Unsupported RPC method: ${method}`);
+          }
+        }
+      );
+
+      const proof: WorkoutProof = {
+        user: externalWallet.address as Address,
+        telemetryHash:
+          "0xabababababababababababababababababababababababababababababababab" as Bytes32,
+        streakCount: 6n,
+        nonce: 3n,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+      };
+      const signedPayload = await signWorkoutProof(
+        eip1193Signer,
+        proof,
+        TEST_GATE_ADDRESS
+      );
+
+      const waitForTransactionMock = vi.fn().mockResolvedValue({
+        hash: expectedTxHash,
+        status: 1
+      });
+      const getTransactionReceiptMock = vi.fn().mockResolvedValue({
+        to: TEST_GATE_ADDRESS,
+        from: externalWallet.address,
+        contractAddress: null,
+        hash: expectedTxHash,
+        index: 0,
+        blockHash: "0x" + "11".repeat(32),
+        blockNumber: 12345,
+        logsBloom: "0x" + "00".repeat(256),
+        gasUsed: 85_000n,
+        cumulativeGasUsed: 85_000n,
+        blobGasUsed: null,
+        gasPrice: 150_000_000n,
+        blobGasPrice: null,
+        type: 2,
+        status: 1,
+        root: null,
+        logs: []
+      });
+      const rpcProvider = {
+        getNetwork: vi.fn().mockResolvedValue({ chainId: 421614n }),
+        getBalance: vi.fn().mockResolvedValue(10_000_000_000_000_000n),
+        estimateGas: vi.fn().mockResolvedValue(90_000n),
+        getFeeData: vi.fn().mockResolvedValue({
+          maxFeePerGas: 150_000_000n,
+          maxPriorityFeePerGas: 10_000_000n,
+          gasPrice: 150_000_000n
+        }),
+        getTransactionReceipt: getTransactionReceiptMock,
+        waitForTransaction: waitForTransactionMock,
+        resolveName: vi.fn().mockResolvedValue(null)
+      } as unknown as Provider;
+
+      setL2Provider(rpcProvider);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+
+      const res = await claimStreakReward(signedPayload, eip1193Signer);
+      expect(res.mode).toBe("live");
+      expect(res.txHash).toBe(expectedTxHash);
+      expect(res.explorerUrl).toBe(`${ARBISCAN_SEPOLIA_BASE_URL}/${expectedTxHash}`);
+      expect(sentRpcPayloads).toHaveLength(1);
+      expect(sentRpcPayloads[0]?.method).toBe("eth_sendTransaction");
+      const firstParam = (sentRpcPayloads[0]?.params?.[0] ?? {}) as Record<
+        string,
+        unknown
+      >;
+      expect(String(firstParam.from).toLowerCase()).toBe(
+        externalWallet.address.toLowerCase()
+      );
+      expect(String(firstParam.to).toLowerCase()).toBe(
+        TEST_GATE_ADDRESS.toLowerCase()
+      );
+      expect(typeof firstParam.data).toBe("string");
+      expect(String(firstParam.data)).toMatch(/^0x/);
+      expect(getTransactionReceiptMock).toHaveBeenCalledWith(expectedTxHash);
     });
   });
 });

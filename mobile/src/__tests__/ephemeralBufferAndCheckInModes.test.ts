@@ -1032,6 +1032,7 @@ describe("Ephemeral Daily Buffer & Dual-Mode Check-In Suite", () => {
       expect(await getDailyEphemeralLogBuffer()).toBeNull();
       expect(hasText(tree, "0 meals")).toBe(true);
       expect(hasText(tree, "Log a meal or finish 1 exercise to unlock")).toBe(true);
+      expect(findByTestId(tree, "checkin-wallet-copy-pill")).toBeNull();
     });
 
     it("serializes concurrent ephemeral food, exercise, and step writes via FIFO queue with zero dropped entries (B1)", async () => {

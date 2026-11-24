@@ -241,6 +241,7 @@ import {
   buildWeeklyWorkoutSplit,
   PlanPreviewModal
 } from "../components/PlanPreviewModal";
+import { StreakFlameHeader } from "../components/StreakFlameHeader";
 import { AnonymizedFeedScreen } from "../screens/AnonymizedFeedScreen";
 import { LoginScreen } from "../screens/LoginScreen";
 import {
@@ -904,9 +905,9 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
   });
 
   // ==========================================================================
-  // 4. MicroCheckInScreen 1-tap copyable wallet pill
+  // 4. StreakFlameHeader 1-tap copyable wallet pill (global top-right header)
   // ==========================================================================
-  describe("MicroCheckInScreen 1-tap copyable wallet pill", () => {
+  describe("StreakFlameHeader 1-tap copyable wallet pill", () => {
     const sampleAddress =
       "0x1234567890abcdef1234567890abcdef1234abcd" as Address;
     const sampleProfile: UserProfile = {
@@ -928,13 +929,58 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
       expect(formatShortWalletAddress("0x1234")).toBe("0x1234");
     });
 
-    it("renders compact copy pill, copies full userAddress in 1 tap, shows Copied ✓, and handles unavailable clipboard gracefully", async () => {
+    it("renders top-right header copy pill, copies full userAddress in 1 tap, shows Copied ✓, removes duplicate check-in pill, and handles unavailable clipboard gracefully", async () => {
       const setStringAsync = vi.fn().mockResolvedValue(true);
       setClipboardAdapterForTesting({ setStringAsync });
       const onCopyWalletAddress = vi.fn();
       const wallet = new Wallet(TEST_PRIVATE_KEY);
 
-      const props = {
+      const headerProps = {
+        userAddress: sampleAddress,
+        streakCount: 4,
+        tokenBalanceDht: "40.0",
+        isFatigueScaled: false,
+        fitnessTier: "Balanced",
+        onCopyWalletAddress
+      };
+
+      let tree = renderWithHarness(StreakFlameHeader, headerProps);
+      const copyPill = findByTestId(tree, "header-wallet-copy-pill");
+      expect(copyPill).not.toBeNull();
+      expect(copyPill!.accessibilityLabel).toBe("Copy Wallet Address");
+      expect(hasText(tree, "0x1234…abcd")).toBe(true);
+      expect(hasText(tree, "Copy")).toBe(true);
+
+      (copyPill!.onPress as () => void)();
+      await flushMicrotasks();
+      tree = renderWithHarness(StreakFlameHeader, headerProps);
+
+      expect(setStringAsync).toHaveBeenCalledWith(sampleAddress);
+      expect(onCopyWalletAddress).toHaveBeenCalledWith(sampleAddress);
+      expect(hasText(tree, "Copied ✓")).toBe(true);
+
+      // Clean unmount clears copy timer cleanly
+      unmountHarness();
+
+      // Unavailable clipboard clears Copied state gracefully without throwing
+      resetHarness();
+      setClipboardAdapterForTesting(null);
+      vi.stubGlobal("navigator", {});
+      const noCallbackProps = {
+        ...headerProps,
+        onCopyWalletAddress: undefined
+      };
+      tree = renderWithHarness(StreakFlameHeader, noCallbackProps);
+      (
+        findByTestId(tree, "header-wallet-copy-pill")!.onPress as () => void
+      )();
+      await flushMicrotasks();
+      tree = renderWithHarness(StreakFlameHeader, noCallbackProps);
+      expect(hasText(tree, "Copied ✓")).toBe(false);
+
+      // Verify redundant duplicate copy pill is gone from MicroCheckInScreen
+      resetHarness();
+      const checkInTree = renderWithHarness(MicroCheckInScreen, {
         userAddress: sampleAddress,
         verifyingContract: TEST_GATE_ADDRESS,
         currentStreak: 1,
@@ -946,49 +992,62 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
         initialStepCount: 0,
         initialStepSource: "manual-fallback" as const,
         initialPedometerAvailable: false,
-        onCopyWalletAddress,
         onDispatchSignedClaim: vi.fn().mockResolvedValue(undefined)
-      };
+      });
+      expect(findByTestId(checkInTree, "checkin-wallet-copy-pill")).toBeNull();
+    });
 
-      let tree = renderWithHarness(MicroCheckInScreen, props);
-      const copyPill = findByTestId(tree, "checkin-wallet-copy-pill");
-      expect(copyPill).not.toBeNull();
-      expect(copyPill!.accessibilityLabel).toBe("Copy Wallet Address");
-      expect(hasText(tree, "0x1234…abcd")).toBe(true);
-      expect(hasText(tree, "Copy")).toBe(true);
+    it("clears the copied timer on unmount and never schedules one after unmount", async () => {
+      vi.useFakeTimers();
+      try {
+        const flush = async (): Promise<void> => {
+          for (let i = 0; i < 20; i++) {
+            await Promise.resolve();
+          }
+        };
+        const headerProps = {
+          userAddress: sampleAddress,
+          streakCount: 1,
+          tokenBalanceDht: "10.0",
+          isFatigueScaled: false,
+          fitnessTier: "Balanced"
+        };
 
-      (copyPill!.onPress as () => void)();
-      await flushMicrotasks();
-      tree = renderWithHarness(MicroCheckInScreen, props);
+        // 1. Copy completes, the Copied timer is armed, unmount clears it
+        setClipboardAdapterForTesting({
+          setStringAsync: vi.fn().mockResolvedValue(true)
+        });
+        resetHarness();
+        let tree = renderWithHarness(StreakFlameHeader, headerProps);
+        (findByTestId(tree, "header-wallet-copy-pill")!.onPress as () => void)();
+        await flush();
+        tree = renderWithHarness(StreakFlameHeader, headerProps);
+        expect(hasText(tree, "Copied ✓")).toBe(true);
+        expect(vi.getTimerCount()).toBe(1);
+        unmountHarness();
+        expect(vi.getTimerCount()).toBe(0);
 
-      expect(setStringAsync).toHaveBeenCalledWith(sampleAddress);
-      expect(onCopyWalletAddress).toHaveBeenCalledWith(sampleAddress);
-      expect(hasText(tree, "Copied ✓")).toBe(true);
-
-      // Clean unmount clears copy timer cleanly
-      unmountHarness();
-
-      // Unavailable clipboard updates statusStep without throwing
-      resetHarness();
-      setClipboardAdapterForTesting(null);
-      vi.stubGlobal("navigator", {});
-      const noCallbackProps = {
-        ...props,
-        onCopyWalletAddress: undefined
-      };
-      tree = renderWithHarness(MicroCheckInScreen, noCallbackProps);
-      (
-        findByTestId(tree, "checkin-wallet-copy-pill")!.onPress as () => void
-      )();
-      await flushMicrotasks();
-      tree = renderWithHarness(MicroCheckInScreen, noCallbackProps);
-      expect(
-        hasText(
-          tree,
-          "Clipboard unavailable; copy wallet address from Dashboard."
-        )
-      ).toBe(true);
-      expect(hasText(tree, "Copied ✓")).toBe(false);
+        // 2. Unmount while the clipboard write is still pending: no timer afterwards
+        let finishWrite!: (ok: boolean) => void;
+        setClipboardAdapterForTesting({
+          setStringAsync: vi.fn().mockImplementation(
+            () =>
+              new Promise<boolean>((resolve) => {
+                finishWrite = resolve;
+              })
+          )
+        });
+        resetHarness();
+        tree = renderWithHarness(StreakFlameHeader, headerProps);
+        (findByTestId(tree, "header-wallet-copy-pill")!.onPress as () => void)();
+        await flush();
+        unmountHarness();
+        finishWrite(true);
+        await flush();
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

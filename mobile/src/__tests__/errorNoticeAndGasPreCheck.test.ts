@@ -232,6 +232,7 @@ import {
   ErrorNoticePayload,
   toErrorNoticePayload
 } from "../components/ErrorNoticeModal";
+import { StreakFlameHeader } from "../components/StreakFlameHeader";
 import {
   AnonymizedFeedScreen,
   AnonymizedFeedScreenProps
@@ -1277,6 +1278,39 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       expect(onCheer.mock.calls[2]).toEqual(["feed-1"]);
       deferredByFeed["feed-1"]!.resolve(undefined);
       await flushMicrotasks(10);
+    });
+  });
+
+  // ============================================================================
+  // 5. Global Top-Right Header Copy Pill (StreakFlameHeader)
+  // ============================================================================
+  describe("StreakFlameHeader top-right copy pill", () => {
+    it("renders compact 1-tap copy pill with testID=header-wallet-copy-pill and toggles Copied ✓", async () => {
+      const setStringAsync = vi.fn().mockResolvedValue(true);
+      setClipboardAdapterForTesting({ setStringAsync });
+
+      const headerProps = {
+        userAddress: wallet.address as Address,
+        streakCount: 3,
+        tokenBalanceDht: "30.0",
+        isFatigueScaled: false,
+        fitnessTier: "Balanced"
+      };
+
+      let tree = renderWithHarness(StreakFlameHeader, headerProps);
+      const pill = findElement(
+        tree,
+        (elProps) => elProps.testID === "header-wallet-copy-pill"
+      );
+      expect(pill).not.toBeNull();
+      expect(hasText(tree, "Copy")).toBe(true);
+
+      (pill!.onPress as () => void)();
+      await flushMicrotasks();
+      tree = renderWithHarness(StreakFlameHeader, headerProps);
+
+      expect(setStringAsync).toHaveBeenCalledWith(wallet.address);
+      expect(hasText(tree, "Copied ✓")).toBe(true);
     });
   });
 });
