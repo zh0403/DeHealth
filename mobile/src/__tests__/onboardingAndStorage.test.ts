@@ -32,6 +32,9 @@ import {
   getDailyProofSignedMap,
   getDailyTaskCompletion,
   getDailyTelemetryCommitment,
+  getOnboardingCompletedAccounts,
+  hasCompletedOnboardingForAccount,
+  markOnboardingCompletedForAccount,
   getPlanHistory,
   getTelemetrySalt,
   getUserBiometrics,
@@ -735,6 +738,39 @@ describe("Milestone 3: Onboarding & Adaptive Storage Unit Test Suite", () => {
 
         expect(plan1.targetDailyCalories).toBe(plan2.targetDailyCalories);
         expect(plan1.baselineBiometrics).toEqual(plan2.baselineBiometrics);
+      });
+    });
+
+    describe("Per-account onboarding completion persistence", () => {
+      it("persists onboarding completion per accountId with case-insensitive normalization and wipes on clearAllAdaptiveData", async () => {
+        expect(await getOnboardingCompletedAccounts()).toEqual({});
+        expect(await hasCompletedOnboardingForAccount("0xAbCd1234")).toBe(false);
+
+        await markOnboardingCompletedForAccount("  0xAbCdEf1234567890  ", 1_700_000_111_000);
+        await markOnboardingCompletedForAccount("Supa-User-99", 1_700_000_222_000);
+
+        expect(await hasCompletedOnboardingForAccount("0xabcdef1234567890")).toBe(true);
+        expect(await hasCompletedOnboardingForAccount("0XABCDEF1234567890")).toBe(true);
+        expect(await hasCompletedOnboardingForAccount("supa-user-99")).toBe(true);
+        expect(await hasCompletedOnboardingForAccount("other-user")).toBe(false);
+        expect(await hasCompletedOnboardingForAccount("   ")).toBe(false);
+
+        const accounts = await getOnboardingCompletedAccounts();
+        expect(accounts).toEqual({
+          "0xabcdef1234567890": 1_700_000_111_000,
+          "supa-user-99": 1_700_000_222_000
+        });
+
+        await expect(markOnboardingCompletedForAccount("  ")).rejects.toThrow(
+          "accountId must be a non-empty string"
+        );
+        await expect(markOnboardingCompletedForAccount("valid", 0)).rejects.toThrow(
+          "completedAtMs must be a positive finite number"
+        );
+
+        await clearAllAdaptiveData();
+        expect(await getOnboardingCompletedAccounts()).toEqual({});
+        expect(await hasCompletedOnboardingForAccount("0xabcdef1234567890")).toBe(false);
       });
     });
   });

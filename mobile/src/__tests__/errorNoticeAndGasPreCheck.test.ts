@@ -245,9 +245,12 @@ import { generate14DayPlan } from "../services/adaptivePlanEngine";
 import {
   claimStreakReward,
   DEFAULT_INSUFFICIENT_GAS_MESSAGE,
+  DEFAULT_RPC_RATE_LIMIT_MESSAGE,
   InsufficientGasError,
+  isLowGasEthBalance,
   MIN_FALLBACK_GAS_BALANCE_WEI,
   resetL2Config,
+  RpcRateLimitError,
   setContractFactory,
   setL2Provider,
   setRewardGateAddress
@@ -546,6 +549,51 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
           walletAddress: null
         });
       }
+    });
+
+    it("maps RpcRateLimitError, raw HTTP 429 objects, and nested ethers 429 errors to Arbitrum Sepolia RPC Rate Limited (429)", () => {
+      const rateLimitErr = new RpcRateLimitError();
+      expect(toErrorNoticePayload(rateLimitErr, "Claim Error", wallet.address)).toEqual({
+        title: "Arbitrum Sepolia RPC Rate Limited (429)",
+        message: DEFAULT_RPC_RATE_LIMIT_MESSAGE,
+        isInsufficientGas: false,
+        walletAddress: wallet.address
+      });
+
+      const customRateLimitErr = new RpcRateLimitError(
+        "Custom RPC throttling notice"
+      );
+      expect(toErrorNoticePayload(customRateLimitErr)).toEqual({
+        title: "Arbitrum Sepolia RPC Rate Limited (429)",
+        message: "Custom RPC throttling notice",
+        isInsufficientGas: false,
+        walletAddress: null
+      });
+
+      expect(
+        toErrorNoticePayload({ status: 429 }, "Sync Failed", wallet.address)
+      ).toEqual({
+        title: "Arbitrum Sepolia RPC Rate Limited (429)",
+        message: DEFAULT_RPC_RATE_LIMIT_MESSAGE,
+        isInsufficientGas: false,
+        walletAddress: wallet.address
+      });
+
+      const nestedEthers429 = {
+        code: "UNKNOWN_ERROR",
+        error: {
+          message: "429 Too Many Requests"
+        },
+        info: {
+          responseStatus: "429 Too Many Requests"
+        }
+      };
+      expect(toErrorNoticePayload(nestedEthers429, "Claim Error")).toEqual({
+        title: "Arbitrum Sepolia RPC Rate Limited (429)",
+        message: DEFAULT_RPC_RATE_LIMIT_MESSAGE,
+        isInsufficientGas: false,
+        walletAddress: null
+      });
     });
 
     it("copyWalletAddressToClipboard writes via navigator.clipboard.writeText and handles failures gracefully", async () => {
@@ -1103,7 +1151,7 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
       const logBtnInvalid = findByLabel(tree, "Log Food Portion");
       (logBtnInvalid!.onPress as () => void)();
       tree = renderWithHarness(MicroCheckInScreen, taskProps);
-      expect(hasText(tree, "Please enter a valid portion weight in grams")).toBe(true);
+      expect(hasText(tree, "Please enter a valid portion amount in g (> 0).")).toBe(true);
       expect(onUpdateDailyPlan).not.toHaveBeenCalled();
 
       // Restore valid grams and double-tap synchronously on the same render tree
@@ -1311,6 +1359,11 @@ describe("R1 (#6) ErrorNoticeModal, Gas Pre-Check UI & Async finally Guards", ()
 
       expect(setStringAsync).toHaveBeenCalledWith(wallet.address);
       expect(hasText(tree, "Copied ✓")).toBe(true);
+    });
+
+    it("aligns isLowGasEthBalance with MIN_FALLBACK_GAS_BALANCE_WEI", () => {
+      expect(isLowGasEthBalance("0.00009")).toBe(true);
+      expect(isLowGasEthBalance("0.0001")).toBe(false);
     });
   });
 });

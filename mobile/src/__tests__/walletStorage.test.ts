@@ -4,9 +4,11 @@ import * as vaultKeyProvider from "../storage/vaultKeyProvider";
 import { InMemoryKeyStore } from "../storage/vaultKeyProvider";
 import {
   clearStoredWallet,
+  DEFAULT_LOCAL_WALLET_ACCOUNT_ID,
   exportWalletPrivateKey,
   getOrCreatePersistentWallet,
   getStoredWallet,
+  getWalletStorageKeyForAccount,
   importPersistentWallet,
   isValidPrivateKey,
   resetWalletStorageForTesting,
@@ -976,6 +978,62 @@ describe("Milestone 1 R2: Persistent Embedded Wallet Storage", () => {
       expect(await defaultInner.getItem(WALLET_PRIVATE_KEY_STORAGE_KEY)).toBe(
         wImport2.privateKey
       );
+    });
+  });
+
+  describe("Per-account namespaced embedded wallets", () => {
+    it("isolates Google account wallets from local and sibling Google accounts across create, import, export, and clear", async () => {
+      const store = new InMemoryKeyStore();
+
+      expect(getWalletStorageKeyForAccount()).toBe(WALLET_PRIVATE_KEY_STORAGE_KEY);
+      expect(getWalletStorageKeyForAccount(DEFAULT_LOCAL_WALLET_ACCOUNT_ID)).toBe(
+        WALLET_PRIVATE_KEY_STORAGE_KEY
+      );
+      expect(getWalletStorageKeyForAccount("User-A")).toBe(
+        `${WALLET_PRIVATE_KEY_STORAGE_KEY}.user-a`
+      );
+      expect(getWalletStorageKeyForAccount("user:special/chars@example.com")).toMatch(
+        new RegExp(`^${WALLET_PRIVATE_KEY_STORAGE_KEY}\\.[0-9a-f]{32}$`)
+      );
+
+      const localWallet = await getOrCreatePersistentWallet(
+        store,
+        DEFAULT_LOCAL_WALLET_ACCOUNT_ID
+      );
+      const googleWalletA = await getOrCreatePersistentWallet(store, "google-user-a");
+      const googleWalletB = await getOrCreatePersistentWallet(store, "google-user-b");
+
+      expect(googleWalletA.address).not.toBe(localWallet.address);
+      expect(googleWalletB.address).not.toBe(localWallet.address);
+      expect(googleWalletA.address).not.toBe(googleWalletB.address);
+
+      expect(await exportWalletPrivateKey(store, "google-user-a")).toBe(
+        googleWalletA.privateKey
+      );
+
+      // Importing into google-user-a does not affect local or google-user-b
+      const replacement = Wallet.createRandom();
+      const imported = await importPersistentWallet(
+        replacement.privateKey,
+        store,
+        "google-user-a"
+      );
+      expect(imported.address).toBe(replacement.address);
+      expect((await getStoredWallet(store, "google-user-a"))?.address).toBe(
+        replacement.address
+      );
+      expect((await getStoredWallet(store, "google-user-b"))?.address).toBe(
+        googleWalletB.address
+      );
+      expect((await getStoredWallet(store))?.address).toBe(localWallet.address);
+
+      // Clearing google-user-a leaves local and google-user-b intact
+      await clearStoredWallet(store, "google-user-a");
+      expect(await getStoredWallet(store, "google-user-a")).toBeNull();
+      expect((await getStoredWallet(store, "google-user-b"))?.address).toBe(
+        googleWalletB.address
+      );
+      expect((await getStoredWallet(store))?.address).toBe(localWallet.address);
     });
   });
 });

@@ -89,6 +89,7 @@ vi.mock("react-native", () => ({
 import {
   deriveLiveMetricsFromVault,
   hydrateVaultData,
+  isOnboardingCompleteForSession,
   resetVaultAndRecover,
   resolveClaimSigner,
   resolveRenderSigner,
@@ -102,6 +103,7 @@ import {
   DuplicateCheerError,
   ErrorNoticeModal,
   formatLocalCalendarDateKey,
+  generateQrMatrix,
   initializeAuthSessionStorage,
   InsufficientGasError,
   LoginScreen,
@@ -115,7 +117,8 @@ import {
   signInWithWalletConnect,
   signOutSession,
   startLocalSession,
-  toErrorNoticePayload
+  toErrorNoticePayload,
+  WalletConnectQrModal
 } from "../index";
 import { generate14DayPlan } from "../services/adaptivePlanEngine";
 import { makeDailyProofSignedKey } from "../storage/adaptiveStorage";
@@ -604,10 +607,11 @@ describe("resolveClaimSigner external wallet guard", () => {
     }
   });
 
-  it("uses the local wallet for local and google sessions and when no session exists", () => {
+  it("uses the local embedded wallet for local and google sessions (ignoring externalSigner) and when no session exists", () => {
     for (const authMethod of ["local", "google"] as const) {
       const session: AuthSessionMetadata = { ...baseSession, authMethod };
       expect(resolveClaimSigner(session, external, local)).toBe(local);
+      expect(resolveClaimSigner(session, null, local)).toBe(local);
     }
     expect(resolveClaimSigner(null, null, local)).toBe(local);
     expect(resolveClaimSigner(null, null, null)).toBeUndefined();
@@ -632,12 +636,130 @@ describe("resolveRenderSigner strict isolation and synchronous polyfills (R1, P1
     }
   });
 
-  it("passes localWallet only for google/local sessions and returns null when unauthenticated (R1)", () => {
+  it("passes localWallet only for google/local sessions (ignoring externalSigner) and returns null when unauthenticated (R1)", () => {
     for (const authMethod of ["google", "local"] as const) {
       const session: AuthSessionMetadata = { ...baseSession, authMethod };
       expect(resolveRenderSigner(session, external, local)).toBe(local);
+      expect(resolveRenderSigner(session, null, local)).toBe(local);
     }
     expect(resolveRenderSigner(null, external, local)).toBeNull();
+  });
+
+  it("hydrates per-account Google embedded wallet and detects cross-device bound_wallet_address mismatch on boot", async () => {
+    const keyStore = new InMemoryKeyStore();
+    const backend = new MemoryStorageBackend();
+    await initializeAdaptiveStorage(keyStore, backend);
+    const authStorage = await initializeAuthSessionStorage(keyStore, backend);
+
+    const googleWallet = await getOrCreatePersistentWallet(
+      keyStore,
+      "google-boot-user"
+    );
+    const remoteBoundAddress = Wallet.createRandom().address as Address;
+    const googleSession: AuthSessionMetadata = {
+      authMethod: "google",
+      accountId: "google-boot-user",
+      displayLabel: "boot@dehealth.xyz",
+      walletAddress: googleWallet.address as Address,
+      signedInAtMs: 1_700_000_000_000
+    };
+    await authStorage.savePersistedAuthSession(googleSession);
+
+    const deps: VaultHydrationDeps = {
+      ...makeDeps(keyStore, backend),
+      getOrCreatePersistentWallet: (accountId?: string) =>
+        getOrCreatePersistentWallet(keyStore, accountId),
+      clearStoredWallet: (accountId?: string) =>
+        clearStoredWallet(keyStore, accountId),
+      getGoogleBoundWalletAddress: vi.fn().mockResolvedValue(remoteBoundAddress)
+    };
+
+    const hydrated = await hydrateVaultData(deps);
+    expect(hydrated.persistentWallet.address).toBe(googleWallet.address);
+    expect(hydrated.boundWalletAddress).toBe(remoteBoundAddress);
+    expect(hydrated.hasWalletMismatch).toBe(true);
+  });
+
+  it("enforces mandatory onboarding for fresh accounts unless explicitly completed (ONB-01..04)", () => {
+    const cycle = generate14DayPlan(DEFAULT_BASELINE_BIOMETRICS, Date.now());
+    const googleSession: AuthSessionMetadata = {
+      ...baseSession,
+      authMethod: "google",
+      accountId: "google-user-new"
+    };
+    const localSession: AuthSessionMetadata = {
+      ...baseSession,
+      authMethod: "local",
+      accountId: "local:0xabc"
+    };
+
+    // Fresh sign-in must go through OnboardingWizardScreen even if another account onboarded on device
+    expect(
+      isOnboardingCompleteForSession({
+        session: googleSession,
+        storedBio: DEFAULT_BASELINE_BIOMETRICS,
+        storedCycle: cycle,
+        completedAccounts: { "google-user-existing": 1_700_000_000_000 },
+        isFreshSignIn: true
+      })
+    ).toBe(false);
+
+    // Fresh sign-in with empty completedAccounts also returns false
+    expect(
+      isOnboardingCompleteForSession({
+        session: googleSession,
+        storedBio: DEFAULT_BASELINE_BIOMETRICS,
+        storedCycle: cycle,
+        completedAccounts: {},
+        isFreshSignIn: true
+      })
+    ).toBe(false);
+
+    // Missing storedBio or storedCycle always forces onboarding
+    expect(
+      isOnboardingCompleteForSession({
+        session: googleSession,
+        storedBio: null,
+        storedCycle: cycle,
+        completedAccounts: { "google-user-new": 1_700_000_000_000 },
+        isFreshSignIn: false
+      })
+    ).toBe(false);
+    expect(
+      isOnboardingCompleteForSession({
+        session: googleSession,
+        storedBio: DEFAULT_BASELINE_BIOMETRICS,
+        storedCycle: null,
+        completedAccounts: { "google-user-new": 1_700_000_000_000 },
+        isFreshSignIn: false
+      })
+    ).toBe(false);
+
+    // Returning account recorded in completedAccounts with storedBio + storedCycle skips onboarding
+    expect(
+      isOnboardingCompleteForSession({
+        session: googleSession,
+        storedBio: DEFAULT_BASELINE_BIOMETRICS,
+        storedCycle: cycle,
+        completedAccounts: { "google-user-new": 1_700_000_000_000 },
+        isFreshSignIn: true
+      })
+    ).toBe(true);
+
+    // Legacy cold boot (empty completedAccounts) remains backward-compatible when not a fresh sign-in
+    expect(
+      isOnboardingCompleteForSession({
+        session: localSession,
+        storedBio: DEFAULT_BASELINE_BIOMETRICS,
+        storedCycle: cycle,
+        completedAccounts: {},
+        isFreshSignIn: false
+      })
+    ).toBe(true);
+
+    // Exports WalletConnectQrModal and generateQrMatrix from mobile/src/index.ts
+    expect(typeof WalletConnectQrModal).toBe("function");
+    expect(typeof generateQrMatrix).toBe("function");
   });
 
   it("synchronously loads @walletconnect/react-native-compat and installs crypto shim before downstream imports (P1)", async () => {

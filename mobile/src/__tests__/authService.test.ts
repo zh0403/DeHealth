@@ -22,12 +22,15 @@ import {
   AUTH_SESSION_STORAGE_KEY,
   AuthError,
   AuthSessionStorage,
+  BOUND_WALLET_ADDRESS_METADATA_KEY,
+  cancelActiveWalletConnectPairing,
   clearPersistedAuthSession,
   completeOAuthRedirectCallback,
   createEip1193Signer,
   Eip1193Provider,
   formatShortAddress,
   getAuthSessionStorage,
+  getGoogleBoundWalletAddress,
   getPersistedAuthSession,
   getWalletConnectProjectId,
   handleIncomingOAuthRedirectUrl,
@@ -38,8 +41,10 @@ import {
   resetDeepLinkOpenerForTesting,
   resetMetaMaskAdapterForTesting,
   resetOAuthBrowserAdapterForTesting,
+  resetPlatformOsForTesting,
   resetUniversalProviderFactoryForTesting,
   resetUniversalProviderModuleLoaderForTesting,
+  syncGoogleBoundWalletAddress,
   resetWalletConnectAdapterForTesting,
   resolveGoogleOAuthRedirectUri,
   restoreExternalWalletSignerOnBoot,
@@ -49,6 +54,7 @@ import {
   setMetaMaskAdapterForTesting,
   setOAuthBrowserAdapterForTesting,
   setPendingGoogleOAuthAttemptForTesting,
+  setPlatformOsForTesting,
   setUniversalProviderFactoryForTesting,
   setUniversalProviderModuleLoaderForTesting,
   setWalletConnectAdapterForTesting,
@@ -517,7 +523,10 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
         provider: "google",
         options: {
           redirectTo: "dehealth://auth-callback",
-          skipBrowserRedirect: true
+          skipBrowserRedirect: true,
+          queryParams: {
+            prompt: "select_account"
+          }
         }
       });
       expect(result.mode).toBe("live");
@@ -535,9 +544,10 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
         signedInAtMs: 1_763_600_123_456
       });
 
-      expect((await getStoredWallet(keyStore))?.address).toBe(
+      expect((await getStoredWallet(keyStore, "supa-user-uuid-99"))?.address).toBe(
         result.walletAddress
       );
+      expect(await getStoredWallet(keyStore, "local")).toBeNull();
       expect(await getPersistedAuthSession(storage)).toEqual(result.session);
     });
 
@@ -590,7 +600,10 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       } as unknown as SupabaseClient);
 
       const res2 = await signInWithGoogle({ keyStore, storage, nowMs: 2000 });
-      expect(res2.walletAddress).toBe(res1.walletAddress);
+      expect(res2.walletAddress).not.toBe(res1.walletAddress);
+      expect((await getStoredWallet(keyStore, "supa-id-only"))?.address).toBe(
+        res2.walletAddress
+      );
       expect(res2.session.accountId).toBe("supa-id-only");
       expect(res2.session.displayLabel).toBe(
         `Google (${formatShortAddress(res2.walletAddress)})`
@@ -1908,6 +1921,335 @@ describe("Auth Service, 3-Way Sign-In, EIP-1193 Signer & Encrypted Session Stora
       expect(await governance.getGovernanceConfig()).toEqual(
         DEFAULT_GOVERNANCE_CONFIG
       );
+    });
+
+    it("clears web localStorage & sessionStorage auth/Supabase/WC keys on signOutSession without storage override while preserving vault/wallet/biometric keys", async () => {
+      const createMockWebStorage = (
+        initial: Record<string, string>
+      ): Storage => {
+        const map = new Map<string, string>(Object.entries(initial));
+        return {
+          get length() {
+            return map.size;
+          },
+          clear() {
+            map.clear();
+          },
+          getItem(key: string) {
+            return map.get(key) ?? null;
+          },
+          key(index: number) {
+            return Array.from(map.keys())[index] ?? null;
+          },
+          removeItem(key: string) {
+            map.delete(key);
+          },
+          setItem(key: string, value: string) {
+            map.set(key, value);
+          }
+        };
+      };
+
+      const localStorageMock = createMockWebStorage({
+        [AUTH_SESSION_STORAGE_KEY]: "cipher-session",
+        "supabase.auth.token": "legacy-token",
+        "sb-dehealth-auth-token": "sb-token",
+        "sb-dehealth-code-verifier": "sb-verifier",
+        "wc@2:client:0.3//session": "wc-session",
+        "dehealth.vault.secret.v1": "vault-secret-keep",
+        "dehealth.wallet.privateKey.v1": "wallet-key-keep",
+        [ADAPTIVE_STORAGE_KEYS.USER_BIOMETRICS]: "bio-keep",
+        [ADAPTIVE_STORAGE_KEYS.ACTIVE_PLAN_CYCLE]: "cycle-keep",
+        [ADAPTIVE_STORAGE_KEYS.ONBOARDING_COMPLETED_ACCOUNTS]: "onboard-keep",
+        "unrelated.app.pref": "keep-me"
+      });
+
+      const sessionStorageMock = createMockWebStorage({
+        "sb-proj-auth-token": "session-sb-token",
+        "wc@2:core:0.3//keychain": "wc-keychain",
+        "dehealth.vault.ephemeral": "vault-keep"
+      });
+
+      vi.stubGlobal("window", {
+        localStorage: localStorageMock,
+        sessionStorage: sessionStorageMock
+      });
+
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const secret = await provisionVaultSecret(keyStore);
+      const storage = new AuthSessionStorage(secret, backend);
+      setAuthSessionStorage(storage);
+
+      try {
+        await signOutSession();
+
+        // Auth, Supabase, and WC@2 keys are removed
+        expect(localStorageMock.getItem(AUTH_SESSION_STORAGE_KEY)).toBeNull();
+        expect(localStorageMock.getItem("supabase.auth.token")).toBeNull();
+        expect(localStorageMock.getItem("sb-dehealth-auth-token")).toBeNull();
+        expect(
+          localStorageMock.getItem("sb-dehealth-code-verifier")
+        ).toBeNull();
+        expect(
+          localStorageMock.getItem("wc@2:client:0.3//session")
+        ).toBeNull();
+        expect(sessionStorageMock.getItem("sb-proj-auth-token")).toBeNull();
+        expect(
+          sessionStorageMock.getItem("wc@2:core:0.3//keychain")
+        ).toBeNull();
+
+        // Vault, wallet, biometric, onboarding, and unrelated keys are preserved
+        expect(localStorageMock.getItem("dehealth.vault.secret.v1")).toBe(
+          "vault-secret-keep"
+        );
+        expect(
+          localStorageMock.getItem("dehealth.wallet.privateKey.v1")
+        ).toBe("wallet-key-keep");
+        expect(
+          localStorageMock.getItem(ADAPTIVE_STORAGE_KEYS.USER_BIOMETRICS)
+        ).toBe("bio-keep");
+        expect(
+          localStorageMock.getItem(ADAPTIVE_STORAGE_KEYS.ACTIVE_PLAN_CYCLE)
+        ).toBe("cycle-keep");
+        expect(
+          localStorageMock.getItem(
+            ADAPTIVE_STORAGE_KEYS.ONBOARDING_COMPLETED_ACCOUNTS
+          )
+        ).toBe("onboard-keep");
+        expect(localStorageMock.getItem("unrelated.app.pref")).toBe("keep-me");
+        expect(sessionStorageMock.getItem("dehealth.vault.ephemeral")).toBe(
+          "vault-keep"
+        );
+      } finally {
+        vi.unstubAllGlobals();
+        resetAuthSessionStorage();
+      }
+    });
+  });
+
+  describe("WalletConnect Web QR Callback, Cancellation & External Signer Linking", () => {
+    afterEach(() => {
+      resetPlatformOsForTesting();
+      resetDeepLinkOpenerForTesting();
+      resetUniversalProviderFactoryForTesting();
+      resetWalletConnectAdapterForTesting();
+    });
+
+    it("signInWithWalletConnect on platformOs='web' invokes onDisplayUri without calling Linking.openURL", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const secret = await provisionVaultSecret(keyStore);
+      const storage = new AuthSessionStorage(secret, backend);
+      const deepLinkMock = vi.fn().mockResolvedValue(undefined);
+      setDeepLinkOpenerForTesting(deepLinkMock);
+
+      const listeners = new Map<string, ((payload: string) => void)[]>();
+      const externalAddress = "0x3333333333333333333333333333333333333333";
+      const wcUri = "wc:web-qr-topic-123@2?relay-protocol=irn&symKey=abcdef";
+
+      const mockProvider: UniversalProviderLike = {
+        session: {
+          namespaces: {
+            eip155: {
+              accounts: [`eip155:421614:${externalAddress}`]
+            }
+          }
+        },
+        on(event, listener) {
+          const list = listeners.get(event) ?? [];
+          list.push(listener);
+          listeners.set(event, list);
+        },
+        off(event, listener) {
+          const list = listeners.get(event) ?? [];
+          listeners.set(
+            event,
+            list.filter((fn) => fn !== listener)
+          );
+        },
+        async connect() {
+          for (const fn of listeners.get("display_uri") ?? []) {
+            fn(wcUri);
+          }
+          return {};
+        },
+        async request() {
+          return [externalAddress];
+        }
+      };
+
+      setUniversalProviderFactoryForTesting(async () => mockProvider);
+
+      const receivedUris: string[] = [];
+      const result = await signInWithWalletConnect({
+        projectId: "wc-web-proj-1",
+        storage,
+        platformOs: "web",
+        onDisplayUri: (uri) => {
+          receivedUris.push(uri);
+        }
+      });
+
+      expect(receivedUris).toEqual([wcUri]);
+      expect(deepLinkMock).not.toHaveBeenCalled();
+      expect(result.session.authMethod).toBe("walletconnect");
+      expect(result.walletAddress).toBe(externalAddress);
+    });
+
+    it("cancelActiveWalletConnectPairing aborts in-flight pairing and rejects with AuthError", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const secret = await provisionVaultSecret(keyStore);
+      const storage = new AuthSessionStorage(secret, backend);
+      setPlatformOsForTesting("web");
+
+      const listeners = new Map<string, ((payload: string) => void)[]>();
+      const abortMock = vi.fn();
+
+      const mockProvider: UniversalProviderLike = {
+        on(event, listener) {
+          const list = listeners.get(event) ?? [];
+          list.push(listener);
+          listeners.set(event, list);
+        },
+        off(event, listener) {
+          const list = listeners.get(event) ?? [];
+          listeners.set(
+            event,
+            list.filter((fn) => fn !== listener)
+          );
+        },
+        connect() {
+          for (const fn of listeners.get("display_uri") ?? []) {
+            fn("wc:pending-pairing@2?relay-protocol=irn&symKey=123");
+          }
+          return new Promise(() => {
+            // Never resolves unless cancelled
+          });
+        },
+        async request() {
+          return [];
+        },
+        abortPairingAttempt: abortMock
+      };
+
+      setUniversalProviderFactoryForTesting(async () => mockProvider);
+
+      let capturedUri: string | null = null;
+      const pendingPromise = signInWithWalletConnect({
+        projectId: "wc-cancel-proj",
+        storage,
+        onDisplayUri: (uri) => {
+          capturedUri = uri;
+        }
+      });
+
+      // Wait a microtask tick for display_uri & connect() to start
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(capturedUri).toBe(
+        "wc:pending-pairing@2?relay-protocol=irn&symKey=123"
+      );
+
+      cancelActiveWalletConnectPairing();
+
+      await expect(pendingPromise).rejects.toThrow(AuthError);
+      await expect(pendingPromise).rejects.toThrow(
+        "WalletConnect pairing was cancelled."
+      );
+      expect(abortMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("isolates embedded wallets per Google account, syncs bound_wallet_address via updateUser on first sign-in, and detects cross-device mismatch", async () => {
+      const keyStore = new InMemoryKeyStore();
+      const backend = new MemoryBackend();
+      const secret = await provisionVaultSecret(keyStore);
+      const storage = new AuthSessionStorage(secret, backend);
+      setAuthSessionStorage(storage);
+
+      const updateUserA = vi.fn().mockResolvedValue({ data: { user: {} }, error: null });
+      setSupabaseClient({
+        auth: {
+          signInWithOAuth: vi.fn().mockResolvedValue({
+            data: { provider: "google", url: "https://oauth.example/a" },
+            error: null
+          }),
+          getUser: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: "google-acct-a",
+                email: "alice@dehealth.xyz",
+                user_metadata: { full_name: "Alice" }
+              }
+            },
+            error: null
+          }),
+          updateUser: updateUserA
+        }
+      } as unknown as SupabaseClient);
+
+      const resA = await signInWithGoogle({
+        keyStore,
+        storage,
+        redirectTo: "dehealth://auth-callback",
+        verifyOAuthCallback: vi.fn().mockResolvedValue(undefined)
+      });
+
+      expect(resA.boundWalletAddress).toBe(resA.walletAddress);
+      expect(resA.hasWalletMismatch).toBe(false);
+      expect(updateUserA).toHaveBeenCalledWith({
+        data: {
+          [BOUND_WALLET_ADDRESS_METADATA_KEY]: resA.walletAddress
+        }
+      });
+
+      // Sibling Google account B with pre-bound remote wallet on another device
+      const remoteDeviceWallet = Wallet.createRandom().address as Address;
+      const updateUserB = vi.fn().mockResolvedValue({ data: { user: {} }, error: null });
+      setSupabaseClient({
+        auth: {
+          signInWithOAuth: vi.fn().mockResolvedValue({
+            data: { provider: "google", url: "https://oauth.example/b" },
+            error: null
+          }),
+          getUser: vi.fn().mockResolvedValue({
+            data: {
+              user: {
+                id: "google-acct-b",
+                email: "bob@dehealth.xyz",
+                user_metadata: {
+                  [BOUND_WALLET_ADDRESS_METADATA_KEY]: remoteDeviceWallet
+                }
+              }
+            },
+            error: null
+          }),
+          updateUser: updateUserB
+        }
+      } as unknown as SupabaseClient);
+
+      const resB = await signInWithGoogle({
+        keyStore,
+        storage,
+        redirectTo: "dehealth://auth-callback",
+        verifyOAuthCallback: vi.fn().mockResolvedValue(undefined)
+      });
+
+      expect(resB.walletAddress).not.toBe(resA.walletAddress);
+      expect(resB.boundWalletAddress).toBe(remoteDeviceWallet);
+      expect(resB.hasWalletMismatch).toBe(true);
+      // Must NOT overwrite remote bound_wallet_address when a mismatch occurs
+      expect(updateUserB).not.toHaveBeenCalled();
+
+      expect(await getGoogleBoundWalletAddress()).toBe(remoteDeviceWallet);
+      expect(await syncGoogleBoundWalletAddress(resB.walletAddress)).toBe(true);
+      expect(updateUserB).toHaveBeenCalledWith({
+        data: {
+          [BOUND_WALLET_ADDRESS_METADATA_KEY]: resB.walletAddress
+        }
+      });
     });
   });
 });

@@ -242,6 +242,7 @@ import {
   PlanPreviewModal
 } from "../components/PlanPreviewModal";
 import { StreakFlameHeader } from "../components/StreakFlameHeader";
+import { generateQrMatrix } from "../utils/qrMatrix";
 import { AnonymizedFeedScreen } from "../screens/AnonymizedFeedScreen";
 import { LoginScreen } from "../screens/LoginScreen";
 import {
@@ -1157,6 +1158,96 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
       expect(findByLabel(tree, "Cheer for @swift_hawk")!.disabled).toBe(true);
       expect(hasText(tree, "Cheered ✓ (4)")).toBe(true);
       expect(hasText(tree, "Cheered ✓ (8)")).toBe(true);
+    });
+  });
+
+  // ==========================================================================
+  // 6. WalletConnect QR Matrix & LoginScreen WalletConnectQrModal integration
+  // ==========================================================================
+  describe("WalletConnect QR Matrix & LoginScreen WalletConnectQrModal", () => {
+    const sampleWcUri =
+      "wc:7f6e5d4c3b2a109876543210fedcba9876543210@2?relay-protocol=irn&symKey=0123456789abcdef0123456789abcdef";
+
+    it("generateQrMatrix produces a deterministic valid square boolean module grid for a realistic WalletConnect URI", () => {
+      const m1 = generateQrMatrix(sampleWcUri);
+      const m2 = generateQrMatrix(sampleWcUri);
+
+      expect(m1).toEqual(m2);
+      expect(m1.version).toBeGreaterThanOrEqual(1);
+      expect(m1.version).toBeLessThanOrEqual(12);
+      expect(m1.size).toBe(m1.version * 4 + 17);
+      expect(m1.modules).toHaveLength(m1.size);
+      for (const row of m1.modules) {
+        expect(row).toHaveLength(m1.size);
+        for (const cell of row) {
+          expect(typeof cell).toBe("boolean");
+        }
+      }
+      // Top-left 7x7 finder pattern outer ring is dark
+      expect(m1.modules[0]?.[0]).toBe(true);
+      expect(m1.modules[0]?.[6]).toBe(true);
+      expect(m1.modules[6]?.[0]).toBe(true);
+    });
+
+    it("LoginScreen opens WalletConnectQrModal with matrix & URI, copies URI, and triggers onCancelWalletConnect on close", async () => {
+      const setStringAsync = vi.fn().mockResolvedValue(true);
+      setClipboardAdapterForTesting({ setStringAsync });
+
+      let resolveWcSignIn!: () => void;
+      const onSignInWithWalletConnect = vi.fn(
+        (onDisplayUri?: (uri: string) => void) => {
+          onDisplayUri?.(sampleWcUri);
+          return new Promise<void>((resolve) => {
+            resolveWcSignIn = resolve;
+          });
+        }
+      );
+      const onCancelWalletConnect = vi.fn(() => {
+        resolveWcSignIn();
+      });
+
+      const props = {
+        onSignInWithGoogle: vi.fn(),
+        onSignInWithMetaMask: vi.fn(),
+        onSignInWithWalletConnect,
+        isWalletConnectConfigured: true,
+        onCancelWalletConnect
+      };
+
+      let tree = renderWithHarness(LoginScreen, props);
+      expect(findByTestId(tree, "wc-qr-modal")).toBeNull();
+
+      // Trigger WalletConnect sign-in -> emits display_uri -> renders QR modal
+      const wcBtn = findByTestId(tree, "login-walletconnect-button");
+      expect(wcBtn).not.toBeNull();
+      (wcBtn!.onPress as () => void)();
+      await flushMicrotasks();
+
+      tree = renderWithHarness(LoginScreen, props);
+      expect(findByTestId(tree, "wc-qr-modal")).not.toBeNull();
+      expect(findByTestId(tree, "wc-qr-matrix")).not.toBeNull();
+      const uriTextNode = findByTestId(tree, "wc-pairing-uri-text");
+      expect(uriTextNode).not.toBeNull();
+      expect(uriTextNode!.children).toBe(sampleWcUri);
+      expect(hasText(tree, sampleWcUri)).toBe(true);
+
+      // Copy URI button copies exact pairing URI
+      const copyBtn = findByTestId(tree, "wc-copy-uri-button");
+      expect(copyBtn).not.toBeNull();
+      (copyBtn!.onPress as () => void)();
+      await flushMicrotasks();
+
+      expect(setStringAsync).toHaveBeenCalledWith(sampleWcUri);
+
+      // Close button cancels pairing and hides modal
+      const closeBtn = findByTestId(tree, "wc-qr-close-button");
+      expect(closeBtn).not.toBeNull();
+      (closeBtn!.onPress as () => void)();
+      await flushMicrotasks();
+
+      expect(onCancelWalletConnect).toHaveBeenCalledTimes(1);
+      tree = renderWithHarness(LoginScreen, props);
+      expect(findByTestId(tree, "wc-qr-modal")).toBeNull();
     });
   });
 });

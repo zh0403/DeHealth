@@ -6,20 +6,32 @@ import { signWorkoutProof } from "../services/cryptoService";
 import {
   ARBISCAN_SEPOLIA_BASE_URL,
   claimStreakReward,
+  DEFAULT_ARBITRUM_SEPOLIA_FALLBACK_RPC_URLS,
   DEFAULT_INSUFFICIENT_GAS_MESSAGE,
+  DEFAULT_RPC_RATE_LIMIT_MESSAGE,
   DEMO_VERIFYING_CONTRACT,
+  executeWithRpcResilience,
+  fetchLiveL2InspectorStatus,
+  fetchNativeEthBalance,
   fetchOnChainNonce,
   fetchTokenBalance,
+  formatNativeEthBalance,
   generateSimulatedTxHash,
   getL2Provider,
+  getL2RpcUrls,
   getRewardGateAddress,
   getTokenAddress,
   InsufficientGasError,
   isL2Configured,
+  isLowGasEthBalance,
   MIN_FALLBACK_GAS_BALANCE_WEI,
   resetL2Config,
+  RpcRateLimitError,
   setContractFactory,
+  setL2FallbackRpcUrlsForTesting,
   setL2Provider,
+  setL2ProviderFactoryForTesting,
+  setL2RetryDelayForTesting,
   setRewardGateAddress,
   setTokenAddress,
   ZERO_ADDRESS
@@ -861,6 +873,266 @@ describe("Milestone 3 R4: L2 Contract Service Unit Test Suite", () => {
       expect(typeof firstParam.data).toBe("string");
       expect(String(firstParam.data)).toMatch(/^0x/);
       expect(getTransactionReceiptMock).toHaveBeenCalledWith(expectedTxHash);
+    });
+  });
+
+  // ============================================================================
+  // 7. RPC Resilience: Backoff Retry & Multi-RPC Failover
+  // ============================================================================
+  describe("RPC Resilience: Backoff Retry & Multi-RPC Failover", () => {
+    it("retries with exponential backoff (200ms, 400ms) on HTTP 429 and recovers on retry", async () => {
+      const recordedDelays: number[] = [];
+      setL2RetryDelayForTesting(async (ms: number) => {
+        recordedDelays.push(ms);
+      });
+
+      const primaryUrl = "https://primary.rpc.example";
+      process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL = primaryUrl;
+      setL2FallbackRpcUrlsForTesting([]);
+      setL2ProviderFactoryForTesting((rpcUrl) => ({ rpcUrl } as unknown as Provider));
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+
+      let callCount = 0;
+      setContractFactory(() => ({
+        nonces: vi.fn().mockImplementation(async () => {
+          callCount += 1;
+          if (callCount <= 2) {
+            throw { status: 429, message: "429 Too Many Requests" };
+          }
+          return 11n;
+        })
+      }));
+
+      const nonce = await fetchOnChainNonce(testWallet.address as Address, 0n);
+      expect(nonce).toBe(11n);
+      expect(callCount).toBe(3);
+      expect(recordedDelays).toEqual([200, 400]);
+    });
+
+    it("fails over from primary RPC to DEFAULT_ARBITRUM_SEPOLIA_FALLBACK_RPC_URLS and sticks to the healthy endpoint", async () => {
+      const recordedDelays: number[] = [];
+      setL2RetryDelayForTesting(async (ms: number) => {
+        recordedDelays.push(ms);
+      });
+
+      const primaryUrl = "https://primary-throttled.rpc.example";
+      process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL = primaryUrl;
+
+      const rpcUrls = getL2RpcUrls();
+      expect(rpcUrls[0]).toBe(primaryUrl);
+      expect(rpcUrls.slice(1)).toEqual([...DEFAULT_ARBITRUM_SEPOLIA_FALLBACK_RPC_URLS]);
+      expect(rpcUrls.some((url) => url.includes("publicnode"))).toBe(true);
+      expect(rpcUrls.some((url) => url.includes("drpc"))).toBe(true);
+      expect(rpcUrls.some((url) => url.includes("sepolia-rollup.arbitrum.io/rpc"))).toBe(true);
+
+      const endpointCalls: string[] = [];
+      setL2ProviderFactoryForTesting(
+        (rpcUrl) =>
+          ({
+            rpcUrl,
+            getTransactionCount: vi.fn().mockImplementation(async () => {
+              endpointCalls.push(rpcUrl);
+              if (rpcUrl === primaryUrl) {
+                throw new Error("HTTP 429 Too Many Requests");
+              }
+              return 9;
+            })
+          }) as unknown as Provider
+      );
+
+      // First call: primary fails 3 times (initial + 2 retries), then fails over to publicnode
+      const firstStatus = await fetchLiveL2InspectorStatus(
+        testWallet.address as Address
+      );
+      expect(firstStatus.rpcReachable).toBe(true);
+      expect(firstStatus.liveNonce).toBe(9n);
+      expect(endpointCalls).toEqual([
+        primaryUrl,
+        primaryUrl,
+        primaryUrl,
+        DEFAULT_ARBITRUM_SEPOLIA_FALLBACK_RPC_URLS[0]
+      ]);
+      expect(recordedDelays).toEqual([200, 400]);
+
+      // Second call: sticky activeRpcIndex starts directly on publicnode
+      endpointCalls.length = 0;
+      const secondStatus = await fetchLiveL2InspectorStatus(
+        testWallet.address as Address
+      );
+      expect(secondStatus.rpcReachable).toBe(true);
+      expect(secondStatus.liveNonce).toBe(9n);
+      expect(endpointCalls).toEqual([
+        DEFAULT_ARBITRUM_SEPOLIA_FALLBACK_RPC_URLS[0]
+      ]);
+    });
+
+    it("throws RpcRateLimitError when all endpoints exhaust retries, and fails immediately on non-429 or InsufficientGasError", async () => {
+      const recordedDelays: number[] = [];
+      setL2RetryDelayForTesting(async (ms: number) => {
+        recordedDelays.push(ms);
+      });
+
+      process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL = "https://primary.rpc.example";
+      setL2FallbackRpcUrlsForTesting(["https://fallback.rpc.example"]);
+      setL2ProviderFactoryForTesting((rpcUrl) => ({ rpcUrl } as unknown as Provider));
+
+      let attempts = 0;
+      let caughtError: unknown = null;
+      try {
+        await executeWithRpcResilience(async () => {
+          attempts += 1;
+          throw { status: 429 };
+        });
+      } catch (err: unknown) {
+        caughtError = err;
+      }
+      expect(caughtError).toBeInstanceOf(RpcRateLimitError);
+      expect((caughtError as RpcRateLimitError).message).toBe(
+        DEFAULT_RPC_RATE_LIMIT_MESSAGE
+      );
+      expect(attempts).toBe(6); // 2 endpoints * (1 initial + 2 retries)
+      expect(recordedDelays).toEqual([200, 400, 200, 400]);
+
+      // Non-429 error fails immediately without retrying
+      recordedDelays.length = 0;
+      let non429Attempts = 0;
+      await expect(
+        executeWithRpcResilience(async () => {
+          non429Attempts += 1;
+          throw new Error("execution reverted");
+        })
+      ).rejects.toThrow("execution reverted");
+      expect(non429Attempts).toBe(1);
+      expect(recordedDelays).toEqual([]);
+
+      // InsufficientGasError fails immediately without retrying
+      let gasAttempts = 0;
+      await expect(
+        executeWithRpcResilience(async () => {
+          gasAttempts += 1;
+          throw new InsufficientGasError(DEFAULT_INSUFFICIENT_GAS_MESSAGE, {
+            signerAddress: testWallet.address as Address,
+            balanceWei: 0n,
+            requiredWei: MIN_FALLBACK_GAS_BALANCE_WEI
+          });
+        })
+      ).rejects.toThrowError(InsufficientGasError);
+      expect(gasAttempts).toBe(1);
+      expect(recordedDelays).toEqual([]);
+    });
+
+    it("claimStreakReward retries tx.wait() on 429 without re-invoking gateContract.claimStreakReward, and retries 429 during estimateGas", async () => {
+      const recordedDelays: number[] = [];
+      setL2RetryDelayForTesting(async (ms: number) => {
+        recordedDelays.push(ms);
+      });
+
+      const primaryUrl = "https://primary-claim.rpc.example";
+      const fallbackUrl = "https://fallback-claim.rpc.example";
+      process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL = primaryUrl;
+      setL2FallbackRpcUrlsForTesting([fallbackUrl]);
+      setRewardGateAddress(TEST_GATE_ADDRESS);
+
+      const mockTxHash =
+        "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+      let waitCalls = 0;
+      const waitMock = vi.fn().mockImplementation(async () => {
+        waitCalls += 1;
+        if (waitCalls === 1) {
+          throw {
+            info: { responseStatus: "429 Too Many Requests" },
+            message: "429 Too Many Requests"
+          };
+        }
+        return { hash: mockTxHash, status: 1 };
+      });
+
+      const claimMock = vi.fn().mockResolvedValue({
+        hash: mockTxHash,
+        wait: waitMock
+      }) as unknown as {
+        (...args: unknown[]): Promise<{ hash: string; wait: typeof waitMock }>;
+        estimateGas: ReturnType<typeof vi.fn>;
+      };
+
+      let estimateCalls = 0;
+      claimMock.estimateGas = vi.fn().mockImplementation(async () => {
+        estimateCalls += 1;
+        if (estimateCalls === 1) {
+          throw { status: 429, message: "429 Too Many Requests" };
+        }
+        return 100_000n;
+      });
+
+      setL2ProviderFactoryForTesting(
+        (rpcUrl) =>
+          ({
+            rpcUrl,
+            getBalance: vi.fn().mockResolvedValue(parseEther("0.05")),
+            getFeeData: vi.fn().mockResolvedValue({
+              maxFeePerGas: 100_000_000n,
+              gasPrice: 100_000_000n
+            })
+          }) as unknown as Provider
+      );
+      setContractFactory(() => ({
+        claimStreakReward: claimMock
+      }));
+
+      const proof: WorkoutProof = {
+        user: testWallet.address as Address,
+        telemetryHash:
+          "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" as Bytes32,
+        streakCount: 7n,
+        nonce: 4n,
+        deadline: BigInt(Math.floor(Date.now() / 1000) + 3600)
+      };
+      const payload = await signWorkoutProof(testWallet, proof, TEST_GATE_ADDRESS);
+
+      const result = await claimStreakReward(payload, testWallet);
+      expect(result.mode).toBe("live");
+      expect(result.txHash).toBe(mockTxHash);
+      expect(result.explorerUrl).toBe(`${ARBISCAN_SEPOLIA_BASE_URL}/${mockTxHash}`);
+      expect(estimateCalls).toBe(2);
+      expect(claimMock).toHaveBeenCalledTimes(1);
+      expect(waitMock).toHaveBeenCalledTimes(2);
+      expect(recordedDelays).toEqual([200, 200]);
+    });
+
+    it("fetchNativeEthBalance formats live ETH balances with RPC 429 failover and evaluates low-gas thresholds", async () => {
+      const testWallet = new Wallet(TEST_PRIVATE_KEY);
+      expect(formatNativeEthBalance(0n)).toBe("0.0000");
+      expect(formatNativeEthBalance(parseEther("0.01234"))).toBe("0.0123");
+      expect(formatNativeEthBalance(parseEther("0.000025"))).toBe("0.000025");
+
+      expect(isLowGasEthBalance("0.00005")).toBe(true);
+      expect(isLowGasEthBalance("0.0000")).toBe(true);
+      expect(isLowGasEthBalance("0.0001")).toBe(false);
+      expect(isLowGasEthBalance("0.0250")).toBe(false);
+      expect(isLowGasEthBalance(null)).toBe(false);
+
+      // Unconfigured provider falls back cleanly
+      expect(
+        await fetchNativeEthBalance(testWallet.address as Address, "0.0000")
+      ).toBe("0.0000");
+
+      setL2RetryDelayForTesting(async () => undefined);
+      const primaryUrl = "https://primary-eth.rpc.example";
+      const fallbackUrl = "https://fallback-eth.rpc.example";
+      process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL = primaryUrl;
+      setL2FallbackRpcUrlsForTesting([fallbackUrl]);
+
+      setL2ProviderFactoryForTesting((rpcUrl) => ({
+        getBalance: vi.fn().mockImplementation(async () => {
+          if (rpcUrl === primaryUrl) {
+            throw { status: 429, message: "Too Many Requests" };
+          }
+          return parseEther("0.0425");
+        })
+      }) as unknown as Provider);
+
+      const liveEth = await fetchNativeEthBalance(testWallet.address as Address);
+      expect(liveEth).toBe("0.0425");
     });
   });
 });

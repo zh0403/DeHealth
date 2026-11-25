@@ -169,9 +169,14 @@ vi.mock("react-native", () => ({
 }));
 
 import {
+  addFoodUnitsToDailyPlan,
+  convertFoodUnitsToGrams,
   DUAL_TRACK_FOOD_PRESETS,
+  formatFoodQuantityLabel,
+  getFoodPresetUnitSpec,
   MicroCheckInScreen,
-  MicroCheckInScreenProps
+  MicroCheckInScreenProps,
+  scaleFoodPresetByUnits
 } from "../screens/MicroCheckInScreen";
 import { generate14DayPlan } from "../services/adaptivePlanEngine";
 import {
@@ -1217,6 +1222,148 @@ describe("Ephemeral Daily Buffer & Dual-Mode Check-In Suite", () => {
       });
       expect(hasText(treeStale, "0 meals")).toBe(true);
       expect(hasText(treeStale, "0 / 5,000 steps")).toBe(true);
+    });
+  });
+
+  describe("Food Portion Measurement Units & Macro Scaling", () => {
+    it("covers all 5 measurement units (g, ml, egg, serving, cup) in DUAL_TRACK_FOOD_PRESETS with Chicken Breast at index 0", () => {
+      expect(DUAL_TRACK_FOOD_PRESETS[0]?.id).toBe("preset_chicken_breast");
+      expect(DUAL_TRACK_FOOD_PRESETS[0]?.unitSpec.unit).toBe("g");
+
+      const units = new Set(
+        DUAL_TRACK_FOOD_PRESETS.map((preset) => preset.unitSpec.unit)
+      );
+      expect(units).toEqual(new Set(["g", "ml", "egg", "serving", "cup"]));
+    });
+
+    it("accurately converts and scales macros for egg, ml, cup, and serving units", () => {
+      const eggPreset = DUAL_TRACK_FOOD_PRESETS.find(
+        (p) => p.id === "preset_whole_egg"
+      )!;
+      const milkPreset = DUAL_TRACK_FOOD_PRESETS.find(
+        (p) => p.id === "preset_milk_ml"
+      )!;
+      const brownRicePreset = DUAL_TRACK_FOOD_PRESETS.find(
+        (p) => p.id === "preset_brown_rice"
+      )!;
+      const wheyPreset = DUAL_TRACK_FOOD_PRESETS.find(
+        (p) => p.id === "preset_whey_protein"
+      )!;
+
+      const twoEggs = scaleFoodPresetByUnits(eggPreset, 2);
+      expect(twoEggs.equivalentGrams).toBe(100);
+      expect(twoEggs.scaled.caloriesKcal).toBe(144);
+      expect(twoEggs.scaled.proteinGrams).toBe(12.6);
+      expect(twoEggs.quantityLabel).toBe("2 eggs");
+
+      const milk250 = scaleFoodPresetByUnits(milkPreset, 250);
+      expect(milk250.equivalentGrams).toBe(250);
+      expect(milk250.scaled.caloriesKcal).toBe(125);
+      expect(milk250.scaled.proteinGrams).toBe(8.5);
+      expect(milk250.quantityLabel).toBe("250ml");
+
+      const oneCupRice = scaleFoodPresetByUnits(brownRicePreset, 1);
+      expect(oneCupRice.equivalentGrams).toBe(195);
+      expect(oneCupRice.quantityLabel).toBe("1 cup");
+      expect(
+        formatFoodQuantityLabel(1.5, getFoodPresetUnitSpec(brownRicePreset))
+      ).toBe("1.5 cups");
+
+      const twoServingsWhey = scaleFoodPresetByUnits(wheyPreset, 2);
+      expect(twoServingsWhey.equivalentGrams).toBe(60);
+      expect(twoServingsWhey.scaled.caloriesKcal).toBe(240);
+      expect(twoServingsWhey.scaled.proteinGrams).toBe(48);
+      expect(twoServingsWhey.quantityLabel).toBe("2 servings");
+
+      expect(convertFoodUnitsToGrams(eggPreset, 3)).toBe(150);
+
+      const cycle = generate14DayPlan(
+        DEFAULT_BASELINE_BIOMETRICS,
+        1_700_000_000_000
+      );
+      const emptyDay: DailyPlan = {
+        ...cycle.dailyPlans[0]!,
+        loggedCaloriesKcal: 0,
+        loggedProteinGrams: 0,
+        loggedCarbsGrams: 0,
+        loggedFatGrams: 0
+      };
+
+      const afterEggs = addFoodUnitsToDailyPlan(emptyDay, eggPreset, 2);
+      expect(afterEggs.loggedCaloriesKcal).toBe(144);
+      expect(afterEggs.loggedProteinGrams).toBe(12.6);
+
+      const afterMilk = addFoodUnitsToDailyPlan(afterEggs, milkPreset, 250);
+      expect(afterMilk.loggedCaloriesKcal).toBe(269);
+      expect(afterMilk.loggedProteinGrams).toBe(21.1);
+    });
+
+    it("updates unit quick chips on preset selection and logs unit-scaled macros in Detailed Log UI", async () => {
+      const wallet = Wallet.createRandom();
+      const cycle = generate14DayPlan(
+        DEFAULT_BASELINE_BIOMETRICS,
+        1_700_000_000_000
+      );
+      const emptyDay: DailyPlan = {
+        ...cycle.dailyPlans[0]!,
+        loggedCaloriesKcal: 0,
+        loggedProteinGrams: 0,
+        loggedCarbsGrams: 0,
+        loggedFatGrams: 0
+      };
+      const onUpdateDailyPlan = vi.fn();
+
+      const props: MicroCheckInScreenProps = {
+        userAddress: wallet.address as Address,
+        verifyingContract: TEST_GATE_ADDRESS,
+        currentStreak: 1,
+        currentNonce: 0n,
+        signer: wallet,
+        dailyPlan: emptyDay,
+        cycleId: "cycle_units_ui",
+        currentDateKey: "2026-11-21",
+        initialCheckInMode: "detailed",
+        initialPedometerAvailable: false,
+        onUpdateDailyPlan,
+        onDispatchSignedClaim: vi.fn().mockResolvedValue(undefined)
+      };
+
+      let tree = renderWithHarness(MicroCheckInScreen, props);
+
+      // Select Whole Egg preset -> switches quick chips to eggs and default quantity to 2
+      const eggChip = findByTestId(tree, "food-preset-chip-preset_whole_egg");
+      expect(eggChip).not.toBeNull();
+      (eggChip!.onPress as () => void)();
+      tree = renderWithHarness(MicroCheckInScreen, props);
+
+      expect(hasText(tree, "Portion Amount (eggs):")).toBe(true);
+      expect(hasText(tree, "2 eggs Whole Egg")).toBe(true);
+      const qtyInput = findByTestId(tree, "portion-quantity-input");
+      expect(qtyInput?.value).toBe("2");
+      expect(qtyInput?.accessibilityLabel).toBe("Portion grams input");
+
+      // Log 2 eggs
+      const logBtn = findByLabel(tree, "Log Food Portion");
+      expect(logBtn).not.toBeNull();
+      (logBtn!.onPress as () => void)();
+      await Promise.resolve();
+      await Promise.resolve();
+      tree = renderWithHarness(MicroCheckInScreen, props);
+
+      expect(onUpdateDailyPlan).toHaveBeenCalledTimes(1);
+      const firstPlan = onUpdateDailyPlan.mock.calls[0]![0] as DailyPlan;
+      expect(firstPlan.loggedCaloriesKcal).toBe(144);
+      expect(firstPlan.loggedProteinGrams).toBe(12.6);
+      expect(hasText(tree, "Whole Egg (2 eggs)")).toBe(true);
+
+      // Select Low-Fat Milk preset -> switches quick chips to ml and default quantity to 250
+      const milkChip = findByTestId(tree, "food-preset-chip-preset_milk_ml");
+      expect(milkChip).not.toBeNull();
+      (milkChip!.onPress as () => void)();
+      tree = renderWithHarness(MicroCheckInScreen, props);
+
+      expect(hasText(tree, "Portion Amount (ml):")).toBe(true);
+      expect(hasText(tree, "250ml Low-Fat Milk")).toBe(true);
     });
   });
 });

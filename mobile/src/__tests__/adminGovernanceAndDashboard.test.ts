@@ -8,6 +8,129 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+interface HarnessState {
+  active: boolean;
+  slots: unknown[];
+  refs: { current: unknown }[];
+  effects: { deps?: readonly unknown[]; cleanup?: (() => void) | void }[];
+  pending: (() => void)[];
+  stateIndex: number;
+  refIndex: number;
+  effectIndex: number;
+  dirty: boolean;
+}
+
+const harness = vi.hoisted<HarnessState>(() => ({
+  active: false,
+  slots: [],
+  refs: [],
+  effects: [],
+  pending: [],
+  stateIndex: 0,
+  refIndex: 0,
+  effectIndex: 0,
+  dirty: false
+}));
+
+vi.mock("react", async () => {
+  const actual = await vi.importActual<typeof import("react")>("react");
+
+  const useState = <T,>(
+    initial: T | (() => T)
+  ): [T, (next: T | ((prev: T) => T)) => void] => {
+    if (!harness.active) {
+      return actual.useState(initial);
+    }
+    const i = harness.stateIndex++;
+    if (!(i in harness.slots)) {
+      harness.slots[i] =
+        typeof initial === "function" ? (initial as () => T)() : initial;
+    }
+    const setter = (next: T | ((prev: T) => T)): void => {
+      const prev = harness.slots[i] as T;
+      const value =
+        typeof next === "function" ? (next as (p: T) => T)(prev) : next;
+      if (!Object.is(prev, value)) {
+        harness.slots[i] = value;
+        harness.dirty = true;
+      }
+    };
+    return [harness.slots[i] as T, setter];
+  };
+
+  const useEffect = (
+    fn: () => void | (() => void),
+    deps?: readonly unknown[]
+  ): void => {
+    if (!harness.active) {
+      actual.useEffect(fn, deps);
+      return;
+    }
+    const i = harness.effectIndex++;
+    const prev = harness.effects[i];
+    const changed =
+      !prev ||
+      !deps ||
+      !prev.deps ||
+      deps.some((d, k) => !Object.is(d, prev.deps?.[k]));
+    if (changed) {
+      harness.effects[i] = { deps, cleanup: prev?.cleanup };
+      harness.pending.push(() => {
+        if (typeof harness.effects[i]?.cleanup === "function") {
+          harness.effects[i]!.cleanup!();
+        }
+        const cleanup = fn();
+        harness.effects[i] = { deps, cleanup };
+      });
+    }
+  };
+
+  const useMemo = <T,>(factory: () => T, deps?: readonly unknown[]): T => {
+    if (!harness.active) {
+      return actual.useMemo(factory, deps ?? []);
+    }
+    return factory();
+  };
+
+  const useRef = <T,>(initial: T): { current: T } => {
+    if (!harness.active) {
+      return actual.useRef(initial);
+    }
+    const i = harness.refIndex++;
+    if (!(i in harness.refs)) {
+      harness.refs[i] = { current: initial };
+    }
+    return harness.refs[i] as { current: T };
+  };
+
+  const useCallback = <T extends (...args: never[]) => unknown>(
+    fn: T,
+    deps?: readonly unknown[]
+  ): T => {
+    if (!harness.active) {
+      return actual.useCallback(fn, deps ?? []);
+    }
+    return fn;
+  };
+
+  return {
+    ...actual,
+    default: {
+      ...actual,
+      useState,
+      useEffect,
+      useMemo,
+      useRef,
+      useCallback
+    },
+    useState,
+    useEffect,
+    useMemo,
+    useRef,
+    useCallback
+  };
+});
+
 interface CapturedPressable {
   readonly text: string;
   readonly accessibilityLabel?: string;
@@ -101,7 +224,8 @@ import {
   GovernanceModalPinUiMode,
   validateGovernanceInput
 } from "../components/AdminGovernanceModal";
-import { DashboardScreen } from "../screens/DashboardScreen";
+import { DashboardScreen, DashboardScreenProps } from "../screens/DashboardScreen";
+import * as clipboardService from "../services/clipboardService";
 import {
   hasMinimumDailyProgress,
   MicroCheckInScreen
@@ -789,6 +913,273 @@ describe("Governance UI and L2 inspector integration", () => {
 
       expect(markup).toContain("Recovery Mode (-50% Volume)");
       expect(markup).toContain("-50% Fatigue Scaled");
+    });
+  });
+
+  describe("DashboardScreen Wallet Key Management & External Signer Delegation", () => {
+    function resetHarness(): void {
+      harness.active = false;
+      harness.slots = [];
+      harness.refs = [];
+      harness.effects = [];
+      harness.pending = [];
+      harness.stateIndex = 0;
+      harness.refIndex = 0;
+      harness.effectIndex = 0;
+      harness.dirty = false;
+    }
+
+    function renderWithHarness<P>(
+      component: React.FC<P>,
+      props: P
+    ): React.ReactNode {
+      harness.active = true;
+      harness.stateIndex = 0;
+      harness.refIndex = 0;
+      harness.effectIndex = 0;
+      harness.pending = [];
+      const tree = component(props);
+      const effects = harness.pending;
+      harness.pending = [];
+      for (const run of effects) {
+        run();
+      }
+      if (harness.dirty) {
+        harness.dirty = false;
+        return renderWithHarness(component, props);
+      }
+      return tree;
+    }
+
+    function findElement(
+      node: React.ReactNode,
+      predicate: (elProps: Record<string, unknown>) => boolean
+    ): Record<string, unknown> | null {
+      if (Array.isArray(node)) {
+        for (const child of node) {
+          const hit = findElement(child, predicate);
+          if (hit) return hit;
+        }
+        return null;
+      }
+      if (React.isValidElement(node)) {
+        const props = node.props as Record<string, unknown>;
+        if (predicate(props)) {
+          return props;
+        }
+        return findElement(props.children as React.ReactNode, predicate);
+      }
+      return null;
+    }
+
+    function findByTestId(
+      node: React.ReactNode,
+      testID: string
+    ): Record<string, unknown> | null {
+      return findElement(node, (elProps) => elProps.testID === testID);
+    }
+
+    function hasText(node: React.ReactNode, needle: string): boolean {
+      return extractText(node).includes(needle);
+    }
+
+    async function flushAsync(): Promise<void> {
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+
+    afterEach(() => {
+      resetHarness();
+      vi.restoreAllMocks();
+    });
+
+    const baseDashboardProps = (): DashboardScreenProps => {
+      const wallet = Wallet.createRandom();
+      return {
+        streakCount: 4,
+        tokenBalanceDht: "40",
+        lastProofHash: null,
+        targetAssessment: {
+          fitnessTier: "balanced-conditioning",
+          baselineSteps: 6000,
+          baselineActiveMinutes: 30,
+          adjustedSteps: 6000,
+          adjustedActiveMinutes: 30,
+          isFatigueScaled: false,
+          hoursSinceLastLog: null,
+          scalingFactorApplied: 1
+        },
+        userAddress: wallet.address as Address,
+        embeddedWalletAddress: wallet.address as Address,
+        authSession: {
+          authMethod: "google",
+          accountId: "google-user-1",
+          displayLabel: "alice@example.com",
+          walletAddress: wallet.address as Address,
+          signedInAtMs: 1_700_000_000_000
+        }
+      };
+    };
+
+    it("keeps private key hidden by default in Wallet Key Management Modal, reveals & copies on demand, and validates/imports 64-hex keys", async () => {
+      const secretKey = Wallet.createRandom().privateKey;
+      const importedWallet = Wallet.createRandom();
+      const bare64Hex = importedWallet.privateKey.slice(2);
+      const onExportPrivateKey = vi.fn().mockResolvedValue(secretKey);
+      const onImportPrivateKey = vi
+        .fn()
+        .mockResolvedValue(importedWallet.address as Address);
+      const copySpy = vi
+        .spyOn(clipboardService, "copyTextToClipboard")
+        .mockResolvedValue(true);
+
+      const props: DashboardScreenProps = {
+        ...baseDashboardProps(),
+        onExportPrivateKey,
+        onImportPrivateKey
+      };
+
+      let tree = renderWithHarness(DashboardScreen, props);
+
+      // Modal is closed by default and private key is NOT exported or visible
+      const closedModal = findByTestId(tree, "wallet-key-management-modal");
+      expect(closedModal?.visible).toBe(false);
+      expect(onExportPrivateKey).not.toHaveBeenCalled();
+
+      // Open modal
+      const openBtn = findByTestId(tree, "dashboard-manage-wallet-key-button");
+      expect(openBtn).not.toBeNull();
+      (openBtn!.onPress as () => void)();
+      tree = renderWithHarness(DashboardScreen, props);
+
+      const openModal = findByTestId(tree, "wallet-key-management-modal");
+      expect(openModal?.visible).toBe(true);
+      expect(hasText(tree, "⚠️ SECURITY WARNING")).toBe(true);
+      expect(hasText(tree, "••••••••••••••••••••••••••••••••")).toBe(true);
+      expect(findByTestId(tree, "wallet-key-revealed-value")).toBeNull();
+      expect(onExportPrivateKey).not.toHaveBeenCalled();
+
+      // Reveal private key on demand
+      const revealBtn = findByTestId(tree, "wallet-key-reveal-toggle");
+      expect(revealBtn).not.toBeNull();
+      (revealBtn!.onPress as () => void)();
+      await flushAsync();
+      tree = renderWithHarness(DashboardScreen, props);
+
+      expect(onExportPrivateKey).toHaveBeenCalledTimes(1);
+      const revealedEl = findByTestId(tree, "wallet-key-revealed-value");
+      expect(revealedEl).not.toBeNull();
+      expect(revealedEl?.children).toBe(secretKey);
+
+      // Copy private key
+      const copyBtn = findByTestId(tree, "wallet-key-copy-button");
+      expect(copyBtn).not.toBeNull();
+      (copyBtn!.onPress as () => void)();
+      await flushAsync();
+      expect(copySpy).toHaveBeenCalledWith(secretKey);
+
+      // Invalid key rejected inline without calling onImportPrivateKey
+      const importInput = findByTestId(tree, "wallet-key-import-input");
+      expect(importInput).not.toBeNull();
+      (importInput!.onChangeText as (t: string) => void)("not-a-valid-key");
+      tree = renderWithHarness(DashboardScreen, props);
+
+      const submitBtn = findByTestId(tree, "wallet-key-import-submit");
+      (submitBtn!.onPress as () => void)();
+      await flushAsync();
+      tree = renderWithHarness(DashboardScreen, props);
+
+      expect(onImportPrivateKey).not.toHaveBeenCalled();
+      expect(findByTestId(tree, "wallet-key-import-error")).not.toBeNull();
+
+      // Valid 64-hex key (without 0x prefix) normalized to 0x... and imported
+      const refreshedInput = findByTestId(tree, "wallet-key-import-input");
+      (refreshedInput!.onChangeText as (t: string) => void)(bare64Hex);
+      tree = renderWithHarness(DashboardScreen, props);
+
+      const refreshedSubmit = findByTestId(tree, "wallet-key-import-submit");
+      (refreshedSubmit!.onPress as () => void)();
+      await flushAsync();
+      tree = renderWithHarness(DashboardScreen, props);
+
+      expect(onImportPrivateKey).toHaveBeenCalledWith(`0x${bare64Hex}`);
+      expect(findByTestId(tree, "wallet-key-import-error")).toBeNull();
+      expect(findByTestId(tree, "wallet-key-revealed-value")).toBeNull();
+      expect(findByTestId(tree, "wallet-key-modal-feedback")).not.toBeNull();
+      expect(findByTestId(tree, "wallet-key-import-input")?.value).toBe("");
+    });
+
+    it("renders Mini Wallet Widget with $ETH & $DHT balances, low-gas reminder, mismatch banner, and zero external-link controls", () => {
+      const base = baseDashboardProps();
+      const remoteBoundAddress = Wallet.createRandom().address as Address;
+
+      const lowGasMismatchProps: DashboardScreenProps = {
+        ...base,
+        nativeEthBalance: "0.0000",
+        tokenBalanceDht: "30.0",
+        boundWalletAddress: remoteBoundAddress,
+        isWalletMismatch: true
+      };
+
+      let tree = renderWithHarness(DashboardScreen, lowGasMismatchProps);
+      expect(findByTestId(tree, "dashboard-mini-wallet-widget")).not.toBeNull();
+      expect(findByTestId(tree, "dashboard-external-wallet-card")).toBeNull();
+      expect(findByTestId(tree, "dashboard-link-metamask-button")).toBeNull();
+      expect(findByTestId(tree, "dashboard-link-walletconnect-button")).toBeNull();
+
+      expect(hasText(tree, "0.0000 ETH")).toBe(true);
+      expect(hasText(tree, "30.0 DHT")).toBe(true);
+      expect(findByTestId(tree, "dashboard-low-gas-reminder")).not.toBeNull();
+      expect(findByTestId(tree, "dashboard-wallet-mismatch-banner")).not.toBeNull();
+      expect(hasText(tree, remoteBoundAddress)).toBe(true);
+
+      // Clicking Import Bound Private Key opens the Key Management Modal
+      const mismatchBtn = findByTestId(tree, "dashboard-mismatch-import-button");
+      expect(mismatchBtn).not.toBeNull();
+      (mismatchBtn!.onPress as () => void)();
+      tree = renderWithHarness(DashboardScreen, lowGasMismatchProps);
+      expect(findByTestId(tree, "wallet-key-management-modal")).not.toBeNull();
+
+      // Funded & matched wallet hides low-gas reminder and mismatch banner
+      resetHarness();
+      const fundedProps: DashboardScreenProps = {
+        ...base,
+        nativeEthBalance: "0.0250",
+        tokenBalanceDht: "30.0",
+        boundWalletAddress: base.userAddress,
+        isWalletMismatch: false
+      };
+      tree = renderWithHarness(DashboardScreen, fundedProps);
+      expect(hasText(tree, "0.0250 ETH")).toBe(true);
+      expect(findByTestId(tree, "dashboard-low-gas-reminder")).toBeNull();
+      expect(findByTestId(tree, "dashboard-wallet-mismatch-banner")).toBeNull();
+    });
+
+    it("renders read-only External Wallet Card with $ETH & $DHT and no private-key export/import controls", () => {
+      const base = baseDashboardProps();
+      const externalAddress = Wallet.createRandom().address as Address;
+      const externalProps: DashboardScreenProps = {
+        ...base,
+        userAddress: externalAddress,
+        nativeEthBalance: "0.1500",
+        tokenBalanceDht: "50.0",
+        authSession: {
+          authMethod: "metamask",
+          accountId: externalAddress,
+          displayLabel: "MetaMask",
+          walletAddress: externalAddress,
+          signedInAtMs: 1_700_000_000_000
+        }
+      };
+
+      const tree = renderWithHarness(DashboardScreen, externalProps);
+      expect(findByTestId(tree, "dashboard-external-wallet-card")).not.toBeNull();
+      expect(findByTestId(tree, "dashboard-mini-wallet-widget")).toBeNull();
+      expect(hasText(tree, "0.1500 ETH")).toBe(true);
+      expect(hasText(tree, "50.0 DHT")).toBe(true);
+      expect(findByTestId(tree, "dashboard-manage-wallet-key-button")).toBeNull();
+      expect(findByTestId(tree, "wallet-key-management-modal")).toBeNull();
+      expect(findByTestId(tree, "dashboard-low-gas-reminder")).toBeNull();
     });
   });
 });

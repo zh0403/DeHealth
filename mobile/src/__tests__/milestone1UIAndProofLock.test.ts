@@ -414,7 +414,7 @@ describe("Milestone 1 NEW-03, R1, R2, and R3 UI Integration", () => {
 
       const markup = renderToStaticMarkup(element);
 
-      expect(markup).toContain("Embedded Testnet Wallet");
+      expect(markup).toContain("Embedded Mini Wallet");
       expect(markup).toContain("Arbitrum Sepolia");
       expect(markup).toContain(dummyUserAddress);
       expect(markup).toContain("Copy Address");
