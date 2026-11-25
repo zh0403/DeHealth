@@ -22,3 +22,5 @@ export * from "./components/PlanReviewModal";
 export * from "./components/PlanPreviewModal";
 export * from "./components/AdminGovernanceModal";
 export * from "./components/ErrorNoticeModal";
+export * from "./components/WalletConnectQrModal";
+export * from "./utils/qrMatrix";

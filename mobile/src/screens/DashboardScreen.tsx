@@ -23,6 +23,7 @@ import {
 import {
   AdminGovernanceModal
 } from "../components/AdminGovernanceModal";
+import { copyWalletAddressToClipboard } from "../components/ErrorNoticeModal";
 import {
   applyApprovedPlanReview,
   keepCurrentPlanOnReview,
@@ -42,6 +43,7 @@ import {
 } from "../services/adaptivePlanEngine";
 import { copyTextToClipboard } from "../services/clipboardService";
 import {
+  isLowGasEthBalance,
   L2InspectorStatus,
   L2ServiceMode
 } from "../services/l2ContractService";
@@ -57,6 +59,7 @@ import {
   resetGovernanceConfig,
   saveGovernanceConfig
 } from "../storage/governanceStorage";
+import { isValidPrivateKey } from "../storage/walletStorage";
 
 export interface WeightLogValidationResult {
   readonly isValid: boolean;
@@ -153,6 +156,11 @@ export interface DashboardScreenProps {
   ) => Promise<void> | void;
   /** User wallet address for Arbitrum Sepolia testnet funding and display */
   readonly userAddress?: Address | null;
+  readonly embeddedWalletAddress?: Address | null;
+  readonly nativeEthBalance?: string | null;
+  readonly boundWalletAddress?: Address | null;
+  readonly isWalletMismatch?: boolean;
+  readonly onImportPrivateKey?: (privateKey: string) => Promise<Address | void> | Address | void;
   /** Callback or direct function to export private key with security warning */
   readonly onExportPrivateKey?: () => Promise<string> | string;
   /** Optional transaction hash, explorer URL, and mode from L2 */
@@ -185,6 +193,11 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   onLogWeightEntry,
   onUpdatePlanCycle,
   userAddress,
+  embeddedWalletAddress = null,
+  nativeEthBalance = null,
+  boundWalletAddress = null,
+  isWalletMismatch = false,
+  onImportPrivateKey,
   onExportPrivateKey,
   lastTxHash,
   lastExplorerUrl,
@@ -296,20 +309,36 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   const [isSubmittingReview, setIsSubmittingReview] = useState<boolean>(false);
   const isSubmittingReviewRef = useRef<boolean>(false);
 
-  const [isPrivateKeyRevealed, setIsPrivateKeyRevealed] = useState<boolean>(false);
+  const [isWalletKeyModalOpen, setIsWalletKeyModalOpen] = useState<boolean>(false);
+  const [isModalKeyRevealed, setIsModalKeyRevealed] = useState<boolean>(false);
   const [exportedPrivateKey, setExportedPrivateKey] = useState<string | null>(null);
   const [isExportingKey, setIsExportingKey] = useState<boolean>(false);
+  const [importKeyInput, setImportKeyInput] = useState<string>("");
+  const [importKeyError, setImportKeyError] = useState<string | null>(null);
+  const [walletKeyModalFeedback, setWalletKeyModalFeedback] = useState<string | null>(null);
+  const [isImportingKey, setIsImportingKey] = useState<boolean>(false);
+  const isImportingKeyRef = useRef<boolean>(false);
   const [walletFeedback, setWalletFeedback] = useState<string | null>(null);
   const [isSigningOut, setIsSigningOut] = useState<boolean>(false);
   const isSigningOutRef = useRef<boolean>(false);
 
-  const effectiveUserAddress = (userAddress ??
-    "0x0000000000000000000000000000000000000000") as Address;
-  const isExternalWallet =
+  const isExternalSession =
     authSession?.authMethod === "metamask" ||
     authSession?.authMethod === "walletconnect";
   const externalWalletProviderLabel =
     authSession?.authMethod === "metamask" ? "MetaMask" : "WalletConnect";
+  const activeWalletAddress = userAddress ?? embeddedWalletAddress ?? null;
+  const effectiveUserAddress = (activeWalletAddress ??
+    "0x0000000000000000000000000000000000000000") as Address;
+  const hasWalletMismatch =
+    !isExternalSession &&
+    Boolean(
+      isWalletMismatch ||
+        (boundWalletAddress &&
+          activeWalletAddress &&
+          boundWalletAddress.toLowerCase() !== activeWalletAddress.toLowerCase())
+    );
+  const isLowGas = !isExternalSession && isLowGasEthBalance(nativeEthBalance);
   const authMethodBadgeLabel =
     authSession?.authMethod === "google"
       ? "Google OAuth"
@@ -348,7 +377,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
   };
 
   const handleCopy = async (text: string, label: string): Promise<void> => {
-    const copied = await copyTextToClipboard(text);
+    const copied = await copyWalletAddressToClipboard(text);
     setWalletFeedback(
       copied
         ? `${label} copied to clipboard!`
@@ -372,30 +401,82 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
     }
   };
 
-  const handleToggleExportPrivateKey = async (): Promise<void> => {
-    if (isPrivateKeyRevealed) {
-      setIsPrivateKeyRevealed(false);
-      return;
-    }
-    if (exportedPrivateKey) {
-      setIsPrivateKeyRevealed(true);
+  const handleOpenWalletKeyModal = (): void => {
+    setIsModalKeyRevealed(false);
+    setImportKeyInput("");
+    setImportKeyError(null);
+    setWalletKeyModalFeedback(null);
+    setIsWalletKeyModalOpen(true);
+  };
+
+  const handleCloseWalletKeyModal = (): void => {
+    setIsWalletKeyModalOpen(false);
+    setIsModalKeyRevealed(false);
+    setImportKeyInput("");
+    setImportKeyError(null);
+  };
+
+  const handleToggleModalPrivateKey = async (): Promise<void> => {
+    if (isModalKeyRevealed) {
+      setIsModalKeyRevealed(false);
       return;
     }
     if (!onExportPrivateKey) {
-      setWalletFeedback("Private key export is not configured in this runtime.");
+      setWalletKeyModalFeedback("Private key export is not configured in this runtime.");
       return;
     }
     setIsExportingKey(true);
     try {
       const key = await onExportPrivateKey();
       setExportedPrivateKey(key);
-      setIsPrivateKeyRevealed(true);
-      setWalletFeedback("Private key successfully retrieved from secure storage.");
+      setIsModalKeyRevealed(true);
+      setWalletKeyModalFeedback("Private key retrieved from device SecureStore.");
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : "Failed to export private key";
-      setWalletFeedback(`Export error: ${msg}`);
+      setWalletKeyModalFeedback(`Export error: ${msg}`);
+      onErrorRef.current?.(err);
     } finally {
       setIsExportingKey(false);
+    }
+  };
+
+  const handleImportPrivateKeySubmit = async (): Promise<void> => {
+    if (isImportingKeyRef.current || isImportingKey) {
+      return;
+    }
+    const trimmed = importKeyInput.trim();
+    const normalized = /^[0-9a-fA-F]{64}$/.test(trimmed)
+      ? `0x${trimmed}`
+      : trimmed;
+
+    if (!isValidPrivateKey(normalized)) {
+      setImportKeyError(
+        "Invalid private key. Enter a valid 64-character hex key (with or without 0x prefix)."
+      );
+      return;
+    }
+    if (!onImportPrivateKey) {
+      setImportKeyError("Private key import is not configured in this runtime.");
+      return;
+    }
+
+    setImportKeyError(null);
+    isImportingKeyRef.current = true;
+    setIsImportingKey(true);
+    try {
+      await Promise.resolve(onImportPrivateKey(normalized));
+      setImportKeyInput("");
+      setExportedPrivateKey(null);
+      setIsModalKeyRevealed(false);
+      setWalletKeyModalFeedback("Private key imported into secure storage.");
+      setWalletFeedback("Embedded wallet private key updated in SecureStore.");
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to import private key";
+      setImportKeyError(msg);
+      onErrorRef.current?.(err);
+    } finally {
+      isImportingKeyRef.current = false;
+      setIsImportingKey(false);
     }
   };
 
@@ -947,25 +1028,80 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         )}
       </View>
 
-      {/* Wallet Card (External Connected or Embedded Testnet Wallet) */}
-      <View style={styles.card}>
+      {/* Wallet Card (Mutually Exclusive: Embedded Mini Wallet vs. Read-Only External Wallet) */}
+      <View
+        testID={
+          isExternalSession
+            ? "dashboard-external-wallet-card"
+            : "dashboard-mini-wallet-widget"
+        }
+        style={styles.card}
+      >
         <View style={styles.cardHeaderRow}>
           <Text style={styles.label}>
-            {isExternalWallet
+            {isExternalSession
               ? "Connected External Wallet"
-              : "Embedded Testnet Wallet"}
+              : "Embedded Mini Wallet"}
           </Text>
           <Text style={styles.walletBadgeTag}>Arbitrum Sepolia</Text>
         </View>
 
         <Text style={styles.walletDescription}>
-          {isExternalWallet
+          {isExternalSession
             ? `Connected via ${externalWalletProviderLabel} on Arbitrum Sepolia. Signing stays inside your external wallet.`
-            : "Non-custodial key persisted on-device in secure storage. Fund with Arbitrum Sepolia ETH to submit cryptographic claims on-chain."}
+            : "Unified in-app non-custodial wallet persisted in device SecureStore. Sign daily EIP-712 proofs directly without wallet popups."}
         </Text>
 
+        {/* Live $ETH Gas + $DHT Token Balances */}
+        <View testID="dashboard-wallet-balances-row" style={styles.balancesRow}>
+          <View style={styles.balanceBox}>
+            <Text style={styles.balanceLabel}>Arbitrum Sepolia Gas</Text>
+            <Text testID="dashboard-eth-balance-value" style={styles.balanceValue}>
+              {nativeEthBalance ?? "0.0000"} ETH
+            </Text>
+          </View>
+          <View style={styles.balanceBox}>
+            <Text style={styles.balanceLabel}>Habit Rewards</Text>
+            <Text testID="dashboard-dht-balance-value" style={styles.balanceValue}>
+              {tokenBalanceDht} DHT
+            </Text>
+          </View>
+        </View>
+
+        {hasWalletMismatch && boundWalletAddress ? (
+          <View testID="dashboard-wallet-mismatch-banner" style={styles.mismatchBanner}>
+            <Text style={styles.mismatchTitle}>⚠️ Cross-Device Wallet Mismatch</Text>
+            <Text style={styles.mismatchBody}>
+              Your Google account is bound to {boundWalletAddress}, which differs from this device&apos;s local wallet. Import your private key to restore signing for your bound wallet.
+            </Text>
+            <Pressable
+              testID="dashboard-mismatch-import-button"
+              accessibilityRole="button"
+              accessibilityLabel="Import Bound Private Key"
+              style={({ pressed }) => [
+                styles.mismatchBtn,
+                pressed ? styles.btnPressed : null
+              ]}
+              onPress={handleOpenWalletKeyModal}
+            >
+              <Text style={styles.mismatchBtnText}>🔑 Import Bound Private Key</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {isLowGas ? (
+          <View testID="dashboard-low-gas-reminder" style={styles.lowGasBanner}>
+            <Text style={styles.lowGasTitle}>⛽ Low Arbitrum Sepolia Gas</Text>
+            <Text style={styles.lowGasBody}>
+              Your $ETH balance is below 0.0001 ETH. Send Arbitrum Sepolia ETH to your 0x address below to cover on-chain proof claims.
+            </Text>
+          </View>
+        ) : null}
+
         <View style={styles.walletAddressBox}>
-          <Text style={styles.walletSubLabel}>Public Address:</Text>
+          <Text style={styles.walletSubLabel}>
+            {isExternalSession ? "Public Address:" : "Bound Wallet Address:"}
+          </Text>
           <Text
             selectable
             accessibilityLabel="Wallet Public Address"
@@ -973,11 +1109,12 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
             numberOfLines={1}
             ellipsizeMode="middle"
           >
-            {userAddress ?? "0x0000000000000000000000000000000000000000"}
+            {effectiveUserAddress}
           </Text>
 
           <View style={styles.walletBtnRow}>
             <Pressable
+              testID="dashboard-copy-address-button"
               accessibilityRole="button"
               accessibilityLabel="Copy Address"
               style={({ pressed }) => [
@@ -985,70 +1122,32 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
                 pressed ? styles.btnPressed : null
               ]}
               onPress={() => {
-                if (userAddress) {
-                  void handleCopy(userAddress, "Address");
+                if (activeWalletAddress) {
+                  void handleCopy(activeWalletAddress, "Address");
                 }
               }}
             >
               <Text style={styles.walletActionBtnText}>📋 Copy Address</Text>
             </Pressable>
 
-            {!isExternalWallet ? (
+            {!isExternalSession ? (
               <Pressable
+                testID="dashboard-manage-wallet-key-button"
                 accessibilityRole="button"
                 accessibilityLabel="Export Private Key"
                 style={({ pressed }) => [
                   styles.walletSecondaryBtn,
                   pressed ? styles.btnPressed : null
                 ]}
-                disabled={isExportingKey}
-                onPress={() => {
-                  void handleToggleExportPrivateKey();
-                }}
+                onPress={handleOpenWalletKeyModal}
               >
                 <Text style={styles.walletSecondaryBtnText}>
-                  {isExportingKey
-                    ? "Decrypting..."
-                    : isPrivateKeyRevealed
-                      ? "Hide Private Key"
-                      : "🔑 Export Private Key"}
+                  🔑 Manage & Export Private Key
                 </Text>
               </Pressable>
             ) : null}
           </View>
         </View>
-
-        {!isExternalWallet && isPrivateKeyRevealed && exportedPrivateKey ? (
-          <View style={styles.privateKeyWarningBox}>
-            <Text style={styles.warningTitle}>⚠️ SECURITY WARNING</Text>
-            <Text style={styles.warningText}>
-              Never share your private key. Anyone with this key can access and transfer all assets in this wallet. DeHealth will never ask for this key.
-            </Text>
-
-            <Text style={styles.walletSubLabel}>Raw Private Key (Hardware Keystore):</Text>
-            <Text
-              selectable
-              accessibilityLabel="Exported Private Key"
-              style={styles.walletKeyText}
-            >
-              {exportedPrivateKey}
-            </Text>
-
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Copy Private Key"
-              style={({ pressed }) => [
-                styles.walletCopyKeyBtn,
-                pressed ? styles.btnPressed : null
-              ]}
-              onPress={() => {
-                void handleCopy(exportedPrivateKey, "Private Key");
-              }}
-            >
-              <Text style={styles.walletCopyKeyBtnText}>📋 Copy Private Key</Text>
-            </Pressable>
-          </View>
-        ) : null}
 
         {walletFeedback ? (
           <Text style={styles.walletFeedbackText}>{walletFeedback}</Text>
@@ -1254,6 +1353,160 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({
         initialInspectorStatus={initialInspectorStatus}
         loadInspectorStatus={loadInspectorStatus}
       />
+
+      {/* Embedded Wallet Key Management Modal (only for Google/Local embedded track) */}
+      {!isExternalSession ? (
+        <Modal
+          visible={isWalletKeyModalOpen}
+          transparent
+          animationType="slide"
+          testID="wallet-key-management-modal"
+          onRequestClose={handleCloseWalletKeyModal}
+        >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Embedded Wallet Key Management</Text>
+
+            <View style={styles.privateKeyWarningBox}>
+              <Text style={styles.warningTitle}>⚠️ SECURITY WARNING</Text>
+              <Text style={styles.warningText}>
+                Never share your private key. It never leaves this device&apos;s SecureStore. You may import this key into MetaMask to fund testnet gas on Arbitrum Sepolia.
+              </Text>
+            </View>
+
+            <Text style={styles.walletSubLabel}>Reveal Private Key</Text>
+            {isModalKeyRevealed && exportedPrivateKey ? (
+              <View>
+                <Text
+                  selectable
+                  testID="wallet-key-revealed-value"
+                  accessibilityLabel="Exported Private Key"
+                  style={styles.walletKeyText}
+                >
+                  {exportedPrivateKey}
+                </Text>
+                <Pressable
+                  testID="wallet-key-copy-button"
+                  accessibilityRole="button"
+                  accessibilityLabel="Copy Private Key"
+                  style={({ pressed }) => [
+                    styles.walletCopyKeyBtn,
+                    pressed ? styles.btnPressed : null
+                  ]}
+                  onPress={() => {
+                    void copyTextToClipboard(exportedPrivateKey).then((copied) => {
+                      const msg = copied
+                        ? "Private Key copied to clipboard!"
+                        : "Private Key selected. Copy via keyboard or long press.";
+                      setWalletKeyModalFeedback(msg);
+                      setWalletFeedback(msg);
+                    });
+                  }}
+                >
+                  <Text style={styles.walletCopyKeyBtnText}>📋 Copy Private Key</Text>
+                </Pressable>
+              </View>
+            ) : (
+              <Text style={styles.walletKeyMaskedText}>
+                ••••••••••••••••••••••••••••••••
+              </Text>
+            )}
+
+            <Pressable
+              testID="wallet-key-reveal-toggle"
+              accessibilityRole="button"
+              accessibilityLabel={
+                isModalKeyRevealed ? "Hide Private Key" : "Reveal Private Key"
+              }
+              disabled={isExportingKey}
+              style={({ pressed }) => [
+                styles.walletSecondaryBtn,
+                { marginTop: 8, marginBottom: 12 },
+                pressed ? styles.btnPressed : null
+              ]}
+              onPress={() => {
+                void handleToggleModalPrivateKey();
+              }}
+            >
+              <Text style={styles.walletSecondaryBtnText}>
+                {isExportingKey
+                  ? "Decrypting..."
+                  : isModalKeyRevealed
+                    ? "Hide Private Key"
+                    : "Reveal Private Key"}
+              </Text>
+            </Pressable>
+
+            <Text style={styles.walletSubLabel}>Import Private Key into SecureStore</Text>
+            <TextInput
+              testID="wallet-key-import-input"
+              accessibilityLabel="Import Private Key Input"
+              secureTextEntry={true}
+              style={styles.walletImportInput}
+              value={importKeyInput}
+              onChangeText={(text) => {
+                setImportKeyInput(text);
+                if (importKeyError) {
+                  setImportKeyError(null);
+                }
+              }}
+              placeholder="0x... (64 hex characters)"
+              placeholderTextColor="#64748B"
+              autoCapitalize="none"
+              autoCorrect={false}
+            />
+
+            {importKeyError ? (
+              <Text
+                testID="wallet-key-import-error"
+                style={styles.walletImportErrorText}
+              >
+                {importKeyError}
+              </Text>
+            ) : null}
+
+            {walletKeyModalFeedback ? (
+              <Text
+                testID="wallet-key-modal-feedback"
+                style={styles.walletFeedbackText}
+              >
+                {walletKeyModalFeedback}
+              </Text>
+            ) : null}
+
+            <View style={styles.modalBtnRow}>
+              <Pressable
+                testID="wallet-key-import-submit"
+                accessibilityRole="button"
+                accessibilityLabel="Import Private Key"
+                disabled={isImportingKey}
+                style={[
+                  styles.saveWeightBtn,
+                  isImportingKey ? styles.saveWeightBtnDisabled : null
+                ]}
+                onPress={() => {
+                  void handleImportPrivateKeySubmit();
+                }}
+              >
+                <Text style={styles.saveWeightBtnText}>
+                  {isImportingKey ? "Importing..." : "Import Private Key"}
+                </Text>
+              </Pressable>
+
+              <Pressable
+                testID="wallet-key-modal-close"
+                accessibilityRole="button"
+                accessibilityLabel="Close Wallet Key Management Modal"
+                style={styles.cancelWeightBtn}
+                onPress={handleCloseWalletKeyModal}
+              >
+                <Text style={styles.cancelWeightBtnText}>Close</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+        </Modal>
+      ) : null}
     </ScrollView>
   );
 };
@@ -1941,6 +2194,111 @@ const styles = StyleSheet.create({
     color: "#34D399",
     marginTop: 6,
     marginBottom: 4
+  },
+  balancesRow: {
+    flexDirection: "row",
+    gap: 8,
+    marginBottom: 10
+  },
+  balanceBox: {
+    flex: 1,
+    backgroundColor: "#0A101D",
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#1E293B"
+  },
+  balanceLabel: {
+    fontSize: 10,
+    fontWeight: "700",
+    color: "#94A3B8",
+    textTransform: "uppercase",
+    marginBottom: 3
+  },
+  balanceValue: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#F8FAFC"
+  },
+  mismatchBanner: {
+    backgroundColor: "#2A1215",
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: "#EF4444",
+    marginBottom: 10
+  },
+  mismatchTitle: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#FCA5A5",
+    marginBottom: 4
+  },
+  mismatchBody: {
+    fontSize: 11,
+    color: "#FECACA",
+    lineHeight: 16,
+    marginBottom: 8
+  },
+  mismatchBtn: {
+    backgroundColor: "#EF4444",
+    borderRadius: 8,
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    alignItems: "center"
+  },
+  mismatchBtnText: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#FFFFFF"
+  },
+  lowGasBanner: {
+    backgroundColor: "#2A1E05",
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: "#F59E0B",
+    marginBottom: 10
+  },
+  lowGasTitle: {
+    fontSize: 12,
+    fontWeight: "800",
+    color: "#FCD34D",
+    marginBottom: 3
+  },
+  lowGasBody: {
+    fontSize: 11,
+    color: "#FDE68A",
+    lineHeight: 16
+  },
+  walletKeyMaskedText: {
+    fontFamily: "monospace",
+    fontSize: 12,
+    color: "#94A3B8",
+    backgroundColor: "#0A101D",
+    padding: 8,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: "#1E293B",
+    marginBottom: 4
+  },
+  walletImportInput: {
+    backgroundColor: "#0A101D",
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#334155",
+    color: "#F8FAFC",
+    fontFamily: "monospace",
+    fontSize: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 6
+  },
+  walletImportErrorText: {
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#F87171",
+    marginBottom: 6
   },
   explorerLinkBtn: {
     marginTop: 8,

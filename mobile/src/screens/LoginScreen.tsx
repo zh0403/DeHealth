@@ -1,6 +1,7 @@
 import { Address } from "@dehealth/shared";
 import React, { useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { WalletConnectQrModal } from "../components/WalletConnectQrModal";
 
 const ZERO_ADDRESS_REGEX = /^0x0{40}$/i;
 
@@ -37,10 +38,14 @@ function toErrorMessage(error: unknown): string {
 export interface LoginScreenProps {
   readonly onSignInWithGoogle: () => Promise<void> | void;
   readonly onSignInWithMetaMask: () => Promise<void> | void;
-  readonly onSignInWithWalletConnect: () => Promise<void> | void;
+  readonly onSignInWithWalletConnect: (
+    onDisplayUri?: (uri: string) => void
+  ) => Promise<void> | void;
   readonly isSupabaseConfigured?: boolean;
   readonly isWalletConnectConfigured?: boolean;
   readonly existingWalletAddress?: Address | null;
+  readonly walletConnectUri?: string | null;
+  readonly onCancelWalletConnect?: () => void;
   readonly onError?: (error: unknown) => void;
 }
 
@@ -53,12 +58,15 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   isSupabaseConfigured = false,
   isWalletConnectConfigured = false,
   existingWalletAddress = null,
+  walletConnectUri = null,
+  onCancelWalletConnect,
   onError
 }) => {
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [pendingMethod, setPendingMethod] = useState<PendingAuthMethod>(null);
   const isSubmittingRef = useRef<boolean>(false);
   const [inlineError, setInlineError] = useState<string | null>(null);
+  const [activePairingUri, setActivePairingUri] = useState<string | null>(null);
 
   const hasExistingWallet =
     typeof existingWalletAddress === "string" &&
@@ -86,6 +94,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       isSubmittingRef.current = false;
       setIsSubmitting(false);
       setPendingMethod(null);
+      setActivePairingUri(null);
     }
   };
 
@@ -98,8 +107,19 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   };
 
   const handleWalletConnectSignIn = (): void => {
-    void runAuthSubmission("walletconnect", onSignInWithWalletConnect);
+    void runAuthSubmission("walletconnect", () =>
+      onSignInWithWalletConnect((uri: string) => {
+        setActivePairingUri(uri);
+      })
+    );
   };
+
+  const handleCloseWalletConnectModal = (): void => {
+    setActivePairingUri(null);
+    onCancelWalletConnect?.();
+  };
+
+  const effectivePairingUri = walletConnectUri ?? activePairingUri;
 
   const googleButtonLabel = isSupabaseConfigured
     ? "Sign in with Google"
@@ -254,6 +274,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
         wallet. Zero raw biometrics, meals, weights, or step counts are ever
         uploaded.
       </Text>
+
+      <WalletConnectQrModal
+        visible={effectivePairingUri !== null}
+        uri={effectivePairingUri}
+        onClose={handleCloseWalletConnectModal}
+      />
     </ScrollView>
   );
 };

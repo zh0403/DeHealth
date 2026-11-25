@@ -3,7 +3,10 @@ import { Modal, Pressable, StyleSheet, Text, View } from "react-native";
 import { copyTextToClipboard } from "../services/clipboardService";
 import {
   DEFAULT_INSUFFICIENT_GAS_MESSAGE,
-  InsufficientGasError
+  DEFAULT_RPC_RATE_LIMIT_MESSAGE,
+  InsufficientGasError,
+  isRateLimitRpcError,
+  RpcRateLimitError
 } from "../services/l2ContractService";
 
 export interface ErrorNoticePayload {
@@ -64,6 +67,28 @@ export function toErrorNoticePayload(
       message: rawMessage ?? DEFAULT_INSUFFICIENT_GAS_MESSAGE,
       isInsufficientGas: true,
       walletAddress: signerAddress ?? normalizedFallbackAddress
+    };
+  }
+
+  if (isRateLimitRpcError(error)) {
+    const isRpcRateLimitInstance =
+      error instanceof RpcRateLimitError ||
+      (isNonArrayObject &&
+        "name" in error &&
+        error.name === "RpcRateLimitError");
+    const rawRateLimitMessage =
+      isRpcRateLimitInstance &&
+      isNonArrayObject &&
+      "message" in error &&
+      typeof error.message === "string"
+        ? normalizeNonEmpty(error.message)
+        : null;
+
+    return {
+      title: "Arbitrum Sepolia RPC Rate Limited (429)",
+      message: rawRateLimitMessage ?? DEFAULT_RPC_RATE_LIMIT_MESSAGE,
+      isInsufficientGas: false,
+      walletAddress: normalizedFallbackAddress
     };
   }
 

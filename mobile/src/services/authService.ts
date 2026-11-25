@@ -31,10 +31,14 @@ import {
   SecureKeyStore,
   VaultKeyUnavailableError
 } from "../storage/vaultKeyProvider";
-import { getOrCreatePersistentWallet } from "../storage/walletStorage";
+import {
+  DEFAULT_LOCAL_WALLET_ACCOUNT_ID,
+  getOrCreatePersistentWallet
+} from "../storage/walletStorage";
 import { assertZeroRawBiometrics, getSupabaseClient } from "./supabaseService";
 
 export const AUTH_SESSION_STORAGE_KEY = "@dehealth/auth_session";
+export const BOUND_WALLET_ADDRESS_METADATA_KEY = "bound_wallet_address";
 
 const ZERO_ADDRESS_REGEX = /^0x0{40}$/i;
 const GOOGLE_UNVERIFIED_MESSAGE =
@@ -70,7 +74,10 @@ export interface MetaMaskAdapter {
 }
 
 export interface WalletConnectAdapter {
-  connect(projectId: string): Promise<ExternalWalletConnection>;
+  connect(
+    projectId: string,
+    onDisplayUri?: (uri: string) => void
+  ): Promise<ExternalWalletConnection>;
   restoreSession?(
     projectId: string,
     expectedAddress: Address
@@ -147,6 +154,8 @@ export interface AuthSignInResult {
   readonly walletAddress: Address;
   readonly mode: AuthServiceMode;
   readonly oauthUrl?: string | null;
+  readonly boundWalletAddress?: Address | null;
+  readonly hasWalletMismatch?: boolean;
 }
 
 export interface LocalSessionOptions {
@@ -172,6 +181,8 @@ export interface MetaMaskSignInOptions {
   readonly adapter?: MetaMaskAdapter;
   readonly projectId?: string;
   readonly storage?: AuthSessionStorage;
+  readonly onDisplayUri?: (uri: string) => void;
+  readonly platformOs?: string;
   readonly nowMs?: number;
 }
 
@@ -179,6 +190,8 @@ export interface WalletConnectSignInOptions {
   readonly projectId?: string;
   readonly adapter?: WalletConnectAdapter;
   readonly storage?: AuthSessionStorage;
+  readonly onDisplayUri?: (uri: string) => void;
+  readonly platformOs?: string;
   readonly nowMs?: number;
 }
 
@@ -192,8 +205,10 @@ let customUniversalProviderModuleLoader:
   | (() => Promise<unknown>)
   | undefined = undefined;
 let customDeepLinkOpener: DeepLinkOpener | undefined = undefined;
+let customPlatformOs: string | undefined = undefined;
 let activeUniversalProvider: UniversalProviderLike | null = null;
 let activeUniversalProviderProjectId: string | null = null;
+let activeWalletConnectAbort: (() => void) | null = null;
 
 /**
  * Injects a custom MetaMask connection adapter for hermetic tests or native bridges.
@@ -229,6 +244,33 @@ export function resetWalletConnectAdapterForTesting(): void {
   customWalletConnectAdapter = undefined;
   activeUniversalProvider = null;
   activeUniversalProviderProjectId = null;
+  activeWalletConnectAbort = null;
+}
+
+/**
+ * Overrides the detected platform OS (`"web"`, `"ios"`, `"android"`, etc.) for tests.
+ */
+export function setPlatformOsForTesting(os: string | undefined): void {
+  customPlatformOs = os;
+}
+
+/**
+ * Restores default `react-native` `Platform.OS` detection.
+ */
+export function resetPlatformOsForTesting(): void {
+  customPlatformOs = undefined;
+}
+
+/**
+ * Cancels an in-flight WalletConnect v2 pairing attempt (e.g. when the user
+ * closes the web QR modal). Safe to call when no pairing is active.
+ */
+export function cancelActiveWalletConnectPairing(): void {
+  if (activeWalletConnectAbort) {
+    const abort = activeWalletConnectAbort;
+    activeWalletConnectAbort = null;
+    abort();
+  }
 }
 
 /**
@@ -832,7 +874,10 @@ export async function purgeAuthSessionStorageKey(
 export async function startLocalSession(
   options?: LocalSessionOptions
 ): Promise<AuthSignInResult> {
-  const wallet = await getOrCreatePersistentWallet(options?.keyStore);
+  const wallet = await getOrCreatePersistentWallet(
+    options?.keyStore,
+    DEFAULT_LOCAL_WALLET_ACCOUNT_ID
+  );
   const walletAddress = wallet.address as Address;
   const trimmedLabel = options?.localDisplayLabel?.trim();
   const displayLabel = (
@@ -860,7 +905,9 @@ export async function startLocalSession(
     signer: wallet,
     walletAddress,
     mode: "local-fallback",
-    oauthUrl: null
+    oauthUrl: null,
+    boundWalletAddress: walletAddress,
+    hasWalletMismatch: false
   };
 }
 
@@ -1219,9 +1266,81 @@ async function waitForOAuthDismissRecovery(
   return false;
 }
 
+function parseBoundWalletAddressFromMetadata(
+  metadata: unknown
+): Address | null {
+  const raw = extractStringProperty(metadata, BOUND_WALLET_ADDRESS_METADATA_KEY);
+  if (!raw) {
+    return null;
+  }
+  const parsed = AddressSchema.safeParse(raw);
+  if (!parsed.success || ZERO_ADDRESS_REGEX.test(parsed.data)) {
+    return null;
+  }
+  return parsed.data;
+}
+
+/**
+ * Persists only the public `bound_wallet_address` (`0x...`) in Supabase
+ * `user_metadata` for the authenticated Google user. Never transmits private keys
+ * or raw biometrics.
+ */
+export async function syncGoogleBoundWalletAddress(
+  walletAddress: Address,
+  supabaseClient?: ReturnType<typeof getSupabaseClient>
+): Promise<boolean> {
+  const validatedAddress = validateNonZeroEvmAddress(
+    walletAddress,
+    "Cannot sync invalid EVM wallet address to Google account metadata."
+  );
+  const client =
+    supabaseClient !== undefined ? supabaseClient : getSupabaseClient();
+  if (!client || typeof client.auth?.updateUser !== "function") {
+    return false;
+  }
+
+  try {
+    const res = await client.auth.updateUser({
+      data: {
+        [BOUND_WALLET_ADDRESS_METADATA_KEY]: validatedAddress
+      }
+    });
+    return !res?.error;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Retrieves the public `bound_wallet_address` from Supabase `user_metadata`
+ * for the active Google user, or returns `null` if unavailable or unset.
+ */
+export async function getGoogleBoundWalletAddress(
+  supabaseClient?: ReturnType<typeof getSupabaseClient>
+): Promise<Address | null> {
+  const client =
+    supabaseClient !== undefined ? supabaseClient : getSupabaseClient();
+  if (!client || typeof client.auth?.getUser !== "function") {
+    return null;
+  }
+
+  try {
+    const userResult = await client.auth.getUser();
+    if (userResult?.error || !userResult?.data?.user) {
+      return null;
+    }
+    return parseBoundWalletAddressFromMetadata(
+      userResult.data.user.user_metadata as unknown
+    );
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Verifies an active Supabase user (`client.auth.getUser()`), provisions the
- * persistent embedded wallet, and encrypts/saves the `"google"` auth session.
+ * per-account persistent embedded wallet, syncs/checks `bound_wallet_address`
+ * in `user_metadata`, and encrypts/saves the `"google"` auth session.
  */
 export async function hydrateVerifiedGoogleSession(
   options?: Pick<GoogleSignInOptions, "keyStore" | "storage" | "nowMs"> & {
@@ -1240,6 +1359,7 @@ export async function hydrateVerifiedGoogleSession(
   let verifiedUserId: string;
   let email: string | null = null;
   let fullName: string | null = null;
+  let remoteBoundAddress: Address | null = null;
   try {
     const userResult = await client.auth.getUser();
     if (userResult?.error) {
@@ -1258,6 +1378,9 @@ export async function hydrateVerifiedGoogleSession(
       user.user_metadata as unknown,
       "full_name"
     );
+    remoteBoundAddress = parseBoundWalletAddressFromMetadata(
+      user.user_metadata as unknown
+    );
   } catch (err) {
     if (err instanceof AuthError) {
       throw err;
@@ -1265,8 +1388,23 @@ export async function hydrateVerifiedGoogleSession(
     throw new AuthError(GOOGLE_UNVERIFIED_MESSAGE);
   }
 
-  const wallet = await getOrCreatePersistentWallet(options?.keyStore);
+  const wallet = await getOrCreatePersistentWallet(
+    options?.keyStore,
+    verifiedUserId
+  );
   const walletAddress = wallet.address as Address;
+
+  let boundWalletAddress: Address = walletAddress;
+  let hasWalletMismatch = false;
+  if (!remoteBoundAddress) {
+    await syncGoogleBoundWalletAddress(walletAddress, client);
+  } else if (remoteBoundAddress.toLowerCase() === walletAddress.toLowerCase()) {
+    boundWalletAddress = remoteBoundAddress;
+  } else {
+    boundWalletAddress = remoteBoundAddress;
+    hasWalletMismatch = true;
+  }
+
   const displayLabel = (
     email ??
     fullName ??
@@ -1292,7 +1430,9 @@ export async function hydrateVerifiedGoogleSession(
     signer: wallet,
     walletAddress,
     mode: "live",
-    oauthUrl: options?.oauthUrl ?? null
+    oauthUrl: options?.oauthUrl ?? null,
+    boundWalletAddress,
+    hasWalletMismatch
   };
 }
 
@@ -1354,7 +1494,10 @@ export async function signInWithGoogle(
         provider: "google",
         options: {
           redirectTo,
-          skipBrowserRedirect: true
+          skipBrowserRedirect: true,
+          queryParams: {
+            prompt: "select_account"
+          }
         }
       });
       if (oauthResponse.error) {
@@ -1679,11 +1822,38 @@ async function resolveUniversalProviderAddress(
   return null;
 }
 
+async function detectPlatformOs(overrideOs?: string): Promise<string> {
+  if (typeof overrideOs === "string" && overrideOs.trim().length > 0) {
+    return overrideOs.trim().toLowerCase();
+  }
+  if (typeof customPlatformOs === "string" && customPlatformOs.trim().length > 0) {
+    return customPlatformOs.trim().toLowerCase();
+  }
+  try {
+    const rn = (await import("react-native")) as {
+      readonly Platform?: {
+        readonly OS?: unknown;
+      };
+    };
+    if (typeof rn.Platform?.OS === "string" && rn.Platform.OS.trim().length > 0) {
+      return rn.Platform.OS.trim().toLowerCase();
+    }
+  } catch {
+    // Non-fatal in pure Node/Vitest environments
+  }
+  return "unknown";
+}
+
 async function connectViaNativeUniversalProvider(
   projectId: string,
   buildLaunchUri: (wcUri: string) => string,
-  providerName: "MetaMask" | "WalletConnect"
+  providerName: "MetaMask" | "WalletConnect",
+  options?: {
+    readonly onDisplayUri?: (uri: string) => void;
+    readonly platformOs?: string;
+  }
 ): Promise<ExternalWalletConnection> {
+  const platformOs = await detectPlatformOs(options?.platformOs);
   const wcProvider = await createOrReuseUniversalProvider(projectId);
   if (!wcProvider) {
     throw new AuthError(
@@ -1699,11 +1869,27 @@ async function connectViaNativeUniversalProvider(
     rejectLinkPromise = reject;
   });
 
+  activeWalletConnectAbort = () => {
+    const cancelErr = new AuthError("WalletConnect pairing was cancelled.");
+    deepLinkError = cancelErr;
+    try {
+      wcProvider.abortPairingAttempt?.();
+    } catch {
+      // Non-fatal
+    }
+    rejectLinkPromise(cancelErr);
+  };
+
   const handleDisplayUri = (rawUri: string): void => {
     if (typeof rawUri !== "string" || rawUri.trim().length === 0) {
       return;
     }
-    const targetUri = buildLaunchUri(rawUri.trim());
+    const trimmedUri = rawUri.trim();
+    if (platformOs === "web") {
+      options?.onDisplayUri?.(trimmedUri);
+      return;
+    }
+    const targetUri = buildLaunchUri(trimmedUri);
     void openDeepLinkUrl(targetUri).catch((err: unknown) => {
       const authErr = new AuthError(
         toAuthErrorMessage(
@@ -1749,6 +1935,7 @@ async function connectViaNativeUniversalProvider(
       toAuthErrorMessage(err, `${providerName} connection failed.`)
     );
   } finally {
+    activeWalletConnectAbort = null;
     if (typeof wcProvider.off === "function") {
       wcProvider.off("display_uri", handleDisplayUri);
     } else if (typeof wcProvider.removeListener === "function") {
@@ -1769,6 +1956,132 @@ async function connectViaNativeUniversalProvider(
   };
 }
 
+async function connectMetaMaskConnection(options?: {
+  readonly adapter?: MetaMaskAdapter;
+  readonly projectId?: string;
+  readonly onDisplayUri?: (uri: string) => void;
+  readonly platformOs?: string;
+}): Promise<ExternalWalletConnection> {
+  const adapter =
+    options?.adapter !== undefined ? options.adapter : customMetaMaskAdapter;
+
+  if (adapter) {
+    try {
+      return await adapter.connect();
+    } catch (err) {
+      if (err instanceof AuthError) {
+        throw err;
+      }
+      throw new AuthError(
+        toAuthErrorMessage(err, "MetaMask connection failed.")
+      );
+    }
+  }
+
+  const provider = resolveGlobalEthereumProvider();
+  if (provider) {
+    let accountsResult: unknown;
+    try {
+      accountsResult = await provider.request({
+        method: "eth_requestAccounts"
+      });
+    } catch (err) {
+      if (err instanceof AuthError) {
+        throw err;
+      }
+      throw new AuthError(
+        toAuthErrorMessage(err, "MetaMask account connection was rejected.")
+      );
+    }
+
+    const firstAccount = Array.isArray(accountsResult)
+      ? accountsResult[0]
+      : undefined;
+    if (typeof firstAccount !== "string") {
+      throw new AuthError(
+        "MetaMask did not return a valid EVM wallet address."
+      );
+    }
+
+    return {
+      address: firstAccount,
+      provider
+    };
+  }
+
+  if (customMetaMaskAdapter === null) {
+    throw new AuthError(
+      "MetaMask provider is unavailable. Install MetaMask or open the app inside the MetaMask browser."
+    );
+  }
+
+  const projectId = options?.projectId?.trim() || getWalletConnectProjectId();
+  if (!projectId) {
+    throw new AuthError(
+      "MetaMask provider is unavailable. Install MetaMask, open the app inside the MetaMask browser, or configure EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID for MetaMask Mobile."
+    );
+  }
+
+  return await connectViaNativeUniversalProvider(
+    projectId,
+    buildMetaMaskWalletConnectDeepLink,
+    "MetaMask",
+    {
+      onDisplayUri: options?.onDisplayUri,
+      platformOs: options?.platformOs
+    }
+  );
+}
+
+async function connectWalletConnectConnection(options?: {
+  readonly projectId?: string;
+  readonly adapter?: WalletConnectAdapter;
+  readonly onDisplayUri?: (uri: string) => void;
+  readonly platformOs?: string;
+}): Promise<ExternalWalletConnection> {
+  const projectId = options?.projectId?.trim() || getWalletConnectProjectId();
+  if (!projectId) {
+    throw new AuthError(
+      "WalletConnect Project ID is not configured. Set EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID to connect."
+    );
+  }
+
+  const adapter =
+    options?.adapter !== undefined
+      ? options.adapter
+      : customWalletConnectAdapter;
+  if (adapter === null) {
+    throw new AuthError(
+      "WalletConnect v2 provider is unavailable in this environment."
+    );
+  }
+
+  if (adapter !== undefined) {
+    try {
+      return options?.onDisplayUri
+        ? await adapter.connect(projectId, options.onDisplayUri)
+        : await adapter.connect(projectId);
+    } catch (err) {
+      if (err instanceof AuthError) {
+        throw err;
+      }
+      throw new AuthError(
+        toAuthErrorMessage(err, "WalletConnect connection failed.")
+      );
+    }
+  }
+
+  return await connectViaNativeUniversalProvider(
+    projectId,
+    (uri) => uri,
+    "WalletConnect",
+    {
+      onDisplayUri: options?.onDisplayUri,
+      platformOs: options?.platformOs
+    }
+  );
+}
+
 /**
  * Connects an external MetaMask / injected EIP-1193 wallet and persists a
  * strictly non-biometric `metamask` session backed by an EIP-1193 signer.
@@ -1778,70 +2091,12 @@ async function connectViaNativeUniversalProvider(
 export async function signInWithMetaMask(
   options?: MetaMaskSignInOptions
 ): Promise<AuthSignInResult> {
-  const adapter =
-    options?.adapter !== undefined ? options.adapter : customMetaMaskAdapter;
-  let connection: ExternalWalletConnection;
-
-  if (adapter) {
-    try {
-      connection = await adapter.connect();
-    } catch (err) {
-      if (err instanceof AuthError) {
-        throw err;
-      }
-      throw new AuthError(
-        toAuthErrorMessage(err, "MetaMask connection failed.")
-      );
-    }
-  } else {
-    const provider = resolveGlobalEthereumProvider();
-    if (provider) {
-      let accountsResult: unknown;
-      try {
-        accountsResult = await provider.request({
-          method: "eth_requestAccounts"
-        });
-      } catch (err) {
-        if (err instanceof AuthError) {
-          throw err;
-        }
-        throw new AuthError(
-          toAuthErrorMessage(err, "MetaMask account connection was rejected.")
-        );
-      }
-
-      const firstAccount = Array.isArray(accountsResult)
-        ? accountsResult[0]
-        : undefined;
-      if (typeof firstAccount !== "string") {
-        throw new AuthError(
-          "MetaMask did not return a valid EVM wallet address."
-        );
-      }
-
-      connection = {
-        address: firstAccount,
-        provider
-      };
-    } else if (customMetaMaskAdapter === null) {
-      throw new AuthError(
-        "MetaMask provider is unavailable. Install MetaMask or open the app inside the MetaMask browser."
-      );
-    } else {
-      const projectId =
-        options?.projectId?.trim() || getWalletConnectProjectId();
-      if (!projectId) {
-        throw new AuthError(
-          "MetaMask provider is unavailable. Install MetaMask, open the app inside the MetaMask browser, or configure EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID for MetaMask Mobile."
-        );
-      }
-      connection = await connectViaNativeUniversalProvider(
-        projectId,
-        buildMetaMaskWalletConnectDeepLink,
-        "MetaMask"
-      );
-    }
-  }
+  const connection = await connectMetaMaskConnection({
+    adapter: options?.adapter,
+    projectId: options?.projectId,
+    onDisplayUri: options?.onDisplayUri,
+    platformOs: options?.platformOs
+  });
 
   const validatedAddress = validateNonZeroEvmAddress(
     connection.address,
@@ -1879,42 +2134,12 @@ export async function signInWithMetaMask(
 export async function signInWithWalletConnect(
   options?: WalletConnectSignInOptions
 ): Promise<AuthSignInResult> {
-  const projectId = options?.projectId?.trim() || getWalletConnectProjectId();
-  if (!projectId) {
-    throw new AuthError(
-      "WalletConnect Project ID is not configured. Set EXPO_PUBLIC_WALLETCONNECT_PROJECT_ID to connect."
-    );
-  }
-
-  const adapter =
-    options?.adapter !== undefined
-      ? options.adapter
-      : customWalletConnectAdapter;
-  if (adapter === null) {
-    throw new AuthError(
-      "WalletConnect v2 provider is unavailable in this environment."
-    );
-  }
-
-  let connection: ExternalWalletConnection;
-  if (adapter !== undefined) {
-    try {
-      connection = await adapter.connect(projectId);
-    } catch (err) {
-      if (err instanceof AuthError) {
-        throw err;
-      }
-      throw new AuthError(
-        toAuthErrorMessage(err, "WalletConnect connection failed.")
-      );
-    }
-  } else {
-    connection = await connectViaNativeUniversalProvider(
-      projectId,
-      (uri) => uri,
-      "WalletConnect"
-    );
-  }
+  const connection = await connectWalletConnectConnection({
+    projectId: options?.projectId,
+    adapter: options?.adapter,
+    onDisplayUri: options?.onDisplayUri,
+    platformOs: options?.platformOs
+  });
 
   const validatedAddress = validateNonZeroEvmAddress(
     connection.address,
@@ -2080,6 +2305,54 @@ export async function restoreExternalWalletSignerOnBoot(
   }
 }
 
+const SUPABASE_WEB_STORAGE_KEY_REGEX = /^sb-.*-(auth-token|code-verifier)$/i;
+
+function isEphemeralWebAuthStorageKey(key: string): boolean {
+  return (
+    key === AUTH_SESSION_STORAGE_KEY ||
+    key === "supabase.auth.token" ||
+    SUPABASE_WEB_STORAGE_KEY_REGEX.test(key) ||
+    key.startsWith("wc@2:")
+  );
+}
+
+function clearWebAuthSessionStorageKeys(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const webStorages: (Storage | undefined)[] = [];
+  try {
+    webStorages.push(window.localStorage);
+  } catch {
+    // Ignore restricted localStorage access
+  }
+  try {
+    webStorages.push(window.sessionStorage);
+  } catch {
+    // Ignore restricted sessionStorage access
+  }
+
+  for (const store of webStorages) {
+    if (!store || typeof store.length !== "number" || typeof store.key !== "function") {
+      continue;
+    }
+    const keysToRemove: string[] = [];
+    for (let i = 0; i < store.length; i += 1) {
+      const k = store.key(i);
+      if (typeof k === "string" && isEphemeralWebAuthStorageKey(k)) {
+        keysToRemove.push(k);
+      }
+    }
+    for (const key of keysToRemove) {
+      try {
+        store.removeItem(key);
+      } catch {
+        // Non-fatal
+      }
+    }
+  }
+}
+
 /**
  * Signs out the active auth session while preserving the persistent wallet,
  * vault secret, biometrics, weight logs, plans, and governance config.
@@ -2128,4 +2401,15 @@ export async function signOutSession(options?: {
   inFlightOAuthExchanges.clear();
   completedOAuthExchanges.clear();
   await clearPersistedAuthSession(options?.storage);
+
+  if (!options?.storage) {
+    try {
+      if (typeof AsyncStorage?.removeItem === "function") {
+        await AsyncStorage.removeItem(AUTH_SESSION_STORAGE_KEY);
+      }
+    } catch {
+      // Best-effort AsyncStorage cleanup
+    }
+    clearWebAuthSessionStorageKeys();
+  }
 }

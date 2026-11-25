@@ -125,7 +125,98 @@ export const HABIT_CARDS: readonly HabitCardDefinition[] = [
   }
 ];
 
-export const DUAL_TRACK_FOOD_PRESETS: readonly FoodPresetItem[] = Object.freeze([
+export type FoodMeasurementUnit = "g" | "ml" | "egg" | "serving" | "cup";
+
+export interface FoodPresetUnitSpec {
+  readonly unit: FoodMeasurementUnit;
+  readonly singularLabel: string;
+  readonly pluralLabel: string;
+  readonly gramsPerUnit: number;
+  readonly defaultQuantity: number;
+  readonly quickQuantities: readonly number[];
+}
+
+export interface DetailedFoodPreset extends FoodPresetItem {
+  readonly unitSpec: FoodPresetUnitSpec;
+}
+
+const FOOD_UNIT_SPEC_BY_ID: Readonly<Record<string, FoodPresetUnitSpec>> =
+  Object.freeze({
+    preset_chicken_breast: Object.freeze({
+      unit: "g",
+      singularLabel: "g",
+      pluralLabel: "g",
+      gramsPerUnit: 1,
+      defaultQuantity: 150,
+      quickQuantities: Object.freeze([100, 150, 200, 250])
+    }),
+    preset_brown_rice: Object.freeze({
+      unit: "cup",
+      singularLabel: "cup",
+      pluralLabel: "cups",
+      gramsPerUnit: 195,
+      defaultQuantity: 1,
+      quickQuantities: Object.freeze([0.5, 1, 1.5, 2])
+    }),
+    preset_whey_protein: Object.freeze({
+      unit: "serving",
+      singularLabel: "serving",
+      pluralLabel: "servings",
+      gramsPerUnit: 30,
+      defaultQuantity: 1,
+      quickQuantities: Object.freeze([1, 1.5, 2])
+    }),
+    preset_whole_egg: Object.freeze({
+      unit: "egg",
+      singularLabel: "egg",
+      pluralLabel: "eggs",
+      gramsPerUnit: 50,
+      defaultQuantity: 2,
+      quickQuantities: Object.freeze([1, 2, 3, 4])
+    }),
+    preset_rolled_oats: Object.freeze({
+      unit: "cup",
+      singularLabel: "cup",
+      pluralLabel: "cups",
+      gramsPerUnit: 80,
+      defaultQuantity: 0.5,
+      quickQuantities: Object.freeze([0.5, 1, 1.5])
+    }),
+    preset_greek_yogurt: Object.freeze({
+      unit: "serving",
+      singularLabel: "serving",
+      pluralLabel: "servings",
+      gramsPerUnit: 150,
+      defaultQuantity: 1,
+      quickQuantities: Object.freeze([0.5, 1, 1.5, 2])
+    }),
+    preset_white_rice: Object.freeze({
+      unit: "cup",
+      singularLabel: "cup",
+      pluralLabel: "cups",
+      gramsPerUnit: 158,
+      defaultQuantity: 1,
+      quickQuantities: Object.freeze([0.5, 1, 1.5, 2])
+    }),
+    preset_mixed_veggies: Object.freeze({
+      unit: "g",
+      singularLabel: "g",
+      pluralLabel: "g",
+      gramsPerUnit: 1,
+      defaultQuantity: 150,
+      quickQuantities: Object.freeze([50, 100, 150, 200])
+    }),
+    preset_milk_ml: Object.freeze({
+      unit: "ml",
+      singularLabel: "ml",
+      pluralLabel: "ml",
+      gramsPerUnit: 1,
+      defaultQuantity: 250,
+      quickQuantities: Object.freeze([100, 200, 250, 500])
+    })
+  });
+
+const BASE_FOOD_PRESETS: readonly FoodPresetItem[] = [
   ...STANDARD_FOOD_PRESETS,
   Object.freeze({
     id: "preset_white_rice",
@@ -146,8 +237,36 @@ export const DUAL_TRACK_FOOD_PRESETS: readonly FoodPresetItem[] = Object.freeze(
     carbsGrams: 13,
     fatGrams: 0.4,
     category: "micronutrients"
+  }),
+  Object.freeze({
+    id: "preset_milk_ml",
+    name: "Low-Fat Milk",
+    servingSizeGrams: 250,
+    caloriesKcal: 125,
+    proteinGrams: 8.5,
+    carbsGrams: 12.5,
+    fatGrams: 4.5,
+    category: "dairy"
   })
-]);
+];
+
+export const DUAL_TRACK_FOOD_PRESETS: readonly DetailedFoodPreset[] = Object.freeze(
+  BASE_FOOD_PRESETS.map((preset) =>
+    Object.freeze({
+      ...preset,
+      unitSpec:
+        FOOD_UNIT_SPEC_BY_ID[preset.id] ??
+        Object.freeze({
+          unit: "g" as const,
+          singularLabel: "g",
+          pluralLabel: "g",
+          gramsPerUnit: 1,
+          defaultQuantity: preset.servingSizeGrams > 0 ? preset.servingSizeGrams : 100,
+          quickQuantities: Object.freeze([50, 100, 150, 200, 250])
+        })
+    })
+  )
+);
 
 export type CheckInMode = "quick" | "detailed";
 
@@ -156,6 +275,7 @@ export interface LoggedMealRecord {
   readonly presetId: string;
   readonly name: string;
   readonly grams: number;
+  readonly quantityDisplay?: string;
   readonly caloriesKcal: number;
   readonly proteinGrams: number;
   readonly carbsGrams: number;
@@ -262,6 +382,99 @@ export function addFoodPortionToDailyPlan(
     loggedCarbsGrams: nextCarbs,
     loggedFatGrams: nextFat
   };
+}
+
+/**
+ * Returns the measurement unit specification for a food preset, falling back
+ * to gram-based scaling if no preset-specific unit is configured.
+ */
+export function getFoodPresetUnitSpec(preset: FoodPresetItem): FoodPresetUnitSpec {
+  const maybeDetailed = preset as Partial<DetailedFoodPreset>;
+  if (maybeDetailed.unitSpec) {
+    return maybeDetailed.unitSpec;
+  }
+  const mapped = FOOD_UNIT_SPEC_BY_ID[preset.id];
+  if (mapped) {
+    return mapped;
+  }
+  return {
+    unit: "g",
+    singularLabel: "g",
+    pluralLabel: "g",
+    gramsPerUnit: 1,
+    defaultQuantity: preset.servingSizeGrams > 0 ? preset.servingSizeGrams : 100,
+    quickQuantities: [50, 100, 150, 200, 250]
+  };
+}
+
+/**
+ * Formats a food portion quantity with its unit (e.g. "150g", "250ml",
+ * "1 egg", "2 eggs", "1.5 servings", "1 cup").
+ */
+export function formatFoodQuantityLabel(
+  quantity: number,
+  spec: FoodPresetUnitSpec
+): string {
+  const safeQty = Number.isFinite(quantity) && quantity >= 0 ? quantity : 0;
+  const formattedQty = Number.isInteger(safeQty)
+    ? String(safeQty)
+    : String(Number(safeQty.toFixed(2)));
+  if (spec.unit === "g" || spec.unit === "ml") {
+    return `${formattedQty}${spec.unit}`;
+  }
+  const unitLabel = safeQty === 1 ? spec.singularLabel : spec.pluralLabel;
+  return `${formattedQty} ${unitLabel}`;
+}
+
+/**
+ * Converts a food preset quantity in its configured measurement unit to
+ * equivalent grams for canonical macro scaling.
+ */
+export function convertFoodUnitsToGrams(
+  preset: FoodPresetItem,
+  quantity: number
+): number {
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    throw new Error("Portion quantity must be a positive finite number");
+  }
+  const spec = getFoodPresetUnitSpec(preset);
+  return Number((quantity * spec.gramsPerUnit).toFixed(2));
+}
+
+/**
+ * Scales a food preset by a quantity in its measurement unit and returns the
+ * equivalent grams, scaled macro breakdown, and formatted quantity label.
+ */
+export function scaleFoodPresetByUnits(
+  preset: FoodPresetItem,
+  quantity: number
+): {
+  readonly equivalentGrams: number;
+  readonly scaled: FoodPresetItem;
+  readonly quantityLabel: string;
+} {
+  const spec = getFoodPresetUnitSpec(preset);
+  const equivalentGrams = convertFoodUnitsToGrams(preset, quantity);
+  const scaled = scaleFoodPresetPortion(preset, equivalentGrams);
+  const quantityLabel = formatFoodQuantityLabel(quantity, spec);
+  return {
+    equivalentGrams,
+    scaled,
+    quantityLabel
+  };
+}
+
+/**
+ * Deterministically scales a food preset by unit quantity and returns updated
+ * `DailyPlan` with accumulated calories and macronutrients.
+ */
+export function addFoodUnitsToDailyPlan(
+  plan: DailyPlan,
+  preset: FoodPresetItem,
+  quantity: number
+): DailyPlan {
+  const equivalentGrams = convertFoodUnitsToGrams(preset, quantity);
+  return addFoodPortionToDailyPlan(plan, preset, equivalentGrams);
 }
 
 /**
@@ -422,8 +635,6 @@ export interface MicroCheckInScreenProps {
   readonly lastExplorerUrl?: string | null;
   readonly lastClaimMode?: L2ServiceMode | null;
 }
-
-const GRAM_QUICK_OPTIONS: readonly number[] = [50, 100, 150, 200, 250];
 
 export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   userAddress,
@@ -657,7 +868,9 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
   const [selectedPresetId, setSelectedPresetId] = useState<string>(
     DUAL_TRACK_FOOD_PRESETS[0]!.id
   );
-  const [portionGramsInput, setPortionGramsInput] = useState<string>("150");
+  const [portionQuantityInput, setPortionQuantityInput] = useState<string>(
+    String(DUAL_TRACK_FOOD_PRESETS[0]!.unitSpec.defaultQuantity)
+  );
   const [loggedMeals, setLoggedMeals] = useState<readonly LoggedMealRecord[]>(
     () =>
       sameDayInitialBuffer
@@ -682,21 +895,31 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     readonly status: string;
   } | null>(null);
 
-  const selectedPreset = useMemo<FoodPresetItem>(() => {
+  const selectedPreset = useMemo<DetailedFoodPreset>(() => {
     return (
       DUAL_TRACK_FOOD_PRESETS.find((item) => item.id === selectedPresetId) ??
       DUAL_TRACK_FOOD_PRESETS[0]!
     );
   }, [selectedPresetId]);
 
-  const parsedGrams = useMemo<number>(() => {
-    const val = Number(portionGramsInput.trim());
+  const parsedQuantity = useMemo<number>(() => {
+    const val = Number(portionQuantityInput.trim());
     return Number.isFinite(val) && val > 0 ? val : 0;
-  }, [portionGramsInput]);
+  }, [portionQuantityInput]);
+
+  const equivalentGrams = useMemo<number>(() => {
+    return parsedQuantity > 0
+      ? convertFoodUnitsToGrams(selectedPreset, parsedQuantity)
+      : 0;
+  }, [selectedPreset, parsedQuantity]);
+
+  const quantityLabel = useMemo<string>(() => {
+    return formatFoodQuantityLabel(parsedQuantity, selectedPreset.unitSpec);
+  }, [parsedQuantity, selectedPreset]);
 
   const scaledPreview = useMemo<FoodPresetItem>(() => {
-    return scaleFoodPresetPortion(selectedPreset, parsedGrams);
-  }, [selectedPreset, parsedGrams]);
+    return scaleFoodPresetPortion(selectedPreset, equivalentGrams);
+  }, [selectedPreset, equivalentGrams]);
 
   const workoutStats = useMemo(
     () => getWorkoutCompletionStats(localPlan.exercises),
@@ -754,7 +977,8 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     preset: FoodPresetItem,
     grams: number,
     idPrefix: string,
-    buildStatus: (scaled: FoodPresetItem) => string
+    buildStatus: (scaled: FoodPresetItem) => string,
+    quantityDisplay?: string
   ): Promise<void> => {
     const updatedPlan = addFoodPortionToDailyPlan(localPlan, preset, grams);
     applyPlanUpdate(updatedPlan);
@@ -766,6 +990,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
       presetId: preset.id,
       name: preset.name,
       grams,
+      ...(quantityDisplay ? { quantityDisplay } : {}),
       caloriesKcal: scaled.caloriesKcal,
       proteinGrams: scaled.proteinGrams,
       carbsGrams: scaled.carbsGrams,
@@ -780,7 +1005,14 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         cycleId: resolvedCycleId,
         dayNumber: localPlan.dayNumber,
         entry: {
-          ...newMeal,
+          id: newMeal.id,
+          presetId: newMeal.presetId,
+          name: newMeal.name,
+          grams: newMeal.grams,
+          caloriesKcal: newMeal.caloriesKcal,
+          proteinGrams: newMeal.proteinGrams,
+          carbsGrams: newMeal.carbsGrams,
+          fatGrams: newMeal.fatGrams,
           loggedAtMs: nowMs
         }
       });
@@ -794,8 +1026,10 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     if (isUpdatingTaskRef.current || isUpdatingTask) {
       return;
     }
-    if (parsedGrams <= 0) {
-      setStatusStep("Please enter a valid portion weight in grams (> 0g).");
+    if (parsedQuantity <= 0 || equivalentGrams <= 0) {
+      setStatusStep(
+        `Please enter a valid portion amount in ${selectedPreset.unitSpec.pluralLabel} (> 0).`
+      );
       return;
     }
 
@@ -804,10 +1038,11 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
     try {
       await recordFoodPortion(
         selectedPreset,
-        parsedGrams,
+        equivalentGrams,
         "meal",
         (scaled) =>
-          `Logged ${parsedGrams}g ${selectedPreset.name} (+${Math.round(scaled.caloriesKcal)} kcal, +${scaled.proteinGrams}g P)`
+          `Logged ${quantityLabel} ${selectedPreset.name} (+${Math.round(scaled.caloriesKcal)} kcal, +${scaled.proteinGrams}g P)`,
+        quantityLabel
       );
     } catch (err: unknown) {
       const message =
@@ -1544,12 +1779,14 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
             return (
               <Pressable
                 key={preset.id}
+                testID={`food-preset-chip-${preset.id}`}
                 style={[
                   styles.presetChip,
                   isSelected ? styles.presetChipActive : null
                 ]}
                 onPress={() => {
                   setSelectedPresetId(preset.id);
+                  setPortionQuantityInput(String(preset.unitSpec.defaultQuantity));
                 }}
               >
                 <Text
@@ -1558,28 +1795,31 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
                     isSelected ? styles.presetChipTextActive : null
                   ]}
                 >
-                  {preset.name}
+                  {preset.name} ({preset.unitSpec.unit})
                 </Text>
               </Pressable>
             );
           })}
         </View>
 
-        {/* Portion Gram Quick Buttons & Custom Input */}
-        <Text style={styles.sectionSubLabel}>Portion Weight (Grams):</Text>
+        {/* Portion Unit Quick Buttons & Custom Input */}
+        <Text style={styles.sectionSubLabel}>
+          Portion Amount ({selectedPreset.unitSpec.pluralLabel}):
+        </Text>
         <View style={styles.gramControlRow}>
           <View style={styles.gramQuickRow}>
-            {GRAM_QUICK_OPTIONS.map((g) => {
-              const isSelected = parsedGrams === g;
+            {selectedPreset.unitSpec.quickQuantities.map((qty) => {
+              const isSelected = parsedQuantity === qty;
               return (
                 <Pressable
-                  key={g}
+                  key={qty}
+                  testID={`portion-quick-btn-${qty}`}
                   style={[
                     styles.gramQuickBtn,
                     isSelected ? styles.gramQuickBtnActive : null
                   ]}
                   onPress={() => {
-                    setPortionGramsInput(String(g));
+                    setPortionQuantityInput(String(qty));
                   }}
                 >
                   <Text
@@ -1588,7 +1828,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
                       isSelected ? styles.gramQuickBtnTextActive : null
                     ]}
                   >
-                    {g}g
+                    {formatFoodQuantityLabel(qty, selectedPreset.unitSpec)}
                   </Text>
                 </Pressable>
               );
@@ -1596,11 +1836,12 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
           </View>
 
           <TextInput
+            testID="portion-quantity-input"
             style={styles.gramInput}
-            value={portionGramsInput}
-            onChangeText={setPortionGramsInput}
+            value={portionQuantityInput}
+            onChangeText={setPortionQuantityInput}
             keyboardType="numeric"
-            placeholder="Grams"
+            placeholder={selectedPreset.unitSpec.pluralLabel}
             placeholderTextColor="#64748B"
             accessibilityLabel="Portion grams input"
           />
@@ -1610,7 +1851,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
         <View style={styles.portionPreviewRow}>
           <View style={styles.portionPreviewTextCol}>
             <Text style={styles.portionPreviewTitle}>
-              {parsedGrams}g {selectedPreset.name}
+              {quantityLabel} {selectedPreset.name}
             </Text>
             <Text style={styles.portionPreviewMacros}>
               {Math.round(scaledPreview.caloriesKcal)} kcal • {scaledPreview.proteinGrams}g P •{" "}
@@ -1643,7 +1884,7 @@ export const MicroCheckInScreen: React.FC<MicroCheckInScreenProps> = ({
             {loggedMeals.slice(0, 4).map((meal) => (
               <View key={meal.id} style={styles.loggedMealRow}>
                 <Text style={styles.loggedMealName}>
-                  {meal.name} ({meal.grams}g)
+                  {meal.name} ({meal.quantityDisplay ?? `${meal.grams}g`})
                 </Text>
                 <Text style={styles.loggedMealMacros}>
                   +{Math.round(meal.caloriesKcal)} kcal • {meal.proteinGrams}g P

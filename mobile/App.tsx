@@ -45,21 +45,26 @@ import {
 import {
   AuthError,
   AuthSignInResult,
+  cancelActiveWalletConnectPairing,
   clearPersistedAuthSession,
+  getGoogleBoundWalletAddress,
   getPersistedAuthSession,
   getWalletConnectProjectId,
   handleIncomingOAuthRedirectUrl,
   purgeAuthSessionStorageKey,
   restoreExternalWalletSignerOnBoot,
+  savePersistedAuthSession,
   signInWithGoogle,
   signInWithMetaMask,
   signInWithWalletConnect,
   signOutSession,
-  startLocalSession
+  startLocalSession,
+  syncGoogleBoundWalletAddress
 } from "./src/services/authService";
 import {
   claimStreakReward,
   DEMO_VERIFYING_CONTRACT,
+  fetchNativeEthBalance,
   fetchOnChainNonce,
   fetchTokenBalance,
   getRewardGateAddress,
@@ -80,10 +85,12 @@ import {
   formatLocalCalendarDateKey,
   getActivePlanCycle,
   getDailyProofSignedMap,
+  getOnboardingCompletedAccounts,
   getPlanHistory,
   getUserBiometrics,
   getWeightLogs,
   makeDailyProofSignedKey,
+  markOnboardingCompletedForAccount,
   purgeAdaptiveStorageKeys,
   purgeDailyEphemeralLogBuffer,
   rolloverStaleDailyEphemeralLogBuffer,
@@ -101,8 +108,10 @@ import {
 import { clearVaultSecret } from "./src/storage/vaultKeyProvider";
 import {
   clearStoredWallet,
+  DEFAULT_LOCAL_WALLET_ACCOUNT_ID,
   exportWalletPrivateKey,
-  getOrCreatePersistentWallet
+  getOrCreatePersistentWallet,
+  importPersistentWallet
 } from "./src/storage/walletStorage";
 
 type ActiveTab = "checkin" | "dashboard" | "feed";
@@ -155,9 +164,10 @@ function biometricsToUserProfile(bio: UserBiometrics): UserProfile {
 }
 
 /**
- * Selects the signer for an on-chain claim. External wallet sessions must use
- * their connected external signer and never fall back to the local embedded
- * wallet, which would sign for an address it does not control.
+ * Selects the signer for an on-chain claim in a strict two-track architecture.
+ * External wallet sessions (`metamask` / `walletconnect`) must use their external
+ * EIP-1193 signer and never fall back to the embedded wallet. Google and local
+ * sessions always sign in-app using their embedded wallet (`localWallet`).
  */
 export function resolveClaimSigner(
   session: AuthSessionMetadata | null,
@@ -179,10 +189,9 @@ export function resolveClaimSigner(
 }
 
 /**
- * Selects the render-time signer for interactive UI screens without ever
- * falling back to the embedded local wallet when an external wallet session
- * (`metamask` / `walletconnect`) is active, and passes the local wallet only
- * for verified `"google"` or `"local"` sessions.
+ * Selects the render-time signer for interactive UI screens with strict mutual
+ * exclusivity: external sessions receive `externalSigner`, while `"google"` and
+ * `"local"` sessions receive `localWallet` (never `externalSigner`).
  */
 export function resolveRenderSigner(
   session: AuthSessionMetadata | null,
@@ -197,6 +206,32 @@ export function resolveRenderSigner(
     return localWallet;
   }
   return null;
+}
+
+/**
+ * Determines whether onboarding has been completed for the active session.
+ * Any fresh sign-in without an explicit persisted completion record for its
+ * `accountId` must complete OnboardingWizardScreen -> PlanPreviewModal first.
+ */
+export function isOnboardingCompleteForSession(params: {
+  readonly session: AuthSessionMetadata | null;
+  readonly storedBio: UserBiometrics | null;
+  readonly storedCycle: AdaptivePlanCycle | null;
+  readonly completedAccounts: Readonly<Record<string, number>>;
+  readonly isFreshSignIn?: boolean;
+}): boolean {
+  if (!params.session || !params.storedBio || !params.storedCycle) {
+    return false;
+  }
+  const accountKey = params.session.accountId.trim().toLowerCase();
+  const recordedAt = params.completedAccounts[accountKey];
+  if (typeof recordedAt === "number" && Number.isFinite(recordedAt) && recordedAt > 0) {
+    return true;
+  }
+  if (params.isFreshSignIn) {
+    return false;
+  }
+  return Object.keys(params.completedAccounts).length === 0;
 }
 
 export interface DerivedVaultMetrics {
@@ -261,16 +296,21 @@ export interface HydratedVaultState {
   readonly storedAuthSession: AuthSessionMetadata | null;
   readonly externalSigner?: Signer | null;
   readonly activeEphemeralBuffer?: DailyEphemeralLogBuffer | null;
+  readonly onboardingCompletedAccounts?: Readonly<Record<string, number>>;
+  readonly boundWalletAddress?: Address | null;
+  readonly hasWalletMismatch?: boolean;
 }
 
 export interface VaultHydrationDeps {
   readonly getUserBiometrics: () => Promise<UserBiometrics | null>;
   readonly getActivePlanCycle: () => Promise<AdaptivePlanCycle | null>;
   readonly getWeightLogs: () => Promise<WeightLogEntry[]>;
-  readonly getOrCreatePersistentWallet: () => Promise<Wallet>;
+  readonly getOrCreatePersistentWallet: (accountId?: string) => Promise<Wallet>;
   readonly getDailyProofSignedMap: () => Promise<Record<string, boolean>>;
   readonly getGovernanceConfig?: () => Promise<GovernanceConfig>;
   readonly getPersistedAuthSession?: () => Promise<AuthSessionMetadata | null>;
+  readonly getOnboardingCompletedAccounts?: () => Promise<Record<string, number>>;
+  readonly getGoogleBoundWalletAddress?: () => Promise<Address | null>;
   readonly restoreExternalSigner?: (
     session: AuthSessionMetadata
   ) => Promise<Signer | null>;
@@ -278,7 +318,7 @@ export interface VaultHydrationDeps {
   readonly rolloverStaleDailyEphemeralLogBuffer?: (
     todayDateKey?: string
   ) => Promise<EphemeralBufferRolloverResult>;
-  readonly clearStoredWallet: () => Promise<void>;
+  readonly clearStoredWallet: (accountId?: string) => Promise<void>;
   readonly clearVaultSecret: () => Promise<void>;
   readonly purgeAdaptiveStorageKeys: () => Promise<void>;
   readonly purgeGovernanceStorageKey?: () => Promise<void>;
@@ -289,14 +329,18 @@ const DEFAULT_VAULT_HYDRATION_DEPS: VaultHydrationDeps = {
   getUserBiometrics,
   getActivePlanCycle,
   getWeightLogs,
-  getOrCreatePersistentWallet,
+  getOrCreatePersistentWallet: (accountId?: string) =>
+    getOrCreatePersistentWallet(undefined, accountId),
   getDailyProofSignedMap,
   getGovernanceConfig,
   getPersistedAuthSession,
+  getOnboardingCompletedAccounts,
+  getGoogleBoundWalletAddress,
   restoreExternalSigner: restoreExternalWalletSignerOnBoot,
   clearPersistedAuthSession,
   rolloverStaleDailyEphemeralLogBuffer,
-  clearStoredWallet,
+  clearStoredWallet: (accountId?: string) =>
+    clearStoredWallet(undefined, accountId),
   clearVaultSecret,
   purgeAdaptiveStorageKeys,
   purgeGovernanceStorageKey,
@@ -308,6 +352,10 @@ export async function hydrateVaultData(
 ): Promise<HydratedVaultState> {
   const resolveGov = deps.getGovernanceConfig ?? getGovernanceConfig;
   const resolveAuth = deps.getPersistedAuthSession ?? getPersistedAuthSession;
+  const resolveOnboardingAccounts =
+    deps.getOnboardingCompletedAccounts ?? getOnboardingCompletedAccounts;
+  const resolveBoundWallet =
+    deps.getGoogleBoundWalletAddress ?? getGoogleBoundWalletAddress;
   const resolveRestoreSigner =
     deps.restoreExternalSigner ?? restoreExternalWalletSignerOnBoot;
   const resolveClearAuth =
@@ -315,28 +363,46 @@ export async function hydrateVaultData(
   const resolveRollover =
     deps.rolloverStaleDailyEphemeralLogBuffer ??
     rolloverStaleDailyEphemeralLogBuffer;
-  const [
-    storedBio,
-    storedCycle,
-    storedLogs,
-    persistentWallet,
-    proofSignedMap
-  ] = await Promise.all([
-    deps.getUserBiometrics(),
-    deps.getActivePlanCycle(),
-    deps.getWeightLogs(),
-    deps.getOrCreatePersistentWallet(),
-    deps.getDailyProofSignedMap()
-  ]);
+  const [storedBio, storedCycle, storedLogs, proofSignedMap] =
+    await Promise.all([
+      deps.getUserBiometrics(),
+      deps.getActivePlanCycle(),
+      deps.getWeightLogs(),
+      deps.getDailyProofSignedMap()
+    ]);
 
-  // Hydrate governance, auth session, and daily rollover after primary vault
-  // provisioning completes so independent keystore handles never race on boot.
+  // Hydrate governance, auth session, and onboarding completion before opening
+  // the per-account embedded wallet so Google accounts load their own key slot.
   const governanceConfig = await resolveGov();
   const storedAuthSession = await resolveAuth();
+  const onboardingCompletedAccounts = await resolveOnboardingAccounts().catch(
+    () => ({})
+  );
+
+  const walletAccountId =
+    storedAuthSession?.authMethod === "google"
+      ? storedAuthSession.accountId
+      : DEFAULT_LOCAL_WALLET_ACCOUNT_ID;
+  const persistentWallet = await deps.getOrCreatePersistentWallet(
+    walletAccountId
+  );
+
   let effectiveAuthSession: AuthSessionMetadata | null = storedAuthSession;
   let externalSigner: Signer | null = null;
+  let boundWalletAddress: Address | null =
+    storedAuthSession?.authMethod === "local"
+      ? (persistentWallet.address as Address)
+      : null;
+  let hasWalletMismatch = false;
 
-  if (
+  if (storedAuthSession?.authMethod === "google") {
+    const remoteBound = await resolveBoundWallet().catch(() => null);
+    boundWalletAddress = remoteBound ?? storedAuthSession.walletAddress;
+    hasWalletMismatch = Boolean(
+      remoteBound &&
+        remoteBound.toLowerCase() !== persistentWallet.address.toLowerCase()
+    );
+  } else if (
     storedAuthSession &&
     (storedAuthSession.authMethod === "metamask" ||
       storedAuthSession.authMethod === "walletconnect")
@@ -363,14 +429,22 @@ export async function hydrateVaultData(
     governanceConfig,
     storedAuthSession: effectiveAuthSession,
     externalSigner,
-    activeEphemeralBuffer: rolloverResult.activeBuffer
+    activeEphemeralBuffer: rolloverResult.activeBuffer,
+    onboardingCompletedAccounts,
+    boundWalletAddress,
+    hasWalletMismatch
   };
 }
 
 export async function resetVaultAndRecover(
   deps: VaultHydrationDeps = DEFAULT_VAULT_HYDRATION_DEPS
 ): Promise<HydratedVaultState> {
-  await deps.clearStoredWallet();
+  const resolveAuth = deps.getPersistedAuthSession ?? getPersistedAuthSession;
+  const currentSession = await resolveAuth().catch(() => null);
+  if (currentSession?.authMethod === "google") {
+    await deps.clearStoredWallet(currentSession.accountId);
+  }
+  await deps.clearStoredWallet(DEFAULT_LOCAL_WALLET_ACCOUNT_ID);
   await deps.clearVaultSecret();
   await deps.purgeAdaptiveStorageKeys();
   const purgeGov = deps.purgeGovernanceStorageKey ?? purgeGovernanceStorageKey;
@@ -581,9 +655,19 @@ export default function App(): React.ReactElement {
 
   const [wallet, setWallet] = useState<Wallet | null>(null);
   const [externalSigner, setExternalSigner] = useState<Signer | null>(null);
+  const [nativeEthBalance, setNativeEthBalance] = useState<string | null>(null);
+  const [boundWalletAddress, setBoundWalletAddress] = useState<Address | null>(
+    null
+  );
+  const [hasWalletMismatch, setHasWalletMismatch] = useState<boolean>(false);
+  const [wcPairingUri, setWcPairingUri] = useState<string | null>(null);
   const [authSession, setAuthSession] = useState<AuthSessionMetadata | null>(
     null
   );
+  const [onboardingCompletedAccounts, setOnboardingCompletedAccounts] =
+    useState<Readonly<Record<string, number>>>({});
+  const [hasStoredBio, setHasStoredBio] = useState<boolean>(false);
+  const [hasStoredCycle, setHasStoredCycle] = useState<boolean>(false);
   const [cheeredFeedIds, setCheeredFeedIds] = useState<
     Readonly<Record<string, boolean>>
   >({});
@@ -598,6 +682,11 @@ export default function App(): React.ReactElement {
     () => formatLocalCalendarDateKey(nowMs),
     [nowMs]
   );
+
+  const activeWalletAccountId =
+    authSession?.authMethod === "google"
+      ? authSession.accountId
+      : DEFAULT_LOCAL_WALLET_ACCOUNT_ID;
 
   const activeWalletAddress = (
     authSession?.walletAddress ??
@@ -661,7 +750,14 @@ export default function App(): React.ReactElement {
     setInitError(null);
     setWallet(persistentWallet);
     setExternalSigner(hydrated.externalSigner ?? null);
+    setBoundWalletAddress(hydrated.boundWalletAddress ?? null);
+    setHasWalletMismatch(Boolean(hydrated.hasWalletMismatch));
+    setWcPairingUri(null);
     setAuthSession(storedAuthSession);
+    const completedAccounts = hydrated.onboardingCompletedAccounts ?? {};
+    setOnboardingCompletedAccounts(completedAccounts);
+    setHasStoredBio(Boolean(storedBio));
+    setHasStoredCycle(Boolean(storedCycle));
     setProofSignedMap(hydratedProofMap);
     setGovernanceConfig(hydratedGovernance);
     setActiveCycle(effectiveHydratedCycle);
@@ -682,14 +778,37 @@ export default function App(): React.ReactElement {
         if (isMounted()) setTokenBalanceDht(bal);
       })
       .catch(() => undefined);
+    void fetchNativeEthBalance(addr)
+      .then((ethBal) => {
+        if (isMounted()) setNativeEthBalance(ethBal);
+      })
+      .catch(() => undefined);
 
-    if (storedBio) {
-      setUserBiometrics(storedBio);
-      setHasCompletedOnboarding(true);
-    } else {
-      setUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
-      setHasCompletedOnboarding(false);
+    const isOnboarded = isOnboardingCompleteForSession({
+      session: storedAuthSession,
+      storedBio,
+      storedCycle,
+      completedAccounts,
+      isFreshSignIn: false
+    });
+    if (
+      isOnboarded &&
+      storedAuthSession &&
+      Object.keys(completedAccounts).length === 0
+    ) {
+      const accountKey = storedAuthSession.accountId.trim().toLowerCase();
+      setOnboardingCompletedAccounts((prev) => ({
+        ...prev,
+        [accountKey]: currentNowMs
+      }));
+      void markOnboardingCompletedForAccount(
+        storedAuthSession.accountId,
+        currentNowMs
+      ).catch(() => undefined);
     }
+
+    setUserBiometrics(storedBio ?? DEFAULT_BASELINE_BIOMETRICS);
+    setHasCompletedOnboarding(isOnboarded);
   };
 
   useEffect(() => {
@@ -737,6 +856,13 @@ export default function App(): React.ReactElement {
       const recovered = await resetVaultAndRecover();
       setAuthSession(null);
       setExternalSigner(null);
+      setNativeEthBalance(null);
+      setBoundWalletAddress(null);
+      setHasWalletMismatch(false);
+      setWcPairingUri(null);
+      setOnboardingCompletedAccounts({});
+      setHasStoredBio(false);
+      setHasStoredCycle(false);
       setCheeredFeedIds({});
       setLastProofHash(null);
       setLastTxHash(null);
@@ -823,6 +949,19 @@ export default function App(): React.ReactElement {
     void saveWeightLog(initialWeightLog).catch(() => undefined);
     setStreakCount(calculateLiveStreak(plan, proofSignedMap, onboardingNowMs));
     setLastLogTimestampMs(null);
+    setHasStoredBio(true);
+    setHasStoredCycle(true);
+    if (authSession) {
+      const accountKey = authSession.accountId.trim().toLowerCase();
+      setOnboardingCompletedAccounts((prev) => ({
+        ...prev,
+        [accountKey]: onboardingNowMs
+      }));
+      void markOnboardingCompletedForAccount(
+        authSession.accountId,
+        onboardingNowMs
+      ).catch(() => undefined);
+    }
     setHasCompletedOnboarding(true);
     setActiveTab("dashboard");
   };
@@ -833,13 +972,34 @@ export default function App(): React.ReactElement {
     if (authResult.wallet) {
       setWallet(authResult.wallet);
     }
+    setWcPairingUri(null);
     setExternalSigner(
       authResult.session.authMethod === "metamask" ||
         authResult.session.authMethod === "walletconnect"
         ? authResult.signer
         : null
     );
+    setBoundWalletAddress(
+      authResult.boundWalletAddress ??
+        (authResult.session.authMethod === "google" ||
+        authResult.session.authMethod === "local"
+          ? authResult.walletAddress
+          : null)
+    );
+    setHasWalletMismatch(Boolean(authResult.hasWalletMismatch));
     setAuthSession(authResult.session);
+
+    const isOnboarded = isOnboardingCompleteForSession({
+      session: authResult.session,
+      storedBio: hasStoredBio ? userBiometrics : null,
+      storedCycle: hasStoredCycle ? activeCycle : null,
+      completedAccounts: onboardingCompletedAccounts,
+      isFreshSignIn: true
+    });
+    setHasCompletedOnboarding(isOnboarded);
+    if (!isOnboarded) {
+      setUserBiometrics(DEFAULT_BASELINE_BIOMETRICS);
+    }
 
     if (previousAddress !== nextAddress) {
       const nextAddr = authResult.walletAddress;
@@ -856,6 +1016,9 @@ export default function App(): React.ReactElement {
         .catch(() => undefined);
       void fetchTokenBalance(nextAddr, derived.fallbackBalanceDht)
         .then((bal) => setTokenBalanceDht(bal))
+        .catch(() => undefined);
+      void fetchNativeEthBalance(nextAddr)
+        .then((ethBal) => setNativeEthBalance(ethBal))
         .catch(() => undefined);
     }
   };
@@ -938,15 +1101,97 @@ export default function App(): React.ReactElement {
     applyAuthenticatedResult(authResult);
   };
 
-  const handleSignInWithWalletConnect = async (): Promise<void> => {
-    const authResult = await signInWithWalletConnect();
-    applyAuthenticatedResult(authResult);
+  const handleSignInWithWalletConnect = async (
+    onDisplayUri?: (uri: string) => void
+  ): Promise<void> => {
+    try {
+      const authResult = await signInWithWalletConnect({
+        onDisplayUri: (uri: string) => {
+          setWcPairingUri(uri);
+          onDisplayUri?.(uri);
+        }
+      });
+      applyAuthenticatedResult(authResult);
+    } finally {
+      setWcPairingUri(null);
+    }
+  };
+
+  const handleCancelWalletConnectPairing = (): void => {
+    cancelActiveWalletConnectPairing();
+    setWcPairingUri(null);
+  };
+
+  const handleImportEmbeddedPrivateKey = async (
+    rawPrivateKey: string
+  ): Promise<Address> => {
+    const importedWallet = await importPersistentWallet(
+      rawPrivateKey,
+      undefined,
+      activeWalletAccountId
+    );
+    const importedAddress = importedWallet.address as Address;
+    setWallet(importedWallet);
+
+    if (
+      authSession &&
+      (authSession.authMethod === "google" || authSession.authMethod === "local")
+    ) {
+      const updatedSession: AuthSessionMetadata =
+        authSession.authMethod === "local"
+          ? {
+              ...authSession,
+              accountId: `local:${importedAddress.toLowerCase()}`,
+              displayLabel: `Local Session (${importedAddress.slice(0, 6)}\u2026${importedAddress.slice(-4)})`,
+              walletAddress: importedAddress
+            }
+          : {
+              ...authSession,
+              walletAddress: importedAddress
+            };
+      const persisted = await savePersistedAuthSession(updatedSession);
+      setAuthSession(persisted);
+
+      if (authSession.authMethod === "google") {
+        await syncGoogleBoundWalletAddress(importedAddress);
+      }
+      setBoundWalletAddress(importedAddress);
+      setHasWalletMismatch(false);
+    }
+
+    void fetchOnChainNonce(importedAddress, 0n)
+      .then((nonce) => setCurrentNonce(nonce))
+      .catch(() => undefined);
+    void fetchTokenBalance(importedAddress, tokenBalanceDht)
+      .then((bal) => setTokenBalanceDht(bal))
+      .catch(() => undefined);
+    void fetchNativeEthBalance(importedAddress)
+      .then((ethBal) => setNativeEthBalance(ethBal))
+      .catch(() => undefined);
+
+    return importedAddress;
   };
 
   const handleSignOut = async (): Promise<void> => {
+    if (hasCompletedOnboarding && authSession) {
+      const completedAtMs = Date.now();
+      const accountKey = authSession.accountId.trim().toLowerCase();
+      setOnboardingCompletedAccounts((prev) => ({
+        ...prev,
+        [accountKey]: prev[accountKey] ?? completedAtMs
+      }));
+      await markOnboardingCompletedForAccount(
+        authSession.accountId,
+        completedAtMs
+      ).catch(() => undefined);
+    }
     await signOutSession();
     setAuthSession(null);
     setExternalSigner(null);
+    setNativeEthBalance(null);
+    setBoundWalletAddress(null);
+    setHasWalletMismatch(false);
+    setWcPairingUri(null);
   };
 
   const handleLogWeightEntry = (entry: WeightLogEntry): void => {
@@ -1064,6 +1309,10 @@ export default function App(): React.ReactElement {
         expectedBalance
       );
       setTokenBalanceDht(updatedBalance);
+
+      void fetchNativeEthBalance(activeWalletAddress)
+        .then((ethBal) => setNativeEthBalance(ethBal))
+        .catch(() => undefined);
     } catch (err: unknown) {
       showErrorNotice(err, "Check-In Proof Failed");
       throw err;
@@ -1141,6 +1390,8 @@ export default function App(): React.ReactElement {
             onSignInWithGoogle={handleSignInWithGoogle}
             onSignInWithMetaMask={handleSignInWithMetaMask}
             onSignInWithWalletConnect={handleSignInWithWalletConnect}
+            walletConnectUri={wcPairingUri}
+            onCancelWalletConnect={handleCancelWalletConnectPairing}
             isSupabaseConfigured={isSupabaseConfigured()}
             isWalletConnectConfigured={getWalletConnectProjectId() !== null}
             existingWalletAddress={embeddedWalletAddress}
@@ -1200,7 +1451,14 @@ export default function App(): React.ReactElement {
               {activeTab === "dashboard" ? (
                 <DashboardScreen
                   userAddress={activeWalletAddress}
-                  onExportPrivateKey={exportWalletPrivateKey}
+                  embeddedWalletAddress={embeddedWalletAddress}
+                  nativeEthBalance={nativeEthBalance}
+                  boundWalletAddress={boundWalletAddress}
+                  isWalletMismatch={hasWalletMismatch}
+                  onExportPrivateKey={() =>
+                    exportWalletPrivateKey(undefined, activeWalletAccountId)
+                  }
+                  onImportPrivateKey={handleImportEmbeddedPrivateKey}
                   streakCount={streakCount}
                   tokenBalanceDht={tokenBalanceDht}
                   lastProofHash={lastProofHash}

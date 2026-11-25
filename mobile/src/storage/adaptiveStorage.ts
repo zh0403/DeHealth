@@ -30,7 +30,8 @@ export const ADAPTIVE_STORAGE_KEYS = {
   TELEMETRY_SALTS: "@dehealth/telemetry_salts",
   DAILY_TELEMETRY_COMMITMENTS: "@dehealth/daily_telemetry_commitments",
   LAST_LOG_TIMESTAMP_MS: "@dehealth/last_log_timestamp_ms",
-  DAILY_EPHEMERAL_LOG_BUFFER: "@dehealth/daily_ephemeral_log_buffer"
+  DAILY_EPHEMERAL_LOG_BUFFER: "@dehealth/daily_ephemeral_log_buffer",
+  ONBOARDING_COMPLETED_ACCOUNTS: "@dehealth/onboarding_completed_accounts"
 } as const;
 
 export const STORAGE_KEYS = ADAPTIVE_STORAGE_KEYS;
@@ -727,6 +728,61 @@ export class AdaptiveStorage {
   }
 
   /**
+   * Records that an account has completed onboarding (stored encrypted).
+   */
+  async markOnboardingCompletedForAccount(
+    accountId: string,
+    completedAtMs: number = Date.now()
+  ): Promise<void> {
+    if (typeof accountId !== "string" || accountId.trim().length === 0) {
+      throw new Error("accountId must be a non-empty string");
+    }
+    if (!Number.isFinite(completedAtMs) || completedAtMs <= 0) {
+      throw new Error("completedAtMs must be a positive finite number");
+    }
+    const normalizedId = accountId.trim().toLowerCase();
+    const existing = await this.getOnboardingCompletedAccounts();
+    const nextMap: Record<string, number> = {
+      ...existing,
+      [normalizedId]: completedAtMs
+    };
+    await this.adapter.setEncryptedItem(
+      ADAPTIVE_STORAGE_KEYS.ONBOARDING_COMPLETED_ACCOUNTS,
+      nextMap
+    );
+  }
+
+  /**
+   * Returns the encrypted map of normalized accountId -> onboarding completion timestamp (ms).
+   */
+  async getOnboardingCompletedAccounts(): Promise<Record<string, number>> {
+    const raw = await this.adapter.getEncryptedItem<unknown>(
+      ADAPTIVE_STORAGE_KEYS.ONBOARDING_COMPLETED_ACCOUNTS
+    );
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return {};
+    }
+    const sanitized: Record<string, number> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+        sanitized[k] = v;
+      }
+    }
+    return sanitized;
+  }
+
+  /**
+   * Returns true if the given accountId has completed onboarding.
+   */
+  async hasCompletedOnboardingForAccount(accountId: string): Promise<boolean> {
+    if (typeof accountId !== "string" || accountId.trim().length === 0) {
+      return false;
+    }
+    const accounts = await this.getOnboardingCompletedAccounts();
+    return Boolean(accounts[accountId.trim().toLowerCase()]);
+  }
+
+  /**
    * Completely removes all adaptive storage keys, resetting local state.
    */
   async clearAllAdaptiveData(): Promise<void> {
@@ -967,6 +1023,26 @@ export async function rolloverStaleDailyEphemeralLogBuffer(
   todayDateKey: string = formatLocalCalendarDateKey()
 ): Promise<EphemeralBufferRolloverResult> {
   return (await resolveStorage()).rolloverStaleDailyEphemeralLogBuffer(todayDateKey);
+}
+
+export async function markOnboardingCompletedForAccount(
+  accountId: string,
+  completedAtMs: number = Date.now()
+): Promise<void> {
+  return (await resolveStorage()).markOnboardingCompletedForAccount(
+    accountId,
+    completedAtMs
+  );
+}
+
+export async function getOnboardingCompletedAccounts(): Promise<Record<string, number>> {
+  return (await resolveStorage()).getOnboardingCompletedAccounts();
+}
+
+export async function hasCompletedOnboardingForAccount(
+  accountId: string
+): Promise<boolean> {
+  return (await resolveStorage()).hasCompletedOnboardingForAccount(accountId);
 }
 
 /**

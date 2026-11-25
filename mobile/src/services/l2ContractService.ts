@@ -95,6 +95,117 @@ export const MIN_FALLBACK_GAS_BALANCE_WEI: bigint = parseEther("0.0001");
 export const DEFAULT_INSUFFICIENT_GAS_MESSAGE =
   "Insufficient Arbitrum Sepolia ETH for gas. Copy your wallet address and fund testnet ETH.";
 
+export const DEFAULT_ARBITRUM_SEPOLIA_FALLBACK_RPC_URLS: readonly string[] =
+  Object.freeze([
+    "https://arbitrum-sepolia-rpc.publicnode.com",
+    "https://arbitrum-sepolia.drpc.org",
+    "https://sepolia-rollup.arbitrum.io/rpc"
+  ]);
+
+export const DEFAULT_RPC_RATE_LIMIT_MESSAGE =
+  "Arbitrum Sepolia RPC rate limit reached (HTTP 429). Please retry in a moment or configure a dedicated EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL.";
+
+export interface RpcRateLimitErrorDetails {
+  readonly endpoint?: string;
+  readonly attempts?: number;
+}
+
+export class RpcRateLimitError extends Error {
+  readonly endpoint?: string;
+  readonly attempts?: number;
+
+  constructor(
+    message: string = DEFAULT_RPC_RATE_LIMIT_MESSAGE,
+    details?: RpcRateLimitErrorDetails
+  ) {
+    super(message);
+    this.name = "RpcRateLimitError";
+    Object.setPrototypeOf(this, new.target.prototype);
+    if (details?.endpoint !== undefined) {
+      this.endpoint = details.endpoint;
+    }
+    if (details?.attempts !== undefined) {
+      this.attempts = details.attempts;
+    }
+  }
+}
+
+const RATE_LIMIT_MESSAGE_REGEX = /\b429\b|too many requests|rate[- ]?limit|throttl/i;
+const MAX_RATE_LIMIT_INSPECT_DEPTH = 8;
+
+/**
+ * Inspects an unknown error and its nested `error`/`cause`/`info`/`response`
+ * objects (cycle-safe, depth-bounded) to determine whether it represents an
+ * HTTP 429 / RPC rate-limit / throttling failure.
+ */
+export function isRateLimitRpcError(error: unknown): boolean {
+  const visited = new WeakSet<object>();
+
+  const inspect = (value: unknown, depth: number): boolean => {
+    if (value === null || value === undefined || depth > MAX_RATE_LIMIT_INSPECT_DEPTH) {
+      return false;
+    }
+    if (value instanceof RpcRateLimitError) {
+      return true;
+    }
+    if (typeof value === "string") {
+      return RATE_LIMIT_MESSAGE_REGEX.test(value);
+    }
+    if (typeof value !== "object") {
+      return false;
+    }
+    if (visited.has(value)) {
+      return false;
+    }
+    visited.add(value);
+
+    const record = value as Record<string, unknown>;
+    if (record.name === "RpcRateLimitError") {
+      return true;
+    }
+    if (record.status === 429 || record.statusCode === 429) {
+      return true;
+    }
+    if (
+      record.code === 429 ||
+      record.code === -32005 ||
+      record.code === "RATE_LIMITED"
+    ) {
+      return true;
+    }
+    if (
+      record.responseStatus === 429 ||
+      (typeof record.responseStatus === "string" &&
+        record.responseStatus.includes("429"))
+    ) {
+      return true;
+    }
+    if (
+      typeof record.message === "string" &&
+      RATE_LIMIT_MESSAGE_REGEX.test(record.message)
+    ) {
+      return true;
+    }
+    if (
+      typeof record.shortMessage === "string" &&
+      RATE_LIMIT_MESSAGE_REGEX.test(record.shortMessage)
+    ) {
+      return true;
+    }
+
+    const nestedKeys = ["error", "cause", "info", "response"] as const;
+    for (const key of nestedKeys) {
+      if (key in record && inspect(record[key], depth + 1)) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  return inspect(error, 0);
+}
+
 export interface InsufficientGasErrorDetails {
   readonly signerAddress?: Address;
   readonly balanceWei?: bigint;
@@ -176,6 +287,10 @@ let customTokenAddress: Address | null | undefined = undefined;
 let customContractFactory:
   | ((address: string, abi: readonly string[], runner?: ContractRunner | null) => unknown)
   | null = null;
+let customFallbackRpcUrls: readonly string[] | undefined = undefined;
+let customProviderFactory: ((rpcUrl: string) => Provider) | null = null;
+let customRetryDelay: ((ms: number) => Promise<void>) | null = null;
+let activeRpcIndex = 0;
 
 /**
  * Injects a custom Provider (used for mocking during unit testing).
@@ -210,6 +325,31 @@ export function setContractFactory(
 }
 
 /**
+ * Overrides fallback Arbitrum Sepolia RPC URLs for hermetic unit testing.
+ */
+export function setL2FallbackRpcUrlsForTesting(urls?: readonly string[]): void {
+  customFallbackRpcUrls = urls;
+}
+
+/**
+ * Injects a custom provider factory `(rpcUrl) => Provider` for hermetic testing.
+ */
+export function setL2ProviderFactoryForTesting(
+  factory: ((rpcUrl: string) => Provider) | null
+): void {
+  customProviderFactory = factory;
+}
+
+/**
+ * Injects a custom retry delay implementation for hermetic testing.
+ */
+export function setL2RetryDelayForTesting(
+  delayFn: ((ms: number) => Promise<void>) | null
+): void {
+  customRetryDelay = delayFn;
+}
+
+/**
  * Resets custom provider and address injections back to environment defaults.
  */
 export function resetL2Config(): void {
@@ -217,6 +357,10 @@ export function resetL2Config(): void {
   customGateAddress = undefined;
   customTokenAddress = undefined;
   customContractFactory = null;
+  customFallbackRpcUrls = undefined;
+  customProviderFactory = null;
+  customRetryDelay = null;
+  activeRpcIndex = 0;
 }
 
 /**
@@ -242,6 +386,43 @@ export function getTokenAddress(): Address | null {
 }
 
 /**
+ * Returns the deduplicated ordered list of Arbitrum Sepolia RPC URLs
+ * (`[primaryUrl, ...fallbackUrls]`) when `EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL`
+ * is configured, or `[]` when unset/blank so offline/local-fallback mode remains intact.
+ */
+export function getL2RpcUrls(): readonly string[] {
+  const primaryUrl = process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL?.trim();
+  if (!primaryUrl) {
+    return [];
+  }
+
+  const fallbacks =
+    customFallbackRpcUrls ?? DEFAULT_ARBITRUM_SEPOLIA_FALLBACK_RPC_URLS;
+  const seen = new Set<string>();
+  const ordered: string[] = [];
+
+  for (const candidate of [primaryUrl, ...fallbacks]) {
+    const trimmed = candidate.trim();
+    if (trimmed.length > 0 && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      ordered.push(trimmed);
+    }
+  }
+
+  return ordered;
+}
+
+function createProviderForUrl(rpcUrl: string): Provider | null {
+  try {
+    return customProviderFactory
+      ? customProviderFactory(rpcUrl)
+      : new JsonRpcProvider(rpcUrl);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Resolves or creates an L2 provider instance.
  * Returns null if RPC URL is unconfigured or invalid.
  */
@@ -249,15 +430,147 @@ export function getL2Provider(): Provider | null {
   if (customProvider !== undefined) {
     return customProvider;
   }
-  const rpcUrl = process.env.EXPO_PUBLIC_ARBITRUM_SEPOLIA_RPC_URL?.trim();
-  if (!rpcUrl) {
+  const rpcUrls = getL2RpcUrls();
+  if (rpcUrls.length === 0) {
     return null;
   }
-  try {
-    return new JsonRpcProvider(rpcUrl);
-  } catch {
-    return null;
+  const index =
+    activeRpcIndex >= 0 && activeRpcIndex < rpcUrls.length ? activeRpcIndex : 0;
+  const targetUrl = rpcUrls[index];
+  return targetUrl ? createProviderForUrl(targetUrl) : null;
+}
+
+const RPC_MAX_RETRIES_PER_ENDPOINT = 2;
+const RPC_BASE_DELAY_MS = 200;
+const RPC_MAX_DELAY_MS = 1600;
+
+function waitRetryDelay(ms: number): Promise<void> {
+  if (customRetryDelay) {
+    return customRetryDelay(ms);
   }
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+interface RpcCandidate {
+  readonly provider: Provider;
+  readonly endpoint: string;
+  readonly rpcIndex: number;
+}
+
+function resolveRpcCandidates(): readonly RpcCandidate[] {
+  if (customProvider !== undefined) {
+    return customProvider
+      ? [{ provider: customProvider, endpoint: "custom-provider", rpcIndex: -1 }]
+      : [];
+  }
+
+  const rpcUrls = getL2RpcUrls();
+  if (rpcUrls.length === 0) {
+    return [];
+  }
+
+  const startIdx =
+    activeRpcIndex >= 0 && activeRpcIndex < rpcUrls.length ? activeRpcIndex : 0;
+  const candidates: RpcCandidate[] = [];
+
+  for (let offset = 0; offset < rpcUrls.length; offset++) {
+    const idx = (startIdx + offset) % rpcUrls.length;
+    const endpoint = rpcUrls[idx];
+    if (!endpoint) {
+      continue;
+    }
+    const provider = createProviderForUrl(endpoint);
+    if (provider) {
+      candidates.push({ provider, endpoint, rpcIndex: idx });
+    }
+  }
+
+  return candidates;
+}
+
+/**
+ * Executes an RPC operation with bounded exponential backoff on HTTP 429 /
+ * rate-limit errors and automatic failover across configured Arbitrum Sepolia
+ * fallback endpoints. Non-rate-limit errors are rethrown immediately.
+ */
+export async function executeWithRpcResilience<T>(
+  operation: (provider: Provider, endpoint: string) => Promise<T>
+): Promise<T> {
+  const candidates = resolveRpcCandidates();
+  if (candidates.length === 0) {
+    throw new Error("No Arbitrum Sepolia RPC provider is configured.");
+  }
+
+  let totalAttempts = 0;
+  let lastEndpoint = candidates[0]!.endpoint;
+  let sawRateLimit = false;
+
+  for (const candidate of candidates) {
+    for (let attempt = 0; attempt <= RPC_MAX_RETRIES_PER_ENDPOINT; attempt++) {
+      totalAttempts += 1;
+      lastEndpoint = candidate.endpoint;
+      try {
+        const result = await operation(candidate.provider, candidate.endpoint);
+        if (candidate.rpcIndex >= 0) {
+          activeRpcIndex = candidate.rpcIndex;
+        }
+        return result;
+      } catch (err: unknown) {
+        if (!isRateLimitRpcError(err)) {
+          throw err;
+        }
+        sawRateLimit = true;
+        if (attempt < RPC_MAX_RETRIES_PER_ENDPOINT) {
+          const delayMs = Math.min(
+            RPC_MAX_DELAY_MS,
+            RPC_BASE_DELAY_MS * 2 ** attempt
+          );
+          await waitRetryDelay(delayMs);
+        }
+      }
+    }
+  }
+
+  if (sawRateLimit) {
+    throw new RpcRateLimitError(DEFAULT_RPC_RATE_LIMIT_MESSAGE, {
+      endpoint: lastEndpoint,
+      attempts: totalAttempts
+    });
+  }
+
+  throw new Error("All Arbitrum Sepolia RPC endpoints failed.");
+}
+
+async function waitForTxReceiptWithRetry(
+  tx: RewardGateClaimTxResponse
+): Promise<{ readonly hash?: string; readonly status?: number } | null> {
+  let totalAttempts = 0;
+  for (let attempt = 0; attempt <= RPC_MAX_RETRIES_PER_ENDPOINT; attempt++) {
+    totalAttempts += 1;
+    try {
+      return await tx.wait();
+    } catch (err: unknown) {
+      if (!isRateLimitRpcError(err)) {
+        throw err;
+      }
+      if (attempt < RPC_MAX_RETRIES_PER_ENDPOINT) {
+        const delayMs = Math.min(
+          RPC_MAX_DELAY_MS,
+          RPC_BASE_DELAY_MS * 2 ** attempt
+        );
+        await waitRetryDelay(delayMs);
+      } else {
+        throw new RpcRateLimitError(DEFAULT_RPC_RATE_LIMIT_MESSAGE, {
+          attempts: totalAttempts
+        });
+      }
+    }
+  }
+  throw new RpcRateLimitError(DEFAULT_RPC_RATE_LIMIT_MESSAGE, {
+    attempts: totalAttempts
+  });
 }
 
 /**
@@ -330,15 +643,14 @@ export async function fetchOnChainNonce(
   }
 
   try {
-    const provider = getL2Provider();
     const gateAddress = getRewardGateAddress();
-    if (!provider || !gateAddress) {
+    if (!gateAddress) {
       return fallback;
     }
 
-    const gateContract = getRewardGateContract(gateAddress, provider);
-    const nonceResult = await gateContract.nonces(userAddress);
-    return BigInt(String(nonceResult));
+    return await executeWithRpcResilience(async (provider) =>
+      BigInt(String(await getRewardGateContract(gateAddress, provider).nonces(userAddress)))
+    );
   } catch {
     return fallback;
   }
@@ -371,8 +683,9 @@ export async function fetchLiveL2InspectorStatus(
 
   if (provider && rewardGateAddress) {
     try {
-      const gateContract = getRewardGateContract(rewardGateAddress, provider);
-      const nonceResult = await gateContract.nonces(userAddress);
+      const nonceResult = await executeWithRpcResilience(async (activeProvider) =>
+        getRewardGateContract(rewardGateAddress, activeProvider).nonces(userAddress)
+      );
       liveNonce = BigInt(String(nonceResult));
       rpcReachable = true;
     } catch {
@@ -381,7 +694,9 @@ export async function fetchLiveL2InspectorStatus(
     }
   } else if (provider) {
     try {
-      const txCount = await provider.getTransactionCount(userAddress);
+      const txCount = await executeWithRpcResilience(async (activeProvider) =>
+        activeProvider.getTransactionCount(userAddress)
+      );
       liveNonce = BigInt(txCount);
       rpcReachable = true;
     } catch {
@@ -420,12 +735,78 @@ export async function fetchTokenBalance(
   }
 
   try {
-    const tokenContract = getTokenContract(tokenAddress, provider);
-    const balanceResult = await tokenContract.balanceOf(userAddress);
+    const balanceResult = await executeWithRpcResilience(async (activeProvider) =>
+      getTokenContract(tokenAddress, activeProvider).balanceOf(userAddress)
+    );
     const balanceBigInt = BigInt(String(balanceResult));
     return formatEther(balanceBigInt);
   } catch {
     return fallback;
+  }
+}
+
+/**
+ * Formats an Arbitrum Sepolia native ETH balance (in wei) cleanly for UI display.
+ */
+export function formatNativeEthBalance(balanceWei: bigint): string {
+  if (balanceWei <= 0n) {
+    return "0.0000";
+  }
+  const etherStr = formatEther(balanceWei);
+  const numeric = Number(etherStr);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return "0.0000";
+  }
+  return numeric >= 0.0001 ? numeric.toFixed(4) : numeric.toFixed(6);
+}
+
+/**
+ * Fetches the live Arbitrum Sepolia native `$ETH` gas balance for `userAddress`
+ * using `executeWithRpcResilience`. Falls back safely to `localBalance` or `"0.0000"`.
+ */
+export async function fetchNativeEthBalance(
+  userAddress: Address,
+  localBalance?: string
+): Promise<string> {
+  const fallback = localBalance ?? "0.0000";
+  if (!getL2Provider()) {
+    return fallback;
+  }
+
+  try {
+    const balanceWei = await executeWithRpcResilience(async (activeProvider) => {
+      if (typeof activeProvider.getBalance !== "function") {
+        throw new Error("L2 provider does not support getBalance.");
+      }
+      return BigInt(await activeProvider.getBalance(userAddress));
+    });
+    return formatNativeEthBalance(balanceWei);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * Returns true when a formatted ETH balance string is below `minGasWei`
+ * (defaults to `MIN_FALLBACK_GAS_BALANCE_WEI`, i.e. 0.0001 ETH).
+ */
+export function isLowGasEthBalance(
+  ethBalance: string | null | undefined,
+  minGasWei: bigint = MIN_FALLBACK_GAS_BALANCE_WEI
+): boolean {
+  if (ethBalance === null || ethBalance === undefined) {
+    return false;
+  }
+  const trimmed = ethBalance.trim();
+  if (trimmed.length === 0) {
+    return false;
+  }
+  try {
+    return parseEther(trimmed) < minGasWei;
+  } catch {
+    const numeric = Number(trimmed);
+    const minNumeric = Number(formatEther(minGasWei));
+    return Number.isFinite(numeric) && numeric < minNumeric;
   }
 }
 
@@ -467,16 +848,6 @@ export async function claimStreakReward(
     }
 
     const gateAddress = getRewardGateAddress()!;
-    const provider = getL2Provider();
-
-    let effectiveSigner = signer;
-    if (provider && isConnectableSigner(signer)) {
-      if (signer.provider !== provider) {
-        effectiveSigner = signer.connect(provider);
-      }
-    }
-
-    const gateContract = getRewardGateContract(gateAddress, effectiveSigner);
 
     const proofStruct: RewardGateProofArg = {
       user: payload.proof.user,
@@ -486,77 +857,85 @@ export async function claimStreakReward(
       deadline: payload.proof.deadline
     };
 
-    const signerAddress = (await effectiveSigner.getAddress()) as Address;
-    const claimFn = gateContract.claimStreakReward;
+    const tx = await executeWithRpcResilience(async (provider) => {
+      let effectiveSigner = signer;
+      if (isConnectableSigner(signer) && signer.provider !== provider) {
+        effectiveSigner = signer.connect(provider);
+      }
 
-    if (provider && typeof provider.getBalance === "function") {
-      const balanceWei = BigInt(await provider.getBalance(signerAddress));
-      let requiredWei = MIN_FALLBACK_GAS_BALANCE_WEI;
+      const gateContract = getRewardGateContract(gateAddress, effectiveSigner);
+      const signerAddress = (await effectiveSigner.getAddress()) as Address;
+      const claimFn = gateContract.claimStreakReward;
 
-      if (typeof claimFn.estimateGas === "function") {
-        try {
-          const estimatedGas = BigInt(
-            await claimFn.estimateGas(proofStruct, payload.signature)
-          );
-          if (estimatedGas > 0n && typeof provider.getFeeData === "function") {
-            const feeData = await provider.getFeeData();
-            const maxFee = feeData?.maxFeePerGas;
-            const legacyGasPrice = feeData?.gasPrice;
-            const gasPrice =
-              maxFee !== null && maxFee !== undefined && maxFee > 0n
-                ? maxFee
-                : (legacyGasPrice ?? 0n);
-            const estimatedCostWei = estimatedGas * gasPrice;
-            if (estimatedCostWei > requiredWei) {
-              requiredWei = estimatedCostWei;
+      if (typeof provider.getBalance === "function") {
+        const balanceWei = BigInt(await provider.getBalance(signerAddress));
+        let requiredWei = MIN_FALLBACK_GAS_BALANCE_WEI;
+
+        if (typeof claimFn.estimateGas === "function") {
+          try {
+            const estimatedGas = BigInt(
+              await claimFn.estimateGas(proofStruct, payload.signature)
+            );
+            if (estimatedGas > 0n && typeof provider.getFeeData === "function") {
+              const feeData = await provider.getFeeData();
+              const maxFee = feeData?.maxFeePerGas;
+              const legacyGasPrice = feeData?.gasPrice;
+              const gasPrice =
+                maxFee !== null && maxFee !== undefined && maxFee > 0n
+                  ? maxFee
+                  : (legacyGasPrice ?? 0n);
+              const estimatedCostWei = estimatedGas * gasPrice;
+              if (estimatedCostWei > requiredWei) {
+                requiredWei = estimatedCostWei;
+              }
+            }
+          } catch (estErr: unknown) {
+            if (isRateLimitRpcError(estErr)) {
+              throw estErr;
+            }
+            const estMsg =
+              estErr instanceof Error ? estErr.message : String(estErr);
+            const isInsufficientFunds =
+              (typeof estErr === "object" &&
+                estErr !== null &&
+                "code" in estErr &&
+                (estErr as { readonly code?: unknown }).code ===
+                  "INSUFFICIENT_FUNDS") ||
+              /insufficient\s+funds|not\s+enough\s+funds/i.test(estMsg);
+
+            if (balanceWei < MIN_FALLBACK_GAS_BALANCE_WEI || isInsufficientFunds) {
+              const details: InsufficientGasErrorDetails =
+                balanceWei < MIN_FALLBACK_GAS_BALANCE_WEI
+                  ? {
+                      signerAddress,
+                      balanceWei,
+                      requiredWei: MIN_FALLBACK_GAS_BALANCE_WEI
+                    }
+                  : {
+                      signerAddress,
+                      balanceWei
+                    };
+              throw new InsufficientGasError(
+                DEFAULT_INSUFFICIENT_GAS_MESSAGE,
+                details
+              );
             }
           }
-        } catch (estErr: unknown) {
-          const estMsg =
-            estErr instanceof Error ? estErr.message : String(estErr);
-          const isInsufficientFunds =
-            (typeof estErr === "object" &&
-              estErr !== null &&
-              "code" in estErr &&
-              (estErr as { readonly code?: unknown }).code ===
-                "INSUFFICIENT_FUNDS") ||
-            /insufficient\s+funds|not\s+enough\s+funds/i.test(estMsg);
+        }
 
-          if (balanceWei < MIN_FALLBACK_GAS_BALANCE_WEI || isInsufficientFunds) {
-            const details: InsufficientGasErrorDetails =
-              balanceWei < MIN_FALLBACK_GAS_BALANCE_WEI
-                ? {
-                    signerAddress,
-                    balanceWei,
-                    requiredWei: MIN_FALLBACK_GAS_BALANCE_WEI
-                  }
-                : {
-                    signerAddress,
-                    balanceWei
-                  };
-            throw new InsufficientGasError(
-              DEFAULT_INSUFFICIENT_GAS_MESSAGE,
-              details
-            );
-          }
+        if (balanceWei < requiredWei) {
+          throw new InsufficientGasError(DEFAULT_INSUFFICIENT_GAS_MESSAGE, {
+            signerAddress,
+            balanceWei,
+            requiredWei
+          });
         }
       }
 
-      if (balanceWei < requiredWei) {
-        throw new InsufficientGasError(DEFAULT_INSUFFICIENT_GAS_MESSAGE, {
-          signerAddress,
-          balanceWei,
-          requiredWei
-        });
-      }
-    }
+      return gateContract.claimStreakReward(proofStruct, payload.signature);
+    });
 
-    const tx = await gateContract.claimStreakReward(
-      proofStruct,
-      payload.signature
-    );
-
-    const receipt = await tx.wait();
+    const receipt = await waitForTxReceiptWithRetry(tx);
     const txHash: string = receipt?.hash ?? tx.hash;
 
     return {
