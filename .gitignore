@@ -22,3 +22,5 @@ build_report/
 
 # Expo local dev state
 .expo/
+
+.agents/

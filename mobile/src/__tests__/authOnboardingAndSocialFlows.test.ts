@@ -614,6 +614,58 @@ describe("UI, Clipboard, Login, Onboarding Preview & Single-Cheer Flows", () => 
       expect(hasText(tree, "OAuth popup cancelled")).toBe(true);
     });
 
+    it("renders a dedicated Start Local Session button that dispatches onStartLocalSession once and recovers on failure", async () => {
+      const localDeferred = createDeferred<void>();
+      const onStartLocalSession = vi
+        .fn()
+        .mockImplementation(() => localDeferred.promise);
+      const onError = vi.fn();
+      const props = {
+        onSignInWithGoogle: vi.fn().mockResolvedValue(undefined),
+        onSignInWithMetaMask: vi.fn().mockResolvedValue(undefined),
+        onSignInWithWalletConnect: vi.fn().mockResolvedValue(undefined),
+        onStartLocalSession,
+        isSupabaseConfigured: true,
+        onError
+      };
+
+      // Hidden when no handler is supplied
+      expect(
+        findByTestId(
+          renderWithHarness(LoginScreen, {
+            ...props,
+            onStartLocalSession: undefined
+          }),
+          "login-local-session-button"
+        )
+      ).toBeNull();
+
+      let tree = renderWithHarness(LoginScreen, props);
+      const localBtn = findByTestId(tree, "login-local-session-button");
+      expect(localBtn).not.toBeNull();
+      expect(localBtn!.disabled).toBe(false);
+
+      (localBtn!.onPress as () => void)();
+      (localBtn!.onPress as () => void)();
+      expect(onStartLocalSession).toHaveBeenCalledTimes(1);
+
+      tree = renderWithHarness(LoginScreen, props);
+      expect(findByTestId(tree, "login-local-session-button")!.disabled).toBe(
+        true
+      );
+      expect(hasText(tree, "Starting Local Session...")).toBe(true);
+
+      const err = new Error("Local session failed");
+      localDeferred.reject(err);
+      await flushMicrotasks();
+
+      tree = renderWithHarness(LoginScreen, props);
+      expect(onError).toHaveBeenCalledWith(err);
+      expect(findByTestId(tree, "login-local-session-button")!.disabled).toBe(
+        false
+      );
+    });
+
     it("connects via MetaMask and WalletConnect buttons and resets spinners on failure", async () => {
       const mmDeferred = createDeferred<void>();
       const wcErr = new Error("WalletConnect Project ID missing");

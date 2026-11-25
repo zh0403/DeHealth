@@ -1096,6 +1096,11 @@ export default function App(): React.ReactElement {
     applyAuthenticatedResult(authResult);
   };
 
+  const handleStartLocalSession = async (): Promise<void> => {
+    const authResult = await startLocalSession();
+    applyAuthenticatedResult(authResult);
+  };
+
   const handleSignInWithMetaMask = async (): Promise<void> => {
     const authResult = await signInWithMetaMask();
     applyAuthenticatedResult(authResult);
@@ -1390,6 +1395,7 @@ export default function App(): React.ReactElement {
             onSignInWithGoogle={handleSignInWithGoogle}
             onSignInWithMetaMask={handleSignInWithMetaMask}
             onSignInWithWalletConnect={handleSignInWithWalletConnect}
+            onStartLocalSession={handleStartLocalSession}
             walletConnectUri={wcPairingUri}
             onCancelWalletConnect={handleCancelWalletConnectPairing}
             isSupabaseConfigured={isSupabaseConfigured()}

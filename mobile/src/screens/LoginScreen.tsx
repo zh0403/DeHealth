@@ -41,6 +41,7 @@ export interface LoginScreenProps {
   readonly onSignInWithWalletConnect: (
     onDisplayUri?: (uri: string) => void
   ) => Promise<void> | void;
+  readonly onStartLocalSession?: () => Promise<void> | void;
   readonly isSupabaseConfigured?: boolean;
   readonly isWalletConnectConfigured?: boolean;
   readonly existingWalletAddress?: Address | null;
@@ -49,12 +50,13 @@ export interface LoginScreenProps {
   readonly onError?: (error: unknown) => void;
 }
 
-type PendingAuthMethod = "google" | "metamask" | "walletconnect" | null;
+type PendingAuthMethod = "google" | "metamask" | "walletconnect" | "local" | null;
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({
   onSignInWithGoogle,
   onSignInWithMetaMask,
   onSignInWithWalletConnect,
+  onStartLocalSession,
   isSupabaseConfigured = false,
   isWalletConnectConfigured = false,
   existingWalletAddress = null,
@@ -100,6 +102,12 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
   const handleGoogleSignIn = (): void => {
     void runAuthSubmission("google", onSignInWithGoogle);
+  };
+
+  const handleLocalSignIn = (): void => {
+    if (onStartLocalSession) {
+      void runAuthSubmission("local", onStartLocalSession);
+    }
   };
 
   const handleMetaMaskSignIn = (): void => {
@@ -194,6 +202,28 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
             {pendingMethod === "google" ? googlePendingLabel : googleButtonLabel}
           </Text>
         </Pressable>
+
+        {isSupabaseConfigured && onStartLocalSession ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Start Local Session"
+            accessibilityState={{ disabled: isSubmitting }}
+            testID="login-local-session-button"
+            disabled={isSubmitting}
+            style={({ pressed }) => [
+              styles.secondaryButton,
+              isSubmitting ? styles.buttonDisabled : null,
+              pressed ? styles.buttonPressed : null
+            ]}
+            onPress={handleLocalSignIn}
+          >
+            <Text style={styles.secondaryButtonText}>
+              {pendingMethod === "local"
+                ? "Starting Local Session..."
+                : "Start Local Session"}
+            </Text>
+          </Pressable>
+        ) : null}
       </View>
 
       {/* Path 2: MetaMask */}
@@ -408,6 +438,20 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "800",
     color: "#082F49"
+  },
+  secondaryButton: {
+    backgroundColor: "#1E293B",
+    borderWidth: 1,
+    borderColor: "#334155",
+    paddingVertical: 12,
+    borderRadius: 12,
+    alignItems: "center",
+    marginTop: 10
+  },
+  secondaryButtonText: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#38BDF8"
   },
   metamaskButton: {
     backgroundColor: "#F59E0B",
